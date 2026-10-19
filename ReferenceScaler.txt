@@ -1,42 +1,28 @@
 // ReferenceScaler.txt
 // ZBrush 2022 ZScript plugin.
-// Keeps the Image Plane reference image scaled (and optionally positioned)
-// so it tracks the model as you zoom the camera in and out.
+// Scales the Texture > Image Plane reference image with the camera zoom so it
+// keeps the same size relative to the model.
 //
-// Build: ZScript > Load > pick this file. ZBrush compiles it to
-// ReferenceScaler.zsc. Copy the .zsc into ZStartup/ZPlugs64 to load it
-// automatically. The UI appears under ZPlugin > Reference Scaler.
+// Build: ZScript > Load > pick this file. The buttons appear under
+// ZPlugin > Reference Scaler. ZBrush keeps buttons bound to the version that
+// first created them, so restart ZBrush before loading a new version.
 
 [IConfig, 2022]
 [IShowActions, 0]
 
-// Shown in every click's note-bar message and in the About popup, so it is
-// obvious which version of the script a button is actually running.
-[VarDef, zrsBuild, "build 12"]
-
-// ---------------------------------------------------------------------------
-// Image Plane slider paths. These are auto-detected (see ZRSDetect). If your
-// Image Plane version names them differently, use "Set Paths" in the plugin
-// panel or edit the defaults here.
-// ---------------------------------------------------------------------------
-[VarDef, zrsSizePath, ""]
-[VarDef, zrsHPath, ""]
-[VarDef, zrsVPath, ""]
+// Shown by About and in every note-bar message, to confirm which version a
+// button is running.
+[VarDef, zrsBuild, "build 13"]
 
 // Anchor state, captured when the reference is lined up with the model.
 [VarDef, zrsAnchored, 0]
 [VarDef, zrsBaseScale, 0]
 [VarDef, zrsBaseSize, 0]
-[VarDef, zrsBaseX, 0]
-[VarDef, zrsBaseY, 0]
-[VarDef, zrsBaseH, 0]
-[VarDef, zrsBaseV, 0]
 
 // Live mode.
 [VarDef, zrsLive, 0]
-[VarDef, zrsInterval, 0.5]
 
-// Scratch values for TransformGet and the update maths.
+// Scratch values.
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -47,131 +33,45 @@
 [VarDef, zrsRy, 0]
 [VarDef, zrsRz, 0]
 [VarDef, zrsRatio, 1]
+[VarDef, zrsBefore, 0]
 [VarDef, zrsTarget, 0]
-[VarDef, zrsMin, 0]
-[VarDef, zrsMax, 0]
-[VarDef, zrsCx, 0]
-[VarDef, zrsCy, 0]
-[VarDef, zrsGain, 0]
-[VarDef, zrsInput, ""]
-
-[VarDef, zrsDbg, ""]
+[VarDef, zrsMsg, ""]
 
 // ZBrush unloads this script whenever another ZScript runs (Image Plane is a
-// ZScript), and reloading resets every VarDef above. Anchor state and paths
-// are therefore kept in memory blocks, which live for the whole ZBrush session.
-// ZRSState holds 7 floats (4 bytes each): anchored, baseScale, baseSize,
-// baseX, baseY, baseH, baseV. ZRSPaths holds 3 strings of 256 bytes each.
+// ZScript), and reloading resets every VarDef above. The anchor is kept in a
+// memory block, which lives for the whole ZBrush session.
+// ZRSState holds 3 floats: anchored, baseScale, baseSize.
 [RoutineDef, ZRSSave,
-	[If, [MemGetSize, ZRSState] == 0, [MemCreate, ZRSState, 28, 0]]
-	[If, [MemGetSize, ZRSPaths] == 0, [MemCreate, ZRSPaths, 768, 0]]
+	[If, [MemGetSize, ZRSState] == 0, [MemCreate, ZRSState, 12, 0]]
 	[MemWrite, ZRSState, zrsAnchored, 0, 0]
 	[MemWrite, ZRSState, zrsBaseScale, 0, 4]
 	[MemWrite, ZRSState, zrsBaseSize, 0, 8]
-	[MemWrite, ZRSState, zrsBaseX, 0, 12]
-	[MemWrite, ZRSState, zrsBaseY, 0, 16]
-	[MemWrite, ZRSState, zrsBaseH, 0, 20]
-	[MemWrite, ZRSState, zrsBaseV, 0, 24]
-	[MemWriteString, ZRSPaths, zrsSizePath, 0, 1]
-	[MemWriteString, ZRSPaths, zrsHPath, 256, 1]
-	[MemWriteString, ZRSPaths, zrsVPath, 512, 1]
 ]
 
-// Restores state saved by ZRSSave. Every button calls this first.
 [RoutineDef, ZRSLoad,
 	[If, [MemGetSize, ZRSState],
 		[MemRead, ZRSState, zrsAnchored, 0, 0]
 		[MemRead, ZRSState, zrsBaseScale, 0, 4]
 		[MemRead, ZRSState, zrsBaseSize, 0, 8]
-		[MemRead, ZRSState, zrsBaseX, 0, 12]
-		[MemRead, ZRSState, zrsBaseY, 0, 16]
-		[MemRead, ZRSState, zrsBaseH, 0, 20]
-		[MemRead, ZRSState, zrsBaseV, 0, 24]
-	]
-	[If, [MemGetSize, ZRSPaths],
-		[MemReadString, ZRSPaths, zrsSizePath, 0, 1]
-		[MemReadString, ZRSPaths, zrsHPath, 256, 1]
-		[MemReadString, ZRSPaths, zrsVPath, 512, 1]
-	]
-	[VarSet, zrsInterval, [IGet, "ZPlugin:Reference Scaler:Interval"]]
-]
-
-// Builds a one-line summary of the current state into zrsDbg.
-[RoutineDef, ZRSDebugLine,
-	[VarSet, zrsDbg, [StrMerge, "RS anchored=", zrsAnchored, " edit=", [IGet, Transform:Edit], " live=", zrsLive]]
-	[VarSet, zrsDbg, [StrMerge, zrsDbg, " scale=", zrsSx, " base=", zrsBaseScale, " ratio=", zrsRatio]]
-	[If, [StrLength, zrsSizePath],
-		[VarSet, zrsDbg, [StrMerge, zrsDbg, " size=", [IGet, #zrsSizePath], " baseSize=", zrsBaseSize]]
-		,
-		[VarSet, zrsDbg, [StrMerge, zrsDbg, " size=(no slider)"]]
 	]
 ]
 
-// Shows the debug line in the bar at the top of the canvas when Debug is on.
-[RoutineDef, ZRSDebug,
-	[If, [IGet, "ZPlugin:Reference Scaler:Debug"],
-		[RoutineCall, ZRSDebugLine]
-		[NoteBar, zrsDbg]
-	]
-]
-
-// Finds the first existing slider for each Image Plane control.
-[RoutineDef, ZRSDetect,
-	[VarSet, zrsSizePath, ""]
-	// "Image Size" is the name in ZBrush 2022's Image Plane; the rest are fallbacks.
-	[If, [IExists, "Texture:Image Plane:Image Size"], [VarSet, zrsSizePath, "Texture:Image Plane:Image Size"]]
-	[If, [StrLength, zrsSizePath] == 0, [If, [IExists, "Texture:Image Plane:ImgSize"], [VarSet, zrsSizePath, "Texture:Image Plane:ImgSize"]]]
-	[If, [StrLength, zrsSizePath] == 0, [If, [IExists, "Texture:Image Plane:Img Size"], [VarSet, zrsSizePath, "Texture:Image Plane:Img Size"]]]
-	[If, [StrLength, zrsSizePath] == 0, [If, [IExists, "Texture:Image Plane:Size"], [VarSet, zrsSizePath, "Texture:Image Plane:Size"]]]
-	[If, [StrLength, zrsSizePath] == 0, [If, [IExists, "Texture:Image Plane:Scale"], [VarSet, zrsSizePath, "Texture:Image Plane:Scale"]]]
-
-	[VarSet, zrsHPath, ""]
-	[If, [IExists, "Texture:Image Plane:Shift H"], [VarSet, zrsHPath, "Texture:Image Plane:Shift H"]]
-	[If, [StrLength, zrsHPath] == 0, [If, [IExists, "Texture:Image Plane:ShiftH"], [VarSet, zrsHPath, "Texture:Image Plane:ShiftH"]]]
-
-	[VarSet, zrsVPath, ""]
-	[If, [IExists, "Texture:Image Plane:Shift V"], [VarSet, zrsVPath, "Texture:Image Plane:Shift V"]]
-	[If, [StrLength, zrsVPath] == 0, [If, [IExists, "Texture:Image Plane:ShiftV"], [VarSet, zrsVPath, "Texture:Image Plane:ShiftV"]]]
-]
-
-[RoutineDef, ZRSShowPaths,
-	[VarSet, zrsInput, "Reference Scaler sliders\n"]
-	[If, [StrLength, zrsSizePath],
-		[VarSet, zrsInput, [StrMerge, zrsInput, "Size: ", zrsSizePath, "\n"]],
-		[VarSet, zrsInput, [StrMerge, zrsInput, "Size: (not found)\n"]]
-	]
-	[If, [StrLength, zrsHPath],
-		[VarSet, zrsInput, [StrMerge, zrsInput, "Shift H: ", zrsHPath, "\n"]],
-		[VarSet, zrsInput, [StrMerge, zrsInput, "Shift H: (not found)\n"]]
-	]
-	[If, [StrLength, zrsVPath],
-		[VarSet, zrsInput, [StrMerge, zrsInput, "Shift V: ", zrsVPath]],
-		[VarSet, zrsInput, [StrMerge, zrsInput, "Shift V: (not found)"]]
-	]
-	[Note, zrsInput, , 4]
-]
-
-// Records the current model scale/position and Image Plane slider values.
-// Line the reference up with the model first, then anchor.
+// Records the current model scale and Image Size. Line the reference up with
+// the model first.
 [RoutineDef, ZRSAnchor,
 	[VarSet, zrsAnchored, 0]
-	[If, [StrLength, zrsSizePath] == 0, [RoutineCall, ZRSDetect]]
-	[If, [StrLength, zrsSizePath] == 0,
-		[Note, "Reference Scaler: Image Plane size slider not found.\nLoad an image with Texture > Image Plane, or use Set Paths.", , 4]
+	[If, [IExists, "Texture:Image Plane:Image Size"] == 0,
+		[Note, "Reference Scaler: Texture > Image Plane > Image Size not found."]
 		,
 		[If, [IGet, Transform:Edit] == 0,
-			[Note, "Reference Scaler: put the model in Edit mode first.", , 3]
+			[Note, "Reference Scaler: put the model in Edit mode first."]
 			,
 			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
 			[If, zrsSx <= 0,
-				[Note, "Reference Scaler: could not read the model scale.", , 3]
+				[Note, "Reference Scaler: could not read the model scale."]
 				,
 				[VarSet, zrsBaseScale, zrsSx]
-				[VarSet, zrsBaseX, zrsPx]
-				[VarSet, zrsBaseY, zrsPy]
-				[VarSet, zrsBaseSize, [IGet, #zrsSizePath]]
-				[If, [StrLength, zrsHPath], [VarSet, zrsBaseH, [IGet, #zrsHPath]]]
-				[If, [StrLength, zrsVPath], [VarSet, zrsBaseV, [IGet, #zrsVPath]]]
+				[VarSet, zrsBaseSize, [IGet, "Texture:Image Plane:Image Size"]]
 				[VarSet, zrsAnchored, 1]
 			]
 		]
@@ -179,262 +79,39 @@
 	[RoutineCall, ZRSSave]
 ]
 
-// Rescales (and optionally repositions) the reference to match the model.
+// Sets Image Size to baseSize * (current scale / anchored scale) and puts the
+// result in the note bar.
 [RoutineDef, ZRSUpdate,
-	[If, zrsAnchored && [IGet, Transform:Edit],
-		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[If, zrsSx > 0 && zrsBaseScale > 0,
+	[If, zrsAnchored == 0,
+		[VarSet, zrsMsg, [StrMerge, "Reference Scaler ", zrsBuild, ": not anchored"]]
+		,
+		[If, [IGet, Transform:Edit] == 0,
+			[VarSet, zrsMsg, [StrMerge, "Reference Scaler ", zrsBuild, ": model not in Edit mode"]]
+			,
+			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
 			[VarSet, zrsRatio, zrsSx / zrsBaseScale]
-
 			[VarSet, zrsTarget, zrsBaseSize * zrsRatio]
-			[VarSet, zrsMin, [IGetMin, #zrsSizePath]]
-			[VarSet, zrsMax, [IGetMax, #zrsSizePath]]
-			[If, zrsTarget < zrsMin, [VarSet, zrsTarget, zrsMin]]
-			[If, zrsTarget > zrsMax, [VarSet, zrsTarget, zrsMax]]
-			[If, ABS(zrsTarget - [IGet, #zrsSizePath]) > 0.0001,
-				[ISet, #zrsSizePath, zrsTarget]
-			]
-
-			// Follow Position: the image is assumed to scale about the canvas
-			// centre, offset = Gain * slider value (pixels per slider unit).
-			// Solving for the offset that keeps the anchored point under the model:
-			// slider = base * ratio + ((p - c) - ratio * (p0 - c)) / gain
-			[VarSet, zrsGain, [IGet, "ZPlugin:Reference Scaler:Offset Gain"]]
-			[If, [IGet, "ZPlugin:Reference Scaler:Follow Position"] && ABS(zrsGain) > 0.0001,
-				[VarSet, zrsCx, [IGet, Document:Width] * 0.5]
-				[VarSet, zrsCy, [IGet, Document:Height] * 0.5]
-				[If, [StrLength, zrsHPath],
-					[VarSet, zrsTarget, zrsBaseH * zrsRatio + ((zrsPx - zrsCx) - zrsRatio * (zrsBaseX - zrsCx)) / zrsGain]
-					[VarSet, zrsMin, [IGetMin, #zrsHPath]]
-					[VarSet, zrsMax, [IGetMax, #zrsHPath]]
-					[If, zrsTarget < zrsMin, [VarSet, zrsTarget, zrsMin]]
-					[If, zrsTarget > zrsMax, [VarSet, zrsTarget, zrsMax]]
-					[If, ABS(zrsTarget - [IGet, #zrsHPath]) > 0.0001, [ISet, #zrsHPath, zrsTarget]]
-				]
-				[If, [StrLength, zrsVPath],
-					[VarSet, zrsTarget, zrsBaseV * zrsRatio + ((zrsPy - zrsCy) - zrsRatio * (zrsBaseY - zrsCy)) / zrsGain]
-					[VarSet, zrsMin, [IGetMin, #zrsVPath]]
-					[VarSet, zrsMax, [IGetMax, #zrsVPath]]
-					[If, zrsTarget < zrsMin, [VarSet, zrsTarget, zrsMin]]
-					[If, zrsTarget > zrsMax, [VarSet, zrsTarget, zrsMax]]
-					[If, ABS(zrsTarget - [IGet, #zrsVPath]) > 0.0001, [ISet, #zrsVPath, zrsTarget]]
-				]
-			]
+			[If, zrsTarget < [IGetMin, "Texture:Image Plane:Image Size"], [VarSet, zrsTarget, [IGetMin, "Texture:Image Plane:Image Size"]]]
+			[If, zrsTarget > [IGetMax, "Texture:Image Plane:Image Size"], [VarSet, zrsTarget, [IGetMax, "Texture:Image Plane:Image Size"]]]
+			[VarSet, zrsBefore, [IGet, "Texture:Image Plane:Image Size"]]
+			[ISet, "Texture:Image Plane:Image Size", zrsTarget]
+			[VarSet, zrsMsg, [StrMerge, "Reference Scaler ", zrsBuild, ": scale ", zrsSx, " / ", zrsBaseScale]]
+			[VarSet, zrsMsg, [StrMerge, zrsMsg, "  Image Size ", zrsBefore, " -> ", [IGet, "Texture:Image Plane:Image Size"]]]
 		]
 	]
-	[RoutineCall, ZRSDebug]
+	[NoteBar, zrsMsg]
 ]
 
 // Live loop: wakes on the timer (1) or on left mouse button up (8), i.e. when
-// a zoom drag finishes, updates, then goes back to sleep. Another ZScript or
-// plugin starting ends the loop (ZBrush only runs one script at a time).
+// a zoom drag finishes, updates, then goes back to sleep. Another ZScript
+// starting ends the loop (ZBrush only runs one script at a time).
 [RoutineDef, ZRSLiveLoop,
-	[Sleep, zrsInterval,
+	[Sleep, 0.5,
 		[If, zrsLive,
 			[RoutineCall, ZRSUpdate]
-			[SleepAgain, zrsInterval, 9]
+			[SleepAgain, 0.5, 9]
 		]
 	, 9]
-]
-
-// ---------------------------------------------------------------------------
-// Diagnostics: probe
-// ---------------------------------------------------------------------------
-// Read-only. Checks likely Image Plane control paths with IExists and builds
-// one list of the ones that exist, with their values. ZScript strings hold
-// about 255 characters, so the list only spills into a second popup if it
-// outgrows that.
-[VarDef, zrsOut, ""]
-[VarDef, zrsItem, ""]
-[VarDef, zrsVal, 0]
-[VarDef, zrsCount, 0]
-
-// Appends "zrsItem = zrsVal" to zrsOut, showing zrsOut first if it is full.
-[RoutineDef, ZRSProbeAdd,
-	[If, [StrLength, zrsOut] + [StrLength, zrsItem] > 220,
-		[Note, zrsOut]
-		[VarSet, zrsOut, "Image Plane controls (continued)\n"]
-	]
-	[VarSet, zrsOut, [StrMerge, zrsOut, zrsItem, " = ", zrsVal, "\n"]]
-	[VarSet, zrsCount, zrsCount + 1]
-]
-
-[RoutineDef, ZRSProbe1,
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Load Image"]]
-	[If, [IExists, "Texture:Image Plane:Load Image"], [VarSet, zrsItem, "Load Image"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Load Image"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Image Plane"]]
-	[If, [IExists, "Texture:Image Plane:Image Plane"], [VarSet, zrsItem, "Image Plane"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Image Plane"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Make Image Plane"]]
-	[If, [IExists, "Texture:Image Plane:Make Image Plane"], [VarSet, zrsItem, "Make Image Plane"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Make Image Plane"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Size"]]
-	[If, [IExists, "Texture:Image Plane:Size"], [VarSet, zrsItem, "Size"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Size"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking ImgSize"]]
-	[If, [IExists, "Texture:Image Plane:ImgSize"], [VarSet, zrsItem, "ImgSize"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:ImgSize"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Img Size"]]
-	[If, [IExists, "Texture:Image Plane:Img Size"], [VarSet, zrsItem, "Img Size"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Img Size"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Image Size"]]
-	[If, [IExists, "Texture:Image Plane:Image Size"], [VarSet, zrsItem, "Image Size"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Image Size"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Scale"]]
-	[If, [IExists, "Texture:Image Plane:Scale"], [VarSet, zrsItem, "Scale"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Scale"]] [RoutineCall, ZRSProbeAdd]]
-]
-
-[RoutineDef, ZRSProbe2,
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Zoom"]]
-	[If, [IExists, "Texture:Image Plane:Zoom"], [VarSet, zrsItem, "Zoom"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Zoom"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Fill"]]
-	[If, [IExists, "Texture:Image Plane:Fill"], [VarSet, zrsItem, "Fill"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Fill"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Fit"]]
-	[If, [IExists, "Texture:Image Plane:Fit"], [VarSet, zrsItem, "Fit"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Fit"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reset"]]
-	[If, [IExists, "Texture:Image Plane:Reset"], [VarSet, zrsItem, "Reset"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reset"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Shift H"]]
-	[If, [IExists, "Texture:Image Plane:Shift H"], [VarSet, zrsItem, "Shift H"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Shift H"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Shift V"]]
-	[If, [IExists, "Texture:Image Plane:Shift V"], [VarSet, zrsItem, "Shift V"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Shift V"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking ShiftH"]]
-	[If, [IExists, "Texture:Image Plane:ShiftH"], [VarSet, zrsItem, "ShiftH"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:ShiftH"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking ShiftV"]]
-	[If, [IExists, "Texture:Image Plane:ShiftV"], [VarSet, zrsItem, "ShiftV"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:ShiftV"]] [RoutineCall, ZRSProbeAdd]]
-]
-
-[RoutineDef, ZRSProbe3,
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Offset H"]]
-	[If, [IExists, "Texture:Image Plane:Offset H"], [VarSet, zrsItem, "Offset H"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Offset H"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Offset V"]]
-	[If, [IExists, "Texture:Image Plane:Offset V"], [VarSet, zrsItem, "Offset V"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Offset V"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking H Offset"]]
-	[If, [IExists, "Texture:Image Plane:H Offset"], [VarSet, zrsItem, "H Offset"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:H Offset"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking V Offset"]]
-	[If, [IExists, "Texture:Image Plane:V Offset"], [VarSet, zrsItem, "V Offset"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:V Offset"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Position X"]]
-	[If, [IExists, "Texture:Image Plane:Position X"], [VarSet, zrsItem, "Position X"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Position X"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Position Y"]]
-	[If, [IExists, "Texture:Image Plane:Position Y"], [VarSet, zrsItem, "Position Y"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Position Y"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Model Opacity"]]
-	[If, [IExists, "Texture:Image Plane:Model Opacity"], [VarSet, zrsItem, "Model Opacity"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Model Opacity"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Opacity"]]
-	[If, [IExists, "Texture:Image Plane:Opacity"], [VarSet, zrsItem, "Opacity"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Opacity"]] [RoutineCall, ZRSProbeAdd]]
-]
-
-[RoutineDef, ZRSProbe4,
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Transparency"]]
-	[If, [IExists, "Texture:Image Plane:Transparency"], [VarSet, zrsItem, "Transparency"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Transparency"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Ghost"]]
-	[If, [IExists, "Texture:Image Plane:Ghost"], [VarSet, zrsItem, "Ghost"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Ghost"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Ghost Mode"]]
-	[If, [IExists, "Texture:Image Plane:Ghost Mode"], [VarSet, zrsItem, "Ghost Mode"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Ghost Mode"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Store View"]]
-	[If, [IExists, "Texture:Image Plane:Store View"], [VarSet, zrsItem, "Store View"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Store View"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Restore View"]]
-	[If, [IExists, "Texture:Image Plane:Restore View"], [VarSet, zrsItem, "Restore View"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Restore View"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views"], [VarSet, zrsItem, "Reference Views"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Help"]]
-	[If, [IExists, "Texture:Image Plane:Help"], [VarSet, zrsItem, "Help"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Help"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Front"]]
-	[If, [IExists, "Texture:Image Plane:Front"], [VarSet, zrsItem, "Front"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Front"]] [RoutineCall, ZRSProbeAdd]]
-]
-
-[RoutineDef, ZRSProbe5,
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Back"]]
-	[If, [IExists, "Texture:Image Plane:Back"], [VarSet, zrsItem, "Back"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Back"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Left"]]
-	[If, [IExists, "Texture:Image Plane:Left"], [VarSet, zrsItem, "Left"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Left"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Right"]]
-	[If, [IExists, "Texture:Image Plane:Right"], [VarSet, zrsItem, "Right"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Right"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Top"]]
-	[If, [IExists, "Texture:Image Plane:Top"], [VarSet, zrsItem, "Top"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Top"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Bottom"]]
-	[If, [IExists, "Texture:Image Plane:Bottom"], [VarSet, zrsItem, "Bottom"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Bottom"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Load Image"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Load Image"], [VarSet, zrsItem, "Reference Views:Load Image"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Load Image"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Image Plane"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Image Plane"], [VarSet, zrsItem, "Reference Views:Image Plane"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Image Plane"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Make Image Plane"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Make Image Plane"], [VarSet, zrsItem, "Reference Views:Make Image Plane"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Make Image Plane"]] [RoutineCall, ZRSProbeAdd]]
-]
-
-[RoutineDef, ZRSProbe6,
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Size"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Size"], [VarSet, zrsItem, "Reference Views:Size"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Size"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:ImgSize"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:ImgSize"], [VarSet, zrsItem, "Reference Views:ImgSize"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:ImgSize"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Img Size"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Img Size"], [VarSet, zrsItem, "Reference Views:Img Size"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Img Size"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Image Size"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Image Size"], [VarSet, zrsItem, "Reference Views:Image Size"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Image Size"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Scale"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Scale"], [VarSet, zrsItem, "Reference Views:Scale"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Scale"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Zoom"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Zoom"], [VarSet, zrsItem, "Reference Views:Zoom"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Zoom"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Fill"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Fill"], [VarSet, zrsItem, "Reference Views:Fill"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Fill"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Fit"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Fit"], [VarSet, zrsItem, "Reference Views:Fit"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Fit"]] [RoutineCall, ZRSProbeAdd]]
-]
-
-[RoutineDef, ZRSProbe7,
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Reset"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Reset"], [VarSet, zrsItem, "Reference Views:Reset"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Reset"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Shift H"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Shift H"], [VarSet, zrsItem, "Reference Views:Shift H"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Shift H"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Shift V"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Shift V"], [VarSet, zrsItem, "Reference Views:Shift V"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Shift V"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:ShiftH"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:ShiftH"], [VarSet, zrsItem, "Reference Views:ShiftH"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:ShiftH"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:ShiftV"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:ShiftV"], [VarSet, zrsItem, "Reference Views:ShiftV"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:ShiftV"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Offset H"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Offset H"], [VarSet, zrsItem, "Reference Views:Offset H"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Offset H"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Offset V"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Offset V"], [VarSet, zrsItem, "Reference Views:Offset V"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Offset V"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:H Offset"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:H Offset"], [VarSet, zrsItem, "Reference Views:H Offset"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:H Offset"]] [RoutineCall, ZRSProbeAdd]]
-]
-
-[RoutineDef, ZRSProbe8,
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:V Offset"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:V Offset"], [VarSet, zrsItem, "Reference Views:V Offset"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:V Offset"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Position X"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Position X"], [VarSet, zrsItem, "Reference Views:Position X"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Position X"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Position Y"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Position Y"], [VarSet, zrsItem, "Reference Views:Position Y"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Position Y"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Model Opacity"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Model Opacity"], [VarSet, zrsItem, "Reference Views:Model Opacity"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Model Opacity"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Opacity"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Opacity"], [VarSet, zrsItem, "Reference Views:Opacity"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Opacity"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Transparency"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Transparency"], [VarSet, zrsItem, "Reference Views:Transparency"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Transparency"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Ghost"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Ghost"], [VarSet, zrsItem, "Reference Views:Ghost"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Ghost"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Ghost Mode"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Ghost Mode"], [VarSet, zrsItem, "Reference Views:Ghost Mode"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Ghost Mode"]] [RoutineCall, ZRSProbeAdd]]
-]
-
-[RoutineDef, ZRSProbe9,
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Store View"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Store View"], [VarSet, zrsItem, "Reference Views:Store View"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Store View"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Restore View"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Restore View"], [VarSet, zrsItem, "Reference Views:Restore View"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Restore View"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Reference Views"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Reference Views"], [VarSet, zrsItem, "Reference Views:Reference Views"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Reference Views"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Help"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Help"], [VarSet, zrsItem, "Reference Views:Help"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Help"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Front"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Front"], [VarSet, zrsItem, "Reference Views:Front"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Front"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Back"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Back"], [VarSet, zrsItem, "Reference Views:Back"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Back"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Left"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Left"], [VarSet, zrsItem, "Reference Views:Left"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Left"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Right"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Right"], [VarSet, zrsItem, "Reference Views:Right"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Right"]] [RoutineCall, ZRSProbeAdd]]
-]
-
-[RoutineDef, ZRSProbe10,
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Top"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Top"], [VarSet, zrsItem, "Reference Views:Top"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Top"]] [RoutineCall, ZRSProbeAdd]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": checking Reference Views:Bottom"]]
-	[If, [IExists, "Texture:Image Plane:Reference Views:Bottom"], [VarSet, zrsItem, "Reference Views:Bottom"] [VarSet, zrsVal, [IGet, "Texture:Image Plane:Reference Views:Bottom"]] [RoutineCall, ZRSProbeAdd]]
 ]
 
 // ---------------------------------------------------------------------------
@@ -444,32 +121,22 @@
 
 [IButton, "ZPlugin:Reference Scaler:Anchor",
 	"Line the Image Plane reference up with the model, then press to record this as the 1:1 zoom.",
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Anchor clicked"]]
-	[RoutineCall, ZRSLoad]
 	[RoutineCall, ZRSAnchor]
 	[If, zrsAnchored,
-		[Note, [StrMerge, "Reference Scaler: anchored.\nModel scale ", zrsBaseScale, ", Image Plane size ", zrsBaseSize], , 2]
+		[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": anchored at scale ", zrsBaseScale, ", Image Size ", zrsBaseSize]]
 	]
 	, 0, 0.5
 ]
 
 [IButton, "ZPlugin:Reference Scaler:Sync",
-	"Rescale the reference to the current zoom once. Assign a hotkey to this if Live mode gets interrupted.",
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Sync clicked"]]
+	"Rescale the reference to the current zoom once.",
 	[RoutineCall, ZRSLoad]
-	[If, zrsAnchored,
-		[RoutineCall, ZRSUpdate]
-		[RoutineCall, ZRSDebugLine]
-		[NoteBar, zrsDbg]
-		,
-		[Note, "Reference Scaler: press Anchor first.", , 2]
-	]
+	[RoutineCall, ZRSUpdate]
 	, 0, 0.5
 ]
 
 [ISwitch, "ZPlugin:Reference Scaler:Live", 0,
-	"Continuously rescale the reference as the camera zooms.",
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Live on"]]
+	"Keep rescaling the reference as the camera zooms.",
 	[RoutineCall, ZRSLoad]
 	[If, zrsAnchored == 0, [RoutineCall, ZRSAnchor]]
 	[If, zrsAnchored,
@@ -481,108 +148,17 @@
 	]
 	,
 	[VarSet, zrsLive, 0]
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Live off"]]
 	, 0, 0.5
 ]
 
 [IButton, "ZPlugin:Reference Scaler:Reset",
-	"Restore the Image Plane sliders to their anchored values.",
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Reset clicked"]]
+	"Put Image Size back to its anchored value.",
 	[RoutineCall, ZRSLoad]
 	[If, zrsAnchored,
-		[ISet, #zrsSizePath, zrsBaseSize]
-		[If, [StrLength, zrsHPath], [ISet, #zrsHPath, zrsBaseH]]
-		[If, [StrLength, zrsVPath], [ISet, #zrsVPath, zrsBaseV]]
+		[ISet, "Texture:Image Plane:Image Size", zrsBaseSize]
+		[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Image Size reset to ", zrsBaseSize]]
 	]
-	, 0, 0.5
-]
-
-[ISlider, "ZPlugin:Reference Scaler:Interval", 0.5, 0.1, 0.1, 5,
-	"Seconds between Live updates. Live also updates whenever you release the mouse.",
-	[VarSet, zrsInterval, [IGet, "ZPlugin:Reference Scaler:Interval"]]
-	, 0, 1
-]
-
-[ISwitch, "ZPlugin:Reference Scaler:Follow Position", 0,
-	"Also move the reference with Shift H / Shift V so it stays under the model. Needs Offset Gain set.",
-	, , 0, 0.5
-]
-
-[ISlider, "ZPlugin:Reference Scaler:Offset Gain", 0, 0.01, -20, 20,
-	"Canvas pixels moved per unit of Image Plane Shift H/V. Calibrate by watching the image; use a negative value if it moves the wrong way. 0 disables Follow Position.",
-	, 0, 0.5
-]
-
-[IButton, "ZPlugin:Reference Scaler:Detect",
-	"Find the Image Plane sliders automatically and show what was found.",
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Detect clicked"]]
-	[RoutineCall, ZRSDetect]
-	[RoutineCall, ZRSShowPaths]
-	, 0, 0.5
-]
-
-[IButton, "ZPlugin:Reference Scaler:Set Paths",
-	"Type the interface paths of the Image Plane size and shift sliders by hand.",
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Set Paths clicked"]]
-	[RoutineCall, ZRSLoad]
-	[VarSet, zrsInput, [StrAsk, zrsSizePath, "Image Plane size slider path"]]
-	[If, [StrLength, zrsInput], [VarSet, zrsSizePath, zrsInput]]
-	[VarSet, zrsInput, [StrAsk, zrsHPath, "Shift H slider path (blank = none)"]]
-	[VarSet, zrsHPath, zrsInput]
-	[VarSet, zrsInput, [StrAsk, zrsVPath, "Shift V slider path (blank = none)"]]
-	[VarSet, zrsVPath, zrsInput]
-	[VarSet, zrsAnchored, 0]
-	[RoutineCall, ZRSSave]
-	[RoutineCall, ZRSShowPaths]
-	, 0, 0.5
-]
-
-[ISwitch, "ZPlugin:Reference Scaler:Debug", 0,
-	"Show the plugin's state in the bar at the top of the canvas on every update.",
-	, , 0, 0.5
-]
-
-[IButton, "ZPlugin:Reference Scaler:Status",
-	"Show everything the plugin currently sees: edit mode, model scale, anchor values and slider paths.",
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Status clicked"]]
-	[RoutineCall, ZRSLoad]
-	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[If, zrsBaseScale > 0, [VarSet, zrsRatio, zrsSx / zrsBaseScale]]
-	[RoutineCall, ZRSDebugLine]
-	[VarSet, zrsInput, [StrMerge, zrsDbg, "\n\nTransformGet  pos ", zrsPx, ", ", zrsPy, ", ", zrsPz]]
-	[VarSet, zrsInput, [StrMerge, zrsInput, "\nTransformGet  scale ", zrsSx, ", ", zrsSy, ", ", zrsSz]]
-	[VarSet, zrsInput, [StrMerge, zrsInput, "\n\nSize path: ", zrsSizePath, "\nShift H path: ", zrsHPath, "\nShift V path: ", zrsVPath]]
-	[Note, zrsInput]
-	, 0, 0.5
-]
-
-[IButton, "ZPlugin:Reference Scaler:Probe IP",
-	"Read-only: list the Image Plane controls that exist and their values.",
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP clicked"]]
-	[VarSet, zrsOut, "Image Plane controls\n"]
-	[VarSet, zrsCount, 0]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 1 of 10"]]
-	[RoutineCall, ZRSProbe1]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 2 of 10"]]
-	[RoutineCall, ZRSProbe2]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 3 of 10"]]
-	[RoutineCall, ZRSProbe3]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 4 of 10"]]
-	[RoutineCall, ZRSProbe4]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 5 of 10"]]
-	[RoutineCall, ZRSProbe5]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 6 of 10"]]
-	[RoutineCall, ZRSProbe6]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 7 of 10"]]
-	[RoutineCall, ZRSProbe7]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 8 of 10"]]
-	[RoutineCall, ZRSProbe8]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 9 of 10"]]
-	[RoutineCall, ZRSProbe9]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 10 of 10"]]
-	[RoutineCall, ZRSProbe10]
-	[If, zrsCount == 0, [VarSet, zrsOut, "Image Plane controls\n(none found)"]]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP done"]]
-	[Note, zrsOut]
 	, 0, 0.5
 ]
 
