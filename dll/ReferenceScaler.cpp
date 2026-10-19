@@ -1,7 +1,7 @@
 // ReferenceScaler64.dll
 // Helper for ReferenceScaler.txt. ZScript cannot resize images, so this DLL
 // renders the reference image, scaled and positioned, into a document-sized
-// BMP that the script imports as a texture and paints in with Color > FillLayer.
+// PNG that the script imports as a texture and paints in with Color > FillLayer.
 //
 // All functions use the ZScript [FileExecute] calling convention and return
 // 1 on success or a negative error code. Files live next to the DLL.
@@ -90,50 +90,24 @@ static bool LoadSavedImage()
 	return LoadImage(Widen(buf));
 }
 
-// Writes a 24-bit bottom-up BMP from a 32bpp ARGB bitmap.
-static bool WriteBmp(const std::wstring& path, Gdiplus::Bitmap& frame)
+// Saves the frame as PNG with GDI+'s built-in encoder.
+static bool WritePng(const std::wstring& path, Gdiplus::Bitmap& frame)
 {
-	const int w = frame.GetWidth(), h = frame.GetHeight();
-	Gdiplus::Rect rect(0, 0, w, h);
-	Gdiplus::BitmapData data;
-	if (frame.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &data) != Gdiplus::Ok)
+	UINT count = 0, size = 0;
+	Gdiplus::GetImageEncodersSize(&count, &size);
+	if (size == 0)
 		return false;
-
-	const int rowSize = (w * 3 + 3) & ~3;
-	BITMAPFILEHEADER fh = {};
-	BITMAPINFOHEADER ih = {};
-	fh.bfType = 0x4D42;
-	fh.bfOffBits = sizeof(fh) + sizeof(ih);
-	fh.bfSize = fh.bfOffBits + rowSize * h;
-	ih.biSize = sizeof(ih);
-	ih.biWidth = w;
-	ih.biHeight = h;
-	ih.biPlanes = 1;
-	ih.biBitCount = 24;
-	ih.biCompression = BI_RGB;
-	ih.biSizeImage = rowSize * h;
-
-	FILE* f = _wfopen(path.c_str(), L"wb");
-	if (!f) {
-		frame.UnlockBits(&data);
-		return false;
-	}
-	fwrite(&fh, sizeof(fh), 1, f);
-	fwrite(&ih, sizeof(ih), 1, f);
-	unsigned char* row = static_cast<unsigned char*>(calloc(rowSize, 1));
-	for (int y = h - 1; y >= 0; --y) {
-		const unsigned char* src = static_cast<unsigned char*>(data.Scan0) + y * data.Stride;
-		for (int x = 0; x < w; ++x) {
-			row[x * 3 + 0] = src[x * 4 + 0];
-			row[x * 3 + 1] = src[x * 4 + 1];
-			row[x * 3 + 2] = src[x * 4 + 2];
+	Gdiplus::ImageCodecInfo* codecs = static_cast<Gdiplus::ImageCodecInfo*>(malloc(size));
+	Gdiplus::GetImageEncoders(count, size, codecs);
+	bool saved = false;
+	for (UINT i = 0; i < count; ++i) {
+		if (wcscmp(codecs[i].MimeType, L"image/png") == 0) {
+			saved = frame.Save(path.c_str(), &codecs[i].Clsid, nullptr) == Gdiplus::Ok;
+			break;
 		}
-		fwrite(row, 1, rowSize, f);
 	}
-	free(row);
-	fclose(f);
-	frame.UnlockBits(&data);
-	return true;
+	free(codecs);
+	return saved;
 }
 
 // Returns 1 so the script can check the DLL loads at all.
@@ -183,7 +157,7 @@ ZFUNC RSRender(char* text, double, char*, int, char*, int, char**)
 	const double x = px + ratio * (baseX - ax);
 	const double y = py + ratio * (baseY - ay);
 
-	Gdiplus::Bitmap frame(static_cast<INT>(docW), static_cast<INT>(docH), PixelFormat32bppARGB);
+	Gdiplus::Bitmap frame(static_cast<INT>(docW), static_cast<INT>(docH), PixelFormat24bppRGB);
 	{
 		Gdiplus::Graphics g(&frame);
 		g.Clear(Gdiplus::Color(255, 0, 0, 0));
@@ -192,7 +166,7 @@ ZFUNC RSRender(char* text, double, char*, int, char*, int, char**)
 		g.DrawImage(gImage, Gdiplus::RectF(static_cast<Gdiplus::REAL>(x), static_cast<Gdiplus::REAL>(y),
 			static_cast<Gdiplus::REAL>(baseW * ratio), static_cast<Gdiplus::REAL>(baseH * ratio)));
 	}
-	if (!WriteBmp(DllFolder() + Widen(frameName), frame))
+	if (!WritePng(DllFolder() + Widen(frameName), frame))
 		return -4;
 	return 1;
 }
