@@ -12,7 +12,7 @@
 
 // Shown in every click's note-bar message and in the About popup, so it is
 // obvious which version of the script a button is actually running.
-[VarDef, zrsBuild, "build 11"]
+[VarDef, zrsBuild, "build 12"]
 
 // ---------------------------------------------------------------------------
 // Image Plane slider paths. These are auto-detected (see ZRSDetect). If your
@@ -118,9 +118,10 @@
 // Finds the first existing slider for each Image Plane control.
 [RoutineDef, ZRSDetect,
 	[VarSet, zrsSizePath, ""]
-	[If, [IExists, "Texture:Image Plane:ImgSize"], [VarSet, zrsSizePath, "Texture:Image Plane:ImgSize"]]
+	// "Image Size" is the name in ZBrush 2022's Image Plane; the rest are fallbacks.
+	[If, [IExists, "Texture:Image Plane:Image Size"], [VarSet, zrsSizePath, "Texture:Image Plane:Image Size"]]
+	[If, [StrLength, zrsSizePath] == 0, [If, [IExists, "Texture:Image Plane:ImgSize"], [VarSet, zrsSizePath, "Texture:Image Plane:ImgSize"]]]
 	[If, [StrLength, zrsSizePath] == 0, [If, [IExists, "Texture:Image Plane:Img Size"], [VarSet, zrsSizePath, "Texture:Image Plane:Img Size"]]]
-	[If, [StrLength, zrsSizePath] == 0, [If, [IExists, "Texture:Image Plane:Image Size"], [VarSet, zrsSizePath, "Texture:Image Plane:Image Size"]]]
 	[If, [StrLength, zrsSizePath] == 0, [If, [IExists, "Texture:Image Plane:Size"], [VarSet, zrsSizePath, "Texture:Image Plane:Size"]]]
 	[If, [StrLength, zrsSizePath] == 0, [If, [IExists, "Texture:Image Plane:Scale"], [VarSet, zrsSizePath, "Texture:Image Plane:Scale"]]]
 
