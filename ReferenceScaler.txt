@@ -233,6 +233,139 @@
 ]
 
 // ---------------------------------------------------------------------------
+// Diagnostics: probe
+// ---------------------------------------------------------------------------
+// Read-only. Checks likely Image Plane control paths with IExists, written
+// the same way as ZRSDetect, and shows the ones that exist with their values.
+// Checks are split into small routines, each showing its own popup, to stay
+// under ZScript's string length limit.
+[VarDef, zrsOut, ""]
+
+[RoutineDef, ZRSProbe1,
+	[VarSet, zrsOut, ""]
+	[If, [IExists, "Texture:Image Plane:Load Image"], [VarSet, zrsOut, [StrMerge, zrsOut, "Load Image = ", [IGet, "Texture:Image Plane:Load Image"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Image Plane"], [VarSet, zrsOut, [StrMerge, zrsOut, "Image Plane = ", [IGet, "Texture:Image Plane:Image Plane"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Make Image Plane"], [VarSet, zrsOut, [StrMerge, zrsOut, "Make Image Plane = ", [IGet, "Texture:Image Plane:Make Image Plane"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Size"], [VarSet, zrsOut, [StrMerge, zrsOut, "Size = ", [IGet, "Texture:Image Plane:Size"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:ImgSize"], [VarSet, zrsOut, [StrMerge, zrsOut, "ImgSize = ", [IGet, "Texture:Image Plane:ImgSize"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Img Size"], [VarSet, zrsOut, [StrMerge, zrsOut, "Img Size = ", [IGet, "Texture:Image Plane:Img Size"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Image Size"], [VarSet, zrsOut, [StrMerge, zrsOut, "Image Size = ", [IGet, "Texture:Image Plane:Image Size"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Scale"], [VarSet, zrsOut, [StrMerge, zrsOut, "Scale = ", [IGet, "Texture:Image Plane:Scale"], "\n"]]]
+	[If, [StrLength, zrsOut], [Note, [StrMerge, "Probe part 1 of 10\n\n", zrsOut]]]
+]
+
+[RoutineDef, ZRSProbe2,
+	[VarSet, zrsOut, ""]
+	[If, [IExists, "Texture:Image Plane:Zoom"], [VarSet, zrsOut, [StrMerge, zrsOut, "Zoom = ", [IGet, "Texture:Image Plane:Zoom"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Fill"], [VarSet, zrsOut, [StrMerge, zrsOut, "Fill = ", [IGet, "Texture:Image Plane:Fill"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Fit"], [VarSet, zrsOut, [StrMerge, zrsOut, "Fit = ", [IGet, "Texture:Image Plane:Fit"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reset"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reset = ", [IGet, "Texture:Image Plane:Reset"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Shift H"], [VarSet, zrsOut, [StrMerge, zrsOut, "Shift H = ", [IGet, "Texture:Image Plane:Shift H"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Shift V"], [VarSet, zrsOut, [StrMerge, zrsOut, "Shift V = ", [IGet, "Texture:Image Plane:Shift V"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:ShiftH"], [VarSet, zrsOut, [StrMerge, zrsOut, "ShiftH = ", [IGet, "Texture:Image Plane:ShiftH"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:ShiftV"], [VarSet, zrsOut, [StrMerge, zrsOut, "ShiftV = ", [IGet, "Texture:Image Plane:ShiftV"], "\n"]]]
+	[If, [StrLength, zrsOut], [Note, [StrMerge, "Probe part 2 of 10\n\n", zrsOut]]]
+]
+
+[RoutineDef, ZRSProbe3,
+	[VarSet, zrsOut, ""]
+	[If, [IExists, "Texture:Image Plane:Offset H"], [VarSet, zrsOut, [StrMerge, zrsOut, "Offset H = ", [IGet, "Texture:Image Plane:Offset H"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Offset V"], [VarSet, zrsOut, [StrMerge, zrsOut, "Offset V = ", [IGet, "Texture:Image Plane:Offset V"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:H Offset"], [VarSet, zrsOut, [StrMerge, zrsOut, "H Offset = ", [IGet, "Texture:Image Plane:H Offset"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:V Offset"], [VarSet, zrsOut, [StrMerge, zrsOut, "V Offset = ", [IGet, "Texture:Image Plane:V Offset"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Position X"], [VarSet, zrsOut, [StrMerge, zrsOut, "Position X = ", [IGet, "Texture:Image Plane:Position X"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Position Y"], [VarSet, zrsOut, [StrMerge, zrsOut, "Position Y = ", [IGet, "Texture:Image Plane:Position Y"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Model Opacity"], [VarSet, zrsOut, [StrMerge, zrsOut, "Model Opacity = ", [IGet, "Texture:Image Plane:Model Opacity"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Opacity"], [VarSet, zrsOut, [StrMerge, zrsOut, "Opacity = ", [IGet, "Texture:Image Plane:Opacity"], "\n"]]]
+	[If, [StrLength, zrsOut], [Note, [StrMerge, "Probe part 3 of 10\n\n", zrsOut]]]
+]
+
+[RoutineDef, ZRSProbe4,
+	[VarSet, zrsOut, ""]
+	[If, [IExists, "Texture:Image Plane:Transparency"], [VarSet, zrsOut, [StrMerge, zrsOut, "Transparency = ", [IGet, "Texture:Image Plane:Transparency"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Ghost"], [VarSet, zrsOut, [StrMerge, zrsOut, "Ghost = ", [IGet, "Texture:Image Plane:Ghost"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Ghost Mode"], [VarSet, zrsOut, [StrMerge, zrsOut, "Ghost Mode = ", [IGet, "Texture:Image Plane:Ghost Mode"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Store View"], [VarSet, zrsOut, [StrMerge, zrsOut, "Store View = ", [IGet, "Texture:Image Plane:Store View"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Restore View"], [VarSet, zrsOut, [StrMerge, zrsOut, "Restore View = ", [IGet, "Texture:Image Plane:Restore View"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views = ", [IGet, "Texture:Image Plane:Reference Views"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Help"], [VarSet, zrsOut, [StrMerge, zrsOut, "Help = ", [IGet, "Texture:Image Plane:Help"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Front"], [VarSet, zrsOut, [StrMerge, zrsOut, "Front = ", [IGet, "Texture:Image Plane:Front"], "\n"]]]
+	[If, [StrLength, zrsOut], [Note, [StrMerge, "Probe part 4 of 10\n\n", zrsOut]]]
+]
+
+[RoutineDef, ZRSProbe5,
+	[VarSet, zrsOut, ""]
+	[If, [IExists, "Texture:Image Plane:Back"], [VarSet, zrsOut, [StrMerge, zrsOut, "Back = ", [IGet, "Texture:Image Plane:Back"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Left"], [VarSet, zrsOut, [StrMerge, zrsOut, "Left = ", [IGet, "Texture:Image Plane:Left"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Right"], [VarSet, zrsOut, [StrMerge, zrsOut, "Right = ", [IGet, "Texture:Image Plane:Right"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Top"], [VarSet, zrsOut, [StrMerge, zrsOut, "Top = ", [IGet, "Texture:Image Plane:Top"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Bottom"], [VarSet, zrsOut, [StrMerge, zrsOut, "Bottom = ", [IGet, "Texture:Image Plane:Bottom"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Load Image"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Load Image = ", [IGet, "Texture:Image Plane:Reference Views:Load Image"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Image Plane"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Image Plane = ", [IGet, "Texture:Image Plane:Reference Views:Image Plane"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Make Image Plane"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Make Image Plane = ", [IGet, "Texture:Image Plane:Reference Views:Make Image Plane"], "\n"]]]
+	[If, [StrLength, zrsOut], [Note, [StrMerge, "Probe part 5 of 10\n\n", zrsOut]]]
+]
+
+[RoutineDef, ZRSProbe6,
+	[VarSet, zrsOut, ""]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Size"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Size = ", [IGet, "Texture:Image Plane:Reference Views:Size"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:ImgSize"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:ImgSize = ", [IGet, "Texture:Image Plane:Reference Views:ImgSize"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Img Size"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Img Size = ", [IGet, "Texture:Image Plane:Reference Views:Img Size"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Image Size"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Image Size = ", [IGet, "Texture:Image Plane:Reference Views:Image Size"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Scale"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Scale = ", [IGet, "Texture:Image Plane:Reference Views:Scale"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Zoom"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Zoom = ", [IGet, "Texture:Image Plane:Reference Views:Zoom"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Fill"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Fill = ", [IGet, "Texture:Image Plane:Reference Views:Fill"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Fit"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Fit = ", [IGet, "Texture:Image Plane:Reference Views:Fit"], "\n"]]]
+	[If, [StrLength, zrsOut], [Note, [StrMerge, "Probe part 6 of 10\n\n", zrsOut]]]
+]
+
+[RoutineDef, ZRSProbe7,
+	[VarSet, zrsOut, ""]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Reset"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Reset = ", [IGet, "Texture:Image Plane:Reference Views:Reset"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Shift H"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Shift H = ", [IGet, "Texture:Image Plane:Reference Views:Shift H"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Shift V"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Shift V = ", [IGet, "Texture:Image Plane:Reference Views:Shift V"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:ShiftH"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:ShiftH = ", [IGet, "Texture:Image Plane:Reference Views:ShiftH"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:ShiftV"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:ShiftV = ", [IGet, "Texture:Image Plane:Reference Views:ShiftV"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Offset H"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Offset H = ", [IGet, "Texture:Image Plane:Reference Views:Offset H"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Offset V"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Offset V = ", [IGet, "Texture:Image Plane:Reference Views:Offset V"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:H Offset"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:H Offset = ", [IGet, "Texture:Image Plane:Reference Views:H Offset"], "\n"]]]
+	[If, [StrLength, zrsOut], [Note, [StrMerge, "Probe part 7 of 10\n\n", zrsOut]]]
+]
+
+[RoutineDef, ZRSProbe8,
+	[VarSet, zrsOut, ""]
+	[If, [IExists, "Texture:Image Plane:Reference Views:V Offset"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:V Offset = ", [IGet, "Texture:Image Plane:Reference Views:V Offset"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Position X"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Position X = ", [IGet, "Texture:Image Plane:Reference Views:Position X"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Position Y"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Position Y = ", [IGet, "Texture:Image Plane:Reference Views:Position Y"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Model Opacity"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Model Opacity = ", [IGet, "Texture:Image Plane:Reference Views:Model Opacity"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Opacity"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Opacity = ", [IGet, "Texture:Image Plane:Reference Views:Opacity"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Transparency"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Transparency = ", [IGet, "Texture:Image Plane:Reference Views:Transparency"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Ghost"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Ghost = ", [IGet, "Texture:Image Plane:Reference Views:Ghost"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Ghost Mode"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Ghost Mode = ", [IGet, "Texture:Image Plane:Reference Views:Ghost Mode"], "\n"]]]
+	[If, [StrLength, zrsOut], [Note, [StrMerge, "Probe part 8 of 10\n\n", zrsOut]]]
+]
+
+[RoutineDef, ZRSProbe9,
+	[VarSet, zrsOut, ""]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Store View"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Store View = ", [IGet, "Texture:Image Plane:Reference Views:Store View"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Restore View"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Restore View = ", [IGet, "Texture:Image Plane:Reference Views:Restore View"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Reference Views"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Reference Views = ", [IGet, "Texture:Image Plane:Reference Views:Reference Views"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Help"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Help = ", [IGet, "Texture:Image Plane:Reference Views:Help"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Front"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Front = ", [IGet, "Texture:Image Plane:Reference Views:Front"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Back"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Back = ", [IGet, "Texture:Image Plane:Reference Views:Back"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Left"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Left = ", [IGet, "Texture:Image Plane:Reference Views:Left"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Right"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Right = ", [IGet, "Texture:Image Plane:Reference Views:Right"], "\n"]]]
+	[If, [StrLength, zrsOut], [Note, [StrMerge, "Probe part 9 of 10\n\n", zrsOut]]]
+]
+
+[RoutineDef, ZRSProbe10,
+	[VarSet, zrsOut, ""]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Top"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Top = ", [IGet, "Texture:Image Plane:Reference Views:Top"], "\n"]]]
+	[If, [IExists, "Texture:Image Plane:Reference Views:Bottom"], [VarSet, zrsOut, [StrMerge, zrsOut, "Reference Views:Bottom = ", [IGet, "Texture:Image Plane:Reference Views:Bottom"], "\n"]]]
+	[If, [StrLength, zrsOut], [Note, [StrMerge, "Probe part 10 of 10\n\n", zrsOut]]]
+]
+
+// ---------------------------------------------------------------------------
 // Interface
 // ---------------------------------------------------------------------------
 [ISubPalette, "ZPlugin:Reference Scaler"]
@@ -343,81 +476,19 @@
 	, 0, 0.5
 ]
 
-// ---------------------------------------------------------------------------
-// Diagnostics: probe
-// ---------------------------------------------------------------------------
-// Read-only. Checks a list of likely Image Plane control paths with IExists
-// (scanning by window ID errors out in ZBrush 2022) and shows the ones that
-// exist, with their values, in popups.
-[VarDef, zrsItem, ""]
-[VarDef, zrsOut, ""]
-[VarDef, zrsCount, 0]
-[VarDef, zrsRest, ""]
-[VarDef, zrsK, 0]
-[VarDef, zrsPrefix, ""]
-[VarDef, zrsNames, ""]
-[VarDef, zrsNames1, "Load Image|Image Plane|Make Image Plane|Size|ImgSize|Img Size|Image Size|Scale|Zoom|Fill|Fit|Reset|"]
-[VarDef, zrsNames2, "Shift H|Shift V|ShiftH|ShiftV|Offset H|Offset V|H Offset|V Offset|Position X|Position Y|"]
-[VarDef, zrsNames3, "Model Opacity|Opacity|Transparency|Ghost|Ghost Mode|Store View|Restore View|Reference Views|Help|"]
-[VarDef, zrsNames4, "Front|Back|Left|Right|Top|Bottom|<<|>>|"]
-
-// ZScript strings hold about 255 characters, so results are shown in
-// several popups instead of one long one.
-[RoutineDef, ZRSProbeFlush,
-	[If, [StrLength, zrsOut] > 0,
-		[Note, zrsOut]
-		[VarSet, zrsOut, ""]
-	]
-]
-
-[RoutineDef, ZRSProbeOne,
-	[If, [IExists, #zrsItem],
-		[If, [StrLength, zrsOut] + [StrLength, zrsItem] > 180, [RoutineCall, ZRSProbeFlush]]
-		[VarSet, zrsOut, [StrMerge, zrsOut, zrsItem, " = ", [IGet, #zrsItem], "\n"]]
-		[VarSet, zrsCount, zrsCount + 1]
-	]
-]
-
-// Checks zrsPrefix + ":" + each "|"-terminated name in zrsNames.
-[RoutineDef, ZRSProbeList,
-	[VarSet, zrsRest, zrsNames]
-	[Loop, 40,
-		[VarSet, zrsK, [StrFind, "|", zrsRest]]
-		[If, zrsK < 1, [LoopExit]]
-		[VarSet, zrsItem, [StrMerge, zrsPrefix, ":", [StrExtract, zrsRest, 0, zrsK - 1]]]
-		[RoutineCall, ZRSProbeOne]
-		[If, zrsK + 1 >= [StrLength, zrsRest],
-			[VarSet, zrsRest, ""]
-			,
-			[VarSet, zrsRest, [StrExtract, zrsRest, zrsK + 1, [StrLength, zrsRest] - 1]]
-		]
-	]
-]
-
-// Checks every name list under zrsPrefix.
-[RoutineDef, ZRSProbePrefix,
-	[VarSet, zrsNames, zrsNames1]
-	[RoutineCall, ZRSProbeList]
-	[VarSet, zrsNames, zrsNames2]
-	[RoutineCall, ZRSProbeList]
-	[VarSet, zrsNames, zrsNames3]
-	[RoutineCall, ZRSProbeList]
-	[VarSet, zrsNames, zrsNames4]
-	[RoutineCall, ZRSProbeList]
-]
-
-[IButton, "ZPlugin:Reference Scaler:Probe",
+[IButton, "ZPlugin:Reference Scaler:Probe IP",
 	"Read-only: list the Image Plane controls that exist and their values in popups.",
-	[Note, "Reference Scaler probe: started. Click OK to continue."]
-	[VarSet, zrsOut, ""]
-	[VarSet, zrsCount, 0]
-	[VarSet, zrsPrefix, "Texture:Image Plane"]
-	[RoutineCall, ZRSProbePrefix]
-	[VarSet, zrsPrefix, "Texture:Image Plane:Reference Views"]
-	[RoutineCall, ZRSProbePrefix]
-	[VarSet, zrsPrefix, "Texture:Image Plane:Image Plane"]
-	[RoutineCall, ZRSProbePrefix]
-	[RoutineCall, ZRSProbeFlush]
-	[Note, [StrMerge, "Probe finished: ", zrsCount, " Image Plane items found."]]
+	[Note, "Probe IP started. Click OK."]
+	[RoutineCall, ZRSProbe1]
+	[RoutineCall, ZRSProbe2]
+	[RoutineCall, ZRSProbe3]
+	[RoutineCall, ZRSProbe4]
+	[RoutineCall, ZRSProbe5]
+	[RoutineCall, ZRSProbe6]
+	[RoutineCall, ZRSProbe7]
+	[RoutineCall, ZRSProbe8]
+	[RoutineCall, ZRSProbe9]
+	[RoutineCall, ZRSProbe10]
+	[Note, "Probe IP finished."]
 	, 0, 0.5
 ]
