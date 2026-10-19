@@ -7,23 +7,17 @@
 // ZPlugin > Reference Scaler b<build>. ZBrush keeps buttons bound to the
 // version that first created them until it restarts, so the sub-palette name
 // carries the build number: each new build gets fresh buttons without a restart.
+//
+// Only commands seen working in ZBrush 2022 are used for feedback: [Note, text]
+// popups (the note bar is cleared when the script ends, so it shows nothing).
+// The anchor is stored in the Anchor Scale / Anchor Size sliders rather than in
+// variables, because variables reset whenever ZBrush reloads the script.
 
 [IConfig, 2022]
 [IShowActions, 0]
 
-// Shown by About and in every note-bar message, to confirm which version a
-// button is running.
-[VarDef, zrsBuild, "build 15"]
-
-// Anchor state, captured when the reference is lined up with the model.
-[VarDef, zrsAnchored, 0]
-[VarDef, zrsBaseScale, 0]
-[VarDef, zrsBaseSize, 0]
-
-// Live mode.
+[VarDef, zrsBuild, "build 16"]
 [VarDef, zrsLive, 0]
-
-// Scratch values.
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -33,85 +27,60 @@
 [VarDef, zrsRx, 0]
 [VarDef, zrsRy, 0]
 [VarDef, zrsRz, 0]
-[VarDef, zrsRatio, 1]
+[VarDef, zrsBaseScale, 0]
+[VarDef, zrsBaseSize, 0]
 [VarDef, zrsBefore, 0]
 [VarDef, zrsTarget, 0]
 [VarDef, zrsMsg, ""]
 
-// ZBrush unloads this script whenever another ZScript runs (Image Plane is a
-// ZScript), and reloading resets every VarDef above. The anchor is kept in a
-// memory block, which lives for the whole ZBrush session.
-// ZRSState holds 3 floats: anchored, baseScale, baseSize.
-[RoutineDef, ZRSSave,
-	[If, [MemGetSize, ZRSState] == 0, [MemCreate, ZRSState, 12, 0]]
-	[MemWrite, ZRSState, zrsAnchored, 0, 0]
-	[MemWrite, ZRSState, zrsBaseScale, 0, 4]
-	[MemWrite, ZRSState, zrsBaseSize, 0, 8]
-]
-
-[RoutineDef, ZRSLoad,
-	[If, [MemGetSize, ZRSState],
-		[MemRead, ZRSState, zrsAnchored, 0, 0]
-		[MemRead, ZRSState, zrsBaseScale, 0, 4]
-		[MemRead, ZRSState, zrsBaseSize, 0, 8]
-	]
-]
-
-// Records the current model scale and Image Size. Line the reference up with
-// the model first.
+// Records the current model scale and Image Size in the anchor sliders and
+// leaves a one-line result in zrsMsg.
 [RoutineDef, ZRSAnchor,
-	[VarSet, zrsAnchored, 0]
 	[If, [IExists, "Texture:Image Plane:Image Size"] == 0,
-		[Note, "Reference Scaler: Texture > Image Plane > Image Size not found."]
+		[VarSet, zrsMsg, "Texture > Image Plane > Image Size not found."]
 		,
 		[If, [IGet, Transform:Edit] == 0,
-			[Note, "Reference Scaler: put the model in Edit mode first."]
+			[VarSet, zrsMsg, "Put the model in Edit mode first."]
 			,
 			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-			[If, zrsSx <= 0,
-				[Note, "Reference Scaler: could not read the model scale."]
-				,
-				[VarSet, zrsBaseScale, zrsSx]
-				[VarSet, zrsBaseSize, [IGet, "Texture:Image Plane:Image Size"]]
-				[VarSet, zrsAnchored, 1]
-			]
+			[VarSet, zrsBaseSize, [IGet, "Texture:Image Plane:Image Size"]]
+			[ISet, "ZPlugin:Reference Scaler b16:Anchor Scale", zrsSx]
+			[ISet, "ZPlugin:Reference Scaler b16:Anchor Size", zrsBaseSize]
+			[VarSet, zrsMsg, [StrMerge, "Anchored: model scale ", zrsSx, ", Image Size ", zrsBaseSize]]
 		]
 	]
-	[RoutineCall, ZRSSave]
 ]
 
-// Sets Image Size to baseSize * (current scale / anchored scale) and leaves a
-// one-line result in zrsMsg for the caller to show.
+// Sets Image Size to anchorSize * (current scale / anchorScale) and leaves a
+// result in zrsMsg.
 [RoutineDef, ZRSUpdate,
-	[VarSet, zrsBefore, 0]
-	[VarSet, zrsTarget, 0]
-	[If, zrsAnchored == 0,
-		[VarSet, zrsMsg, [StrMerge, "Reference Scaler ", zrsBuild, ": not anchored"]]
+	[VarSet, zrsBaseScale, [IGet, "ZPlugin:Reference Scaler b16:Anchor Scale"]]
+	[VarSet, zrsBaseSize, [IGet, "ZPlugin:Reference Scaler b16:Anchor Size"]]
+	[If, zrsBaseScale <= 0,
+		[VarSet, zrsMsg, "Not anchored: press Anchor first."]
 		,
 		[If, [IGet, Transform:Edit] == 0,
-			[VarSet, zrsMsg, [StrMerge, "Reference Scaler ", zrsBuild, ": model not in Edit mode"]]
+			[VarSet, zrsMsg, "Put the model in Edit mode first."]
 			,
 			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-			[VarSet, zrsRatio, zrsSx / zrsBaseScale]
-			[VarSet, zrsTarget, zrsBaseSize * zrsRatio]
-			[If, zrsTarget < [IGetMin, "Texture:Image Plane:Image Size"], [VarSet, zrsTarget, [IGetMin, "Texture:Image Plane:Image Size"]]]
-			[If, zrsTarget > [IGetMax, "Texture:Image Plane:Image Size"], [VarSet, zrsTarget, [IGetMax, "Texture:Image Plane:Image Size"]]]
+			[VarSet, zrsTarget, zrsBaseSize * zrsSx / zrsBaseScale]
 			[VarSet, zrsBefore, [IGet, "Texture:Image Plane:Image Size"]]
 			[ISet, "Texture:Image Plane:Image Size", zrsTarget]
-			[VarSet, zrsMsg, [StrMerge, "Reference Scaler ", zrsBuild, ": scale ", zrsSx, " / ", zrsBaseScale]]
-			[VarSet, zrsMsg, [StrMerge, zrsMsg, "  Image Size ", zrsBefore, " -> ", [IGet, "Texture:Image Plane:Image Size"]]]
+			[VarSet, zrsMsg, [StrMerge, "Model scale ", zrsSx, " (anchor ", zrsBaseScale, ")"]]
+			[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nImage Size ", zrsBefore, " -> wanted ", zrsTarget]]
+			[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nImage Size now ", [IGet, "Texture:Image Plane:Image Size"]]]
 		]
 	]
 ]
 
 // Live loop: wakes on the timer (1) or on left mouse button up (8), i.e. when
-// a zoom drag finishes, updates, then goes back to sleep. Another ZScript
-// starting ends the loop (ZBrush only runs one script at a time).
+// a zoom drag finishes, updates, then goes back to sleep. It has no popups,
+// since a popup on every update would block zooming. Another ZScript starting
+// ends the loop (ZBrush only runs one script at a time).
 [RoutineDef, ZRSLiveLoop,
 	[Sleep, 0.5,
 		[If, zrsLive,
 			[RoutineCall, ZRSUpdate]
-			[NoteBar, zrsMsg]
 			[SleepAgain, 0.5, 9]
 		]
 	, 9]
@@ -120,67 +89,53 @@
 // ---------------------------------------------------------------------------
 // Interface
 // ---------------------------------------------------------------------------
-// Each button writes a note-bar message before and after every step, so if it
-// stops, the last message shows where.
-[ISubPalette, "ZPlugin:Reference Scaler b15"]
+[ISubPalette, "ZPlugin:Reference Scaler b16"]
 
-[IButton, "ZPlugin:Reference Scaler b15:Anchor",
+[IButton, "ZPlugin:Reference Scaler b16:Anchor",
 	"Line the Image Plane reference up with the model, then press to record this as the 1:1 zoom.",
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Anchor started"]]
 	[RoutineCall, ZRSAnchor]
-	[If, zrsAnchored,
-		[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": anchored at scale ", zrsBaseScale, ", Image Size ", zrsBaseSize]]
-		,
-		[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Anchor failed"]]
-	]
+	[Note, zrsMsg]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b15:Sync",
+[IButton, "ZPlugin:Reference Scaler b16:Sync",
 	"Rescale the reference to the current zoom once.",
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Sync started"]]
-	[RoutineCall, ZRSLoad]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Sync loaded anchor ", zrsAnchored, " scale ", zrsBaseScale]]
 	[RoutineCall, ZRSUpdate]
-	[NoteBar, zrsMsg]
+	[Note, zrsMsg]
 	, 0, 0.5
 ]
 
-[ISwitch, "ZPlugin:Reference Scaler b15:Live", 0,
+[ISwitch, "ZPlugin:Reference Scaler b16:Live", 0,
 	"Keep rescaling the reference as the camera zooms.",
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Live started"]]
-	[RoutineCall, ZRSLoad]
-	[If, zrsAnchored == 0, [RoutineCall, ZRSAnchor]]
-	[If, zrsAnchored,
-		[VarSet, zrsLive, 1]
-		[RoutineCall, ZRSUpdate]
-		[NoteBar, zrsMsg]
-		[RoutineCall, ZRSLiveLoop]
-		,
-		[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Live needs Anchor"]]
-		[ISet, "ZPlugin:Reference Scaler b15:Live", 0]
-	]
+	[VarSet, zrsLive, 1]
+	[RoutineCall, ZRSUpdate]
+	[Note, [StrMerge, "Live on.\n", zrsMsg]]
+	[RoutineCall, ZRSLiveLoop]
 	,
 	[VarSet, zrsLive, 0]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Live off"]]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b15:Reset",
+[IButton, "ZPlugin:Reference Scaler b16:Reset",
 	"Put Image Size back to its anchored value.",
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Reset started"]]
-	[RoutineCall, ZRSLoad]
-	[If, zrsAnchored,
-		[ISet, "Texture:Image Plane:Image Size", zrsBaseSize]
-		[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Image Size reset to ", zrsBaseSize]]
-		,
-		[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Reset needs Anchor"]]
-	]
+	[ISet, "Texture:Image Plane:Image Size", [IGet, "ZPlugin:Reference Scaler b16:Anchor Size"]]
+	[Note, [StrMerge, "Image Size reset to ", [IGet, "Texture:Image Plane:Image Size"]]]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b15:About",
+[IButton, "ZPlugin:Reference Scaler b16:About",
 	"Show which build of the script this button is running.",
 	[Note, [StrMerge, "Reference Scaler ", zrsBuild]]
 	, 0, 0.5
+]
+
+// Anchor storage. Set by Anchor; shown so the anchored values are visible.
+[ISlider, "ZPlugin:Reference Scaler b16:Anchor Scale", 0, 0.001, 0, 100000,
+	"Model scale recorded by Anchor.",
+	, 0, 1
+]
+
+[ISlider, "ZPlugin:Reference Scaler b16:Anchor Size", 0, 0.001, 0, 10000,
+	"Image Plane Image Size recorded by Anchor.",
+	, 0, 1
 ]
