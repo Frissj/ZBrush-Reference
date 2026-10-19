@@ -10,9 +10,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-// Shown by About and in every note-bar message, to confirm which version a
+// Shown by About and in every status popup, to confirm which version a
 // button is running.
-[VarDef, zrsBuild, "build 13"]
+[VarDef, zrsBuild, "build 14"]
 
 // Anchor state, captured when the reference is lined up with the model.
 [VarDef, zrsAnchored, 0]
@@ -79,9 +79,13 @@
 	[RoutineCall, ZRSSave]
 ]
 
-// Sets Image Size to baseSize * (current scale / anchored scale) and puts the
-// result in the note bar.
+// Sets Image Size to baseSize * (current scale / anchored scale) and shows the
+// result in a popup that closes itself. The note bar is not used: ZBrush
+// clears it as soon as the script finishes, so it never showed anything.
+// In Live mode (zrsLive) the popup only appears when Image Size changes.
 [RoutineDef, ZRSUpdate,
+	[VarSet, zrsBefore, 0]
+	[VarSet, zrsTarget, 0]
 	[If, zrsAnchored == 0,
 		[VarSet, zrsMsg, [StrMerge, "Reference Scaler ", zrsBuild, ": not anchored"]]
 		,
@@ -99,7 +103,7 @@
 			[VarSet, zrsMsg, [StrMerge, zrsMsg, "  Image Size ", zrsBefore, " -> ", [IGet, "Texture:Image Plane:Image Size"]]]
 		]
 	]
-	[NoteBar, zrsMsg]
+	[If, zrsLive == 0 || ABS(zrsTarget - zrsBefore) > 0.5, [Note, zrsMsg, , 2]]
 ]
 
 // Live loop: wakes on the timer (1) or on left mouse button up (8), i.e. when
@@ -123,7 +127,7 @@
 	"Line the Image Plane reference up with the model, then press to record this as the 1:1 zoom.",
 	[RoutineCall, ZRSAnchor]
 	[If, zrsAnchored,
-		[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": anchored at scale ", zrsBaseScale, ", Image Size ", zrsBaseSize]]
+		[Note, [StrMerge, "Reference Scaler ", zrsBuild, ": anchored at scale ", zrsBaseScale, ", Image Size ", zrsBaseSize], , 2]
 	]
 	, 0, 0.5
 ]
@@ -148,7 +152,7 @@
 	]
 	,
 	[VarSet, zrsLive, 0]
-	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Live off"]]
+	[Note, [StrMerge, "Reference Scaler ", zrsBuild, ": Live off"], , 1]
 	, 0, 0.5
 ]
 
@@ -157,7 +161,7 @@
 	[RoutineCall, ZRSLoad]
 	[If, zrsAnchored,
 		[ISet, "Texture:Image Plane:Image Size", zrsBaseSize]
-		[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Image Size reset to ", zrsBaseSize]]
+		[Note, [StrMerge, "Reference Scaler ", zrsBuild, ": Image Size reset to ", zrsBaseSize], , 2]
 	]
 	, 0, 0.5
 ]
