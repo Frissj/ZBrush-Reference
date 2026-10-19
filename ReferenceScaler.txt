@@ -10,6 +10,10 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
+// Shown in every click's note-bar message and in the About popup, so it is
+// obvious which version of the script a button is actually running.
+[VarDef, zrsBuild, "build 10"]
+
 // ---------------------------------------------------------------------------
 // Image Plane slider paths. These are auto-detected (see ZRSDetect). If your
 // Image Plane version names them differently, use "Set Paths" in the plugin
@@ -365,6 +369,7 @@
 
 [IButton, "ZPlugin:Reference Scaler:Anchor",
 	"Line the Image Plane reference up with the model, then press to record this as the 1:1 zoom.",
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Anchor clicked"]]
 	[RoutineCall, ZRSLoad]
 	[RoutineCall, ZRSAnchor]
 	[If, zrsAnchored,
@@ -375,6 +380,7 @@
 
 [IButton, "ZPlugin:Reference Scaler:Sync",
 	"Rescale the reference to the current zoom once. Assign a hotkey to this if Live mode gets interrupted.",
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Sync clicked"]]
 	[RoutineCall, ZRSLoad]
 	[If, zrsAnchored,
 		[RoutineCall, ZRSUpdate]
@@ -388,6 +394,7 @@
 
 [ISwitch, "ZPlugin:Reference Scaler:Live", 0,
 	"Continuously rescale the reference as the camera zooms.",
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Live on"]]
 	[RoutineCall, ZRSLoad]
 	[If, zrsAnchored == 0, [RoutineCall, ZRSAnchor]]
 	[If, zrsAnchored,
@@ -404,6 +411,7 @@
 
 [IButton, "ZPlugin:Reference Scaler:Reset",
 	"Restore the Image Plane sliders to their anchored values.",
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Reset clicked"]]
 	[RoutineCall, ZRSLoad]
 	[If, zrsAnchored,
 		[ISet, #zrsSizePath, zrsBaseSize]
@@ -431,6 +439,7 @@
 
 [IButton, "ZPlugin:Reference Scaler:Detect",
 	"Find the Image Plane sliders automatically and show what was found.",
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Detect clicked"]]
 	[RoutineCall, ZRSDetect]
 	[RoutineCall, ZRSShowPaths]
 	, 0, 0.5
@@ -438,6 +447,7 @@
 
 [IButton, "ZPlugin:Reference Scaler:Set Paths",
 	"Type the interface paths of the Image Plane size and shift sliders by hand.",
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Set Paths clicked"]]
 	[RoutineCall, ZRSLoad]
 	[VarSet, zrsInput, [StrAsk, zrsSizePath, "Image Plane size slider path"]]
 	[If, [StrLength, zrsInput], [VarSet, zrsSizePath, zrsInput]]
@@ -458,6 +468,7 @@
 
 [IButton, "ZPlugin:Reference Scaler:Status",
 	"Show everything the plugin currently sees: edit mode, model scale, anchor values and slider paths.",
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Status clicked"]]
 	[RoutineCall, ZRSLoad]
 	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
 	[If, zrsBaseScale > 0, [VarSet, zrsRatio, zrsSx / zrsBaseScale]]
@@ -471,19 +482,37 @@
 
 [IButton, "ZPlugin:Reference Scaler:Probe IP",
 	"Read-only: list the Image Plane controls that exist and their values.",
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP clicked"]]
 	[VarSet, zrsOut, "Image Plane controls\n"]
 	[VarSet, zrsCount, 0]
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 1 of 10"]]
 	[RoutineCall, ZRSProbe1]
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 2 of 10"]]
 	[RoutineCall, ZRSProbe2]
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 3 of 10"]]
 	[RoutineCall, ZRSProbe3]
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 4 of 10"]]
 	[RoutineCall, ZRSProbe4]
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 5 of 10"]]
 	[RoutineCall, ZRSProbe5]
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 6 of 10"]]
 	[RoutineCall, ZRSProbe6]
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 7 of 10"]]
 	[RoutineCall, ZRSProbe7]
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 8 of 10"]]
 	[RoutineCall, ZRSProbe8]
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 9 of 10"]]
 	[RoutineCall, ZRSProbe9]
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP part 10 of 10"]]
 	[RoutineCall, ZRSProbe10]
 	[If, zrsCount == 0, [VarSet, zrsOut, "Image Plane controls\n(none found)"]]
+	[NoteBar, [StrMerge, "Reference Scaler ", zrsBuild, ": Probe IP done"]]
 	[Note, zrsOut]
+	, 0, 0.5
+]
+
+[IButton, "ZPlugin:Reference Scaler:About",
+	"Show which build of the script this button is running.",
+	[Note, [StrMerge, "Reference Scaler ", zrsBuild]]
 	, 0, 0.5
 ]
