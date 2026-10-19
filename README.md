@@ -31,6 +31,21 @@ and shrinks with the model as you zoom in and out.
 | Follow Position + Offset Gain | Also moves the image with Image Plane's Shift H/V so it stays under the model when zooming moves the model on screen. Offset Gain is how many canvas pixels the image moves per slider unit. Adjust it by eye, and use a negative value if the image moves the wrong way. |
 | Detect / Set Paths | Finds the Image Plane sliders, or lets you type their paths. |
 
+## Debugging
+
+ZBrush has no script console. This plugin gives you three ways to see what it's doing:
+
+- **Status**: a popup listing everything the plugin sees. That's edit mode, the
+  model scale/position from `TransformGet`, the anchor values, the Image Plane
+  slider value and the detected slider paths.
+- **Debug** switch: while it's on, each update writes a one-line summary to the
+  bar at the top of the canvas. **Sync** always writes that line.
+- **Syntax errors**: ZBrush reports these in a popup with the line number
+  when you load the `.txt` via **ZScript > Load**.
+
+After you edit `ReferenceScaler.txt`, load it again with **ZScript > Load**. That
+rebuilds the `.zsc`, and you then copy the new `.zsc` into `ZPlugs64`.
+
 ## Notes and limitations
 
 - **Not yet tested in ZBrush.** It was written against the ZScript 2022 command

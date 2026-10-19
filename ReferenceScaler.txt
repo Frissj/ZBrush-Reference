@@ -51,6 +51,66 @@
 [VarDef, zrsGain, 0]
 [VarDef, zrsInput, ""]
 
+[VarDef, zrsDbg, ""]
+
+// ZBrush unloads this script whenever another ZScript runs (Image Plane is a
+// ZScript), and reloading resets every VarDef above. Anchor state and paths
+// are therefore kept in memory blocks, which live for the whole ZBrush session.
+// ZRSState holds 7 floats (4 bytes each): anchored, baseScale, baseSize,
+// baseX, baseY, baseH, baseV. ZRSPaths holds 3 strings of 256 bytes each.
+[RoutineDef, ZRSSave,
+	[If, [MemGetSize, ZRSState] == 0, [MemCreate, ZRSState, 28, 0]]
+	[If, [MemGetSize, ZRSPaths] == 0, [MemCreate, ZRSPaths, 768, 0]]
+	[MemWrite, ZRSState, zrsAnchored, 0, 0]
+	[MemWrite, ZRSState, zrsBaseScale, 0, 4]
+	[MemWrite, ZRSState, zrsBaseSize, 0, 8]
+	[MemWrite, ZRSState, zrsBaseX, 0, 12]
+	[MemWrite, ZRSState, zrsBaseY, 0, 16]
+	[MemWrite, ZRSState, zrsBaseH, 0, 20]
+	[MemWrite, ZRSState, zrsBaseV, 0, 24]
+	[MemWriteString, ZRSPaths, zrsSizePath, 0, 1]
+	[MemWriteString, ZRSPaths, zrsHPath, 256, 1]
+	[MemWriteString, ZRSPaths, zrsVPath, 512, 1]
+]
+
+// Restores state saved by ZRSSave. Every button calls this first.
+[RoutineDef, ZRSLoad,
+	[If, [MemGetSize, ZRSState],
+		[MemRead, ZRSState, zrsAnchored, 0, 0]
+		[MemRead, ZRSState, zrsBaseScale, 0, 4]
+		[MemRead, ZRSState, zrsBaseSize, 0, 8]
+		[MemRead, ZRSState, zrsBaseX, 0, 12]
+		[MemRead, ZRSState, zrsBaseY, 0, 16]
+		[MemRead, ZRSState, zrsBaseH, 0, 20]
+		[MemRead, ZRSState, zrsBaseV, 0, 24]
+	]
+	[If, [MemGetSize, ZRSPaths],
+		[MemReadString, ZRSPaths, zrsSizePath, 0, 1]
+		[MemReadString, ZRSPaths, zrsHPath, 256, 1]
+		[MemReadString, ZRSPaths, zrsVPath, 512, 1]
+	]
+	[VarSet, zrsInterval, [IGet, "ZPlugin:Reference Scaler:Interval"]]
+]
+
+// Builds a one-line summary of the current state into zrsDbg.
+[RoutineDef, ZRSDebugLine,
+	[VarSet, zrsDbg, [StrMerge, "RS anchored=", zrsAnchored, " edit=", [IGet, Transform:Edit], " live=", zrsLive]]
+	[VarSet, zrsDbg, [StrMerge, zrsDbg, " scale=", zrsSx, " base=", zrsBaseScale, " ratio=", zrsRatio]]
+	[If, [StrLength, zrsSizePath],
+		[VarSet, zrsDbg, [StrMerge, zrsDbg, " size=", [IGet, #zrsSizePath], " baseSize=", zrsBaseSize]]
+		,
+		[VarSet, zrsDbg, [StrMerge, zrsDbg, " size=(no slider)"]]
+	]
+]
+
+// Shows the debug line in the bar at the top of the canvas when Debug is on.
+[RoutineDef, ZRSDebug,
+	[If, [IGet, "ZPlugin:Reference Scaler:Debug"],
+		[RoutineCall, ZRSDebugLine]
+		[NoteBar, zrsDbg]
+	]
+]
+
 // Finds the first existing slider for each Image Plane control.
 [RoutineDef, ZRSDetect,
 	[VarSet, zrsSizePath, ""]
@@ -111,6 +171,7 @@
 			]
 		]
 	]
+	[RoutineCall, ZRSSave]
 ]
 
 // Rescales (and optionally repositions) the reference to match the model.
@@ -156,6 +217,7 @@
 			]
 		]
 	]
+	[RoutineCall, ZRSDebug]
 ]
 
 // Live loop: wakes on the timer (1) or on left mouse button up (8), i.e. when
@@ -177,19 +239,30 @@
 
 [IButton, "ZPlugin:Reference Scaler:Anchor",
 	"Line the Image Plane reference up with the model, then press to record this as the 1:1 zoom.",
+	[RoutineCall, ZRSLoad]
 	[RoutineCall, ZRSAnchor]
-	[If, zrsAnchored, [Note, "Reference Scaler: anchored.", , 1]]
+	[If, zrsAnchored,
+		[Note, [StrMerge, "Reference Scaler: anchored.\nModel scale ", zrsBaseScale, ", Image Plane size ", zrsBaseSize], , 2]
+	]
 	, 0, 0.5
 ]
 
 [IButton, "ZPlugin:Reference Scaler:Sync",
 	"Rescale the reference to the current zoom once. Assign a hotkey to this if Live mode gets interrupted.",
-	[If, zrsAnchored, [RoutineCall, ZRSUpdate], [Note, "Reference Scaler: press Anchor first.", , 2]]
+	[RoutineCall, ZRSLoad]
+	[If, zrsAnchored,
+		[RoutineCall, ZRSUpdate]
+		[RoutineCall, ZRSDebugLine]
+		[NoteBar, zrsDbg]
+		,
+		[Note, "Reference Scaler: press Anchor first.", , 2]
+	]
 	, 0, 0.5
 ]
 
 [ISwitch, "ZPlugin:Reference Scaler:Live", 0,
 	"Continuously rescale the reference as the camera zooms.",
+	[RoutineCall, ZRSLoad]
 	[If, zrsAnchored == 0, [RoutineCall, ZRSAnchor]]
 	[If, zrsAnchored,
 		[VarSet, zrsLive, 1]
@@ -205,6 +278,7 @@
 
 [IButton, "ZPlugin:Reference Scaler:Reset",
 	"Restore the Image Plane sliders to their anchored values.",
+	[RoutineCall, ZRSLoad]
 	[If, zrsAnchored,
 		[ISet, #zrsSizePath, zrsBaseSize]
 		[If, [StrLength, zrsHPath], [ISet, #zrsHPath, zrsBaseH]]
@@ -238,6 +312,7 @@
 
 [IButton, "ZPlugin:Reference Scaler:Set Paths",
 	"Type the interface paths of the Image Plane size and shift sliders by hand.",
+	[RoutineCall, ZRSLoad]
 	[VarSet, zrsInput, [StrAsk, zrsSizePath, "Image Plane size slider path"]]
 	[If, [StrLength, zrsInput], [VarSet, zrsSizePath, zrsInput]]
 	[VarSet, zrsInput, [StrAsk, zrsHPath, "Shift H slider path (blank = none)"]]
@@ -245,6 +320,25 @@
 	[VarSet, zrsInput, [StrAsk, zrsVPath, "Shift V slider path (blank = none)"]]
 	[VarSet, zrsVPath, zrsInput]
 	[VarSet, zrsAnchored, 0]
+	[RoutineCall, ZRSSave]
 	[RoutineCall, ZRSShowPaths]
+	, 0, 0.5
+]
+
+[ISwitch, "ZPlugin:Reference Scaler:Debug", 0,
+	"Show the plugin's state in the bar at the top of the canvas on every update.",
+	, , 0, 0.5
+]
+
+[IButton, "ZPlugin:Reference Scaler:Status",
+	"Show everything the plugin currently sees: edit mode, model scale, anchor values and slider paths.",
+	[RoutineCall, ZRSLoad]
+	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+	[If, zrsBaseScale > 0, [VarSet, zrsRatio, zrsSx / zrsBaseScale]]
+	[RoutineCall, ZRSDebugLine]
+	[VarSet, zrsInput, [StrMerge, zrsDbg, "\n\nTransformGet  pos ", zrsPx, ", ", zrsPy, ", ", zrsPz]]
+	[VarSet, zrsInput, [StrMerge, zrsInput, "\nTransformGet  scale ", zrsSx, ", ", zrsSy, ", ", zrsSz]]
+	[VarSet, zrsInput, [StrMerge, zrsInput, "\n\nSize path: ", zrsSizePath, "\nShift H path: ", zrsHPath, "\nShift V path: ", zrsVPath]]
+	[Note, zrsInput]
 	, 0, 0.5
 ]
