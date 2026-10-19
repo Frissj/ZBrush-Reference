@@ -1,0 +1,250 @@
+// ReferenceScaler.txt
+// ZBrush 2022 ZScript plugin.
+// Keeps the Image Plane reference image scaled (and optionally positioned)
+// so it tracks the model as you zoom the camera in and out.
+//
+// Build: ZScript > Load > pick this file. ZBrush compiles it to
+// ReferenceScaler.zsc. Copy the .zsc into ZStartup/ZPlugs64 to load it
+// automatically. The UI appears under ZPlugin > Reference Scaler.
+
+[IConfig, 2022]
+[IShowActions, 0]
+
+// ---------------------------------------------------------------------------
+// Image Plane slider paths. These are auto-detected (see ZRSDetect). If your
+// Image Plane version names them differently, use "Set Paths" in the plugin
+// panel or edit the defaults here.
+// ---------------------------------------------------------------------------
+[VarDef, zrsSizePath, ""]
+[VarDef, zrsHPath, ""]
+[VarDef, zrsVPath, ""]
+
+// Anchor state, captured when the reference is lined up with the model.
+[VarDef, zrsAnchored, 0]
+[VarDef, zrsBaseScale, 0]
+[VarDef, zrsBaseSize, 0]
+[VarDef, zrsBaseX, 0]
+[VarDef, zrsBaseY, 0]
+[VarDef, zrsBaseH, 0]
+[VarDef, zrsBaseV, 0]
+
+// Live mode.
+[VarDef, zrsLive, 0]
+[VarDef, zrsInterval, 0.5]
+
+// Scratch values for TransformGet and the update maths.
+[VarDef, zrsPx, 0]
+[VarDef, zrsPy, 0]
+[VarDef, zrsPz, 0]
+[VarDef, zrsSx, 0]
+[VarDef, zrsSy, 0]
+[VarDef, zrsSz, 0]
+[VarDef, zrsRx, 0]
+[VarDef, zrsRy, 0]
+[VarDef, zrsRz, 0]
+[VarDef, zrsRatio, 1]
+[VarDef, zrsTarget, 0]
+[VarDef, zrsMin, 0]
+[VarDef, zrsMax, 0]
+[VarDef, zrsCx, 0]
+[VarDef, zrsCy, 0]
+[VarDef, zrsGain, 0]
+[VarDef, zrsInput, ""]
+
+// Finds the first existing slider for each Image Plane control.
+[RoutineDef, ZRSDetect,
+	[VarSet, zrsSizePath, ""]
+	[If, [IExists, "Texture:Image Plane:ImgSize"], [VarSet, zrsSizePath, "Texture:Image Plane:ImgSize"]]
+	[If, [StrLength, zrsSizePath] == 0, [If, [IExists, "Texture:Image Plane:Img Size"], [VarSet, zrsSizePath, "Texture:Image Plane:Img Size"]]]
+	[If, [StrLength, zrsSizePath] == 0, [If, [IExists, "Texture:Image Plane:Image Size"], [VarSet, zrsSizePath, "Texture:Image Plane:Image Size"]]]
+	[If, [StrLength, zrsSizePath] == 0, [If, [IExists, "Texture:Image Plane:Size"], [VarSet, zrsSizePath, "Texture:Image Plane:Size"]]]
+	[If, [StrLength, zrsSizePath] == 0, [If, [IExists, "Texture:Image Plane:Scale"], [VarSet, zrsSizePath, "Texture:Image Plane:Scale"]]]
+
+	[VarSet, zrsHPath, ""]
+	[If, [IExists, "Texture:Image Plane:Shift H"], [VarSet, zrsHPath, "Texture:Image Plane:Shift H"]]
+	[If, [StrLength, zrsHPath] == 0, [If, [IExists, "Texture:Image Plane:ShiftH"], [VarSet, zrsHPath, "Texture:Image Plane:ShiftH"]]]
+
+	[VarSet, zrsVPath, ""]
+	[If, [IExists, "Texture:Image Plane:Shift V"], [VarSet, zrsVPath, "Texture:Image Plane:Shift V"]]
+	[If, [StrLength, zrsVPath] == 0, [If, [IExists, "Texture:Image Plane:ShiftV"], [VarSet, zrsVPath, "Texture:Image Plane:ShiftV"]]]
+]
+
+[RoutineDef, ZRSShowPaths,
+	[VarSet, zrsInput, "Reference Scaler sliders\n"]
+	[If, [StrLength, zrsSizePath],
+		[VarSet, zrsInput, [StrMerge, zrsInput, "Size: ", zrsSizePath, "\n"]],
+		[VarSet, zrsInput, [StrMerge, zrsInput, "Size: (not found)\n"]]
+	]
+	[If, [StrLength, zrsHPath],
+		[VarSet, zrsInput, [StrMerge, zrsInput, "Shift H: ", zrsHPath, "\n"]],
+		[VarSet, zrsInput, [StrMerge, zrsInput, "Shift H: (not found)\n"]]
+	]
+	[If, [StrLength, zrsVPath],
+		[VarSet, zrsInput, [StrMerge, zrsInput, "Shift V: ", zrsVPath]],
+		[VarSet, zrsInput, [StrMerge, zrsInput, "Shift V: (not found)"]]
+	]
+	[Note, zrsInput, , 4]
+]
+
+// Records the current model scale/position and Image Plane slider values.
+// Line the reference up with the model first, then anchor.
+[RoutineDef, ZRSAnchor,
+	[VarSet, zrsAnchored, 0]
+	[If, [StrLength, zrsSizePath] == 0, [RoutineCall, ZRSDetect]]
+	[If, [StrLength, zrsSizePath] == 0,
+		[Note, "Reference Scaler: Image Plane size slider not found.\nLoad an image with Texture > Image Plane, or use Set Paths.", , 4]
+		,
+		[If, [IGet, Transform:Edit] == 0,
+			[Note, "Reference Scaler: put the model in Edit mode first.", , 3]
+			,
+			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+			[If, zrsSx <= 0,
+				[Note, "Reference Scaler: could not read the model scale.", , 3]
+				,
+				[VarSet, zrsBaseScale, zrsSx]
+				[VarSet, zrsBaseX, zrsPx]
+				[VarSet, zrsBaseY, zrsPy]
+				[VarSet, zrsBaseSize, [IGet, #zrsSizePath]]
+				[If, [StrLength, zrsHPath], [VarSet, zrsBaseH, [IGet, #zrsHPath]]]
+				[If, [StrLength, zrsVPath], [VarSet, zrsBaseV, [IGet, #zrsVPath]]]
+				[VarSet, zrsAnchored, 1]
+			]
+		]
+	]
+]
+
+// Rescales (and optionally repositions) the reference to match the model.
+[RoutineDef, ZRSUpdate,
+	[If, zrsAnchored && [IGet, Transform:Edit],
+		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+		[If, zrsSx > 0 && zrsBaseScale > 0,
+			[VarSet, zrsRatio, zrsSx / zrsBaseScale]
+
+			[VarSet, zrsTarget, zrsBaseSize * zrsRatio]
+			[VarSet, zrsMin, [IGetMin, #zrsSizePath]]
+			[VarSet, zrsMax, [IGetMax, #zrsSizePath]]
+			[If, zrsTarget < zrsMin, [VarSet, zrsTarget, zrsMin]]
+			[If, zrsTarget > zrsMax, [VarSet, zrsTarget, zrsMax]]
+			[If, ABS(zrsTarget - [IGet, #zrsSizePath]) > 0.0001,
+				[ISet, #zrsSizePath, zrsTarget]
+			]
+
+			// Follow Position: the image is assumed to scale about the canvas
+			// centre, offset = Gain * slider value (pixels per slider unit).
+			// Solving for the offset that keeps the anchored point under the model:
+			// slider = base * ratio + ((p - c) - ratio * (p0 - c)) / gain
+			[VarSet, zrsGain, [IGet, "ZPlugin:Reference Scaler:Offset Gain"]]
+			[If, [IGet, "ZPlugin:Reference Scaler:Follow Position"] && ABS(zrsGain) > 0.0001,
+				[VarSet, zrsCx, [IGet, Document:Width] * 0.5]
+				[VarSet, zrsCy, [IGet, Document:Height] * 0.5]
+				[If, [StrLength, zrsHPath],
+					[VarSet, zrsTarget, zrsBaseH * zrsRatio + ((zrsPx - zrsCx) - zrsRatio * (zrsBaseX - zrsCx)) / zrsGain]
+					[VarSet, zrsMin, [IGetMin, #zrsHPath]]
+					[VarSet, zrsMax, [IGetMax, #zrsHPath]]
+					[If, zrsTarget < zrsMin, [VarSet, zrsTarget, zrsMin]]
+					[If, zrsTarget > zrsMax, [VarSet, zrsTarget, zrsMax]]
+					[If, ABS(zrsTarget - [IGet, #zrsHPath]) > 0.0001, [ISet, #zrsHPath, zrsTarget]]
+				]
+				[If, [StrLength, zrsVPath],
+					[VarSet, zrsTarget, zrsBaseV * zrsRatio + ((zrsPy - zrsCy) - zrsRatio * (zrsBaseY - zrsCy)) / zrsGain]
+					[VarSet, zrsMin, [IGetMin, #zrsVPath]]
+					[VarSet, zrsMax, [IGetMax, #zrsVPath]]
+					[If, zrsTarget < zrsMin, [VarSet, zrsTarget, zrsMin]]
+					[If, zrsTarget > zrsMax, [VarSet, zrsTarget, zrsMax]]
+					[If, ABS(zrsTarget - [IGet, #zrsVPath]) > 0.0001, [ISet, #zrsVPath, zrsTarget]]
+				]
+			]
+		]
+	]
+]
+
+// Live loop: wakes on the timer (1) or on left mouse button up (8), i.e. when
+// a zoom drag finishes, updates, then goes back to sleep. Another ZScript or
+// plugin starting ends the loop (ZBrush only runs one script at a time).
+[RoutineDef, ZRSLiveLoop,
+	[Sleep, zrsInterval,
+		[If, zrsLive,
+			[RoutineCall, ZRSUpdate]
+			[SleepAgain, zrsInterval, 9]
+		]
+	, 9]
+]
+
+// ---------------------------------------------------------------------------
+// Interface
+// ---------------------------------------------------------------------------
+[ISubPalette, "ZPlugin:Reference Scaler"]
+
+[IButton, "ZPlugin:Reference Scaler:Anchor",
+	"Line the Image Plane reference up with the model, then press to record this as the 1:1 zoom.",
+	[RoutineCall, ZRSAnchor]
+	[If, zrsAnchored, [Note, "Reference Scaler: anchored.", , 1]]
+	, 0, 0.5
+]
+
+[IButton, "ZPlugin:Reference Scaler:Sync",
+	"Rescale the reference to the current zoom once. Assign a hotkey to this if Live mode gets interrupted.",
+	[If, zrsAnchored, [RoutineCall, ZRSUpdate], [Note, "Reference Scaler: press Anchor first.", , 2]]
+	, 0, 0.5
+]
+
+[ISwitch, "ZPlugin:Reference Scaler:Live", 0,
+	"Continuously rescale the reference as the camera zooms.",
+	[If, zrsAnchored == 0, [RoutineCall, ZRSAnchor]]
+	[If, zrsAnchored,
+		[VarSet, zrsLive, 1]
+		[RoutineCall, ZRSUpdate]
+		[RoutineCall, ZRSLiveLoop]
+		,
+		[ISet, "ZPlugin:Reference Scaler:Live", 0]
+	]
+	,
+	[VarSet, zrsLive, 0]
+	, 0, 0.5
+]
+
+[IButton, "ZPlugin:Reference Scaler:Reset",
+	"Restore the Image Plane sliders to their anchored values.",
+	[If, zrsAnchored,
+		[ISet, #zrsSizePath, zrsBaseSize]
+		[If, [StrLength, zrsHPath], [ISet, #zrsHPath, zrsBaseH]]
+		[If, [StrLength, zrsVPath], [ISet, #zrsVPath, zrsBaseV]]
+	]
+	, 0, 0.5
+]
+
+[ISlider, "ZPlugin:Reference Scaler:Interval", 0.5, 0.1, 0.1, 5,
+	"Seconds between Live updates. Live also updates whenever you release the mouse.",
+	[VarSet, zrsInterval, [IGet, "ZPlugin:Reference Scaler:Interval"]]
+	, 0, 1
+]
+
+[ISwitch, "ZPlugin:Reference Scaler:Follow Position", 0,
+	"Also move the reference with Shift H / Shift V so it stays under the model. Needs Offset Gain set.",
+	, , 0, 0.5
+]
+
+[ISlider, "ZPlugin:Reference Scaler:Offset Gain", 0, 0.01, -20, 20,
+	"Canvas pixels moved per unit of Image Plane Shift H/V. Calibrate by watching the image; use a negative value if it moves the wrong way. 0 disables Follow Position.",
+	, 0, 0.5
+]
+
+[IButton, "ZPlugin:Reference Scaler:Detect",
+	"Find the Image Plane sliders automatically and show what was found.",
+	[RoutineCall, ZRSDetect]
+	[RoutineCall, ZRSShowPaths]
+	, 0, 0.5
+]
+
+[IButton, "ZPlugin:Reference Scaler:Set Paths",
+	"Type the interface paths of the Image Plane size and shift sliders by hand.",
+	[VarSet, zrsInput, [StrAsk, zrsSizePath, "Image Plane size slider path"]]
+	[If, [StrLength, zrsInput], [VarSet, zrsSizePath, zrsInput]]
+	[VarSet, zrsInput, [StrAsk, zrsHPath, "Shift H slider path (blank = none)"]]
+	[VarSet, zrsHPath, zrsInput]
+	[VarSet, zrsInput, [StrAsk, zrsVPath, "Shift V slider path (blank = none)"]]
+	[VarSet, zrsVPath, zrsInput]
+	[VarSet, zrsAnchored, 0]
+	[RoutineCall, ZRSShowPaths]
+	, 0, 0.5
+]
