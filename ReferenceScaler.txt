@@ -1,23 +1,31 @@
 // ReferenceScaler.txt
 // ZBrush 2022 ZScript plugin.
-// Scales the Texture > Image Plane reference image with the camera zoom so it
-// keeps the same size relative to the model.
+// Shows a reference image behind the model being edited and keeps it scaled
+// and positioned with the model as the camera zooms and pans.
 //
-// Build: ZScript > Load > pick this file. The buttons appear under
+// Image Plane only applies its Image Size when an image is loaded, so this
+// plugin draws the background itself: ReferenceScaler64.dll renders the image,
+// scaled and placed, into a document-sized BMP, which is imported as a texture
+// and painted in with Color > FillLayer (with the model in Edit mode, FillLayer
+// paints behind it, and X-ray works).
+//
+// Install: keep the ReferenceScaler_Data folder next to this file, then
+// ZScript > Load > pick this file. The buttons appear under
 // ZPlugin > Reference Scaler b<build>. ZBrush keeps buttons bound to the
 // version that first created them until it restarts, so the sub-palette name
 // carries the build number: each new build gets fresh buttons without a restart.
 //
-// Only commands seen working in ZBrush 2022 are used for feedback: [Note, text]
-// popups (the note bar is cleared when the script ends, so it shows nothing).
-// The anchor is stored in the Anchor Scale / Anchor Size sliders rather than in
-// variables, because variables reset whenever ZBrush reloads the script.
+// Feedback uses [Note, text] popups only: the note bar is cleared when the
+// script ends. The anchor is stored in sliders rather than variables, because
+// variables reset whenever ZBrush reloads the script.
 
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 16"]
+[VarDef, zrsBuild, "build 17"]
+[VarDef, zrsDll, "ReferenceScaler_Data/ReferenceScaler64.dll"]
 [VarDef, zrsLive, 0]
+[VarDef, zrsFrame, 0]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -27,60 +35,80 @@
 [VarDef, zrsRx, 0]
 [VarDef, zrsRy, 0]
 [VarDef, zrsRz, 0]
-[VarDef, zrsBaseScale, 0]
-[VarDef, zrsBaseSize, 0]
-[VarDef, zrsBefore, 0]
-[VarDef, zrsTarget, 0]
+[VarDef, zrsRatio, 1]
+[VarDef, zrsAx, 0]
+[VarDef, zrsAy, 0]
+[VarDef, zrsLastRatio, 0]
+[VarDef, zrsLastPx, 0]
+[VarDef, zrsLastPy, 0]
+[VarDef, zrsResult, 0]
+[VarDef, zrsArgs, ""]
+[VarDef, zrsFrameName, ""]
+[VarDef, zrsFile, ""]
 [VarDef, zrsMsg, ""]
 
-// Records the current model scale and Image Size in the anchor sliders and
-// leaves a one-line result in zrsMsg.
-[RoutineDef, ZRSAnchor,
-	[If, [IExists, "Texture:Image Plane:Image Size"] == 0,
-		[VarSet, zrsMsg, "Texture > Image Plane > Image Size not found."]
+// Renders a frame with the DLL for zrsRatio, model position (zrsPx, zrsPy)
+// and anchor position (zrsAx, zrsAy), imports it as a texture and fills the
+// canvas behind the model with it. Frame names alternate so ZBrush never
+// reuses a cached texture. Leaves a result in zrsMsg; zrsResult is 1 on
+// success. Ratio 1 with model position = anchor position draws the base
+// layout: the image fitted to the document.
+[RoutineDef, ZRSDraw,
+	[VarSet, zrsResult, 0]
+	[If, [IGet, Transform:Edit] == 0,
+		[VarSet, zrsMsg, "Put the model in Edit mode first (FillLayer would paint over it otherwise)."]
 		,
-		[If, [IGet, Transform:Edit] == 0,
-			[VarSet, zrsMsg, "Put the model in Edit mode first."]
+		[VarSet, zrsFrame, 1 - zrsFrame]
+		[VarSet, zrsFrameName, [StrMerge, "frame", zrsFrame, ".bmp"]]
+		[VarSet, zrsArgs, [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " ", zrsRatio, " ", zrsPx]]
+		[VarSet, zrsArgs, [StrMerge, zrsArgs, " ", zrsPy, " ", zrsAx, " ", zrsAy]]
+		[VarSet, zrsArgs, [StrMerge, zrsArgs, " ", zrsFrameName]]
+		[VarSet, zrsResult, [FileExecute, zrsDll, "RSRender", zrsArgs]]
+		[If, zrsResult != 1,
+			[VarSet, zrsMsg, [StrMerge, "Render failed (", zrsResult, "). -3 means no image: press Load Image.\nArgs: ", zrsArgs]]
 			,
-			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-			[VarSet, zrsBaseSize, [IGet, "Texture:Image Plane:Image Size"]]
-			[ISet, "ZPlugin:Reference Scaler b16:Anchor Scale", zrsSx]
-			[ISet, "ZPlugin:Reference Scaler b16:Anchor Size", zrsBaseSize]
-			[VarSet, zrsMsg, [StrMerge, "Anchored: model scale ", zrsSx, ", Image Size ", zrsBaseSize]]
+			[VarSet, zrsFile, [FileNameResolvePath, [StrMerge, "ReferenceScaler_Data/", zrsFrameName]]]
+			[FileNameSetNext, zrsFile]
+			[IPress, Texture:Import]
+			[IPress, Color:FillLayer]
+			[VarSet, zrsLastRatio, zrsRatio]
+			[VarSet, zrsLastPx, zrsPx]
+			[VarSet, zrsLastPy, zrsPy]
+			[VarSet, zrsMsg, [StrMerge, "Drew ", zrsFile, "\nratio ", zrsRatio, ", model at ", zrsPx]]
+			[VarSet, zrsMsg, [StrMerge, zrsMsg, ", ", zrsPy, "\nDocument ", [IGet, Document:Width], " x ", [IGet, Document:Height]]]
 		]
 	]
 ]
 
-// Sets Image Size to anchorSize * (current scale / anchorScale) and leaves a
-// result in zrsMsg.
+// Works out the ratio and positions from the current model and the anchor
+// sliders, then draws. Leaves a result in zrsMsg.
 [RoutineDef, ZRSUpdate,
-	[VarSet, zrsBaseScale, [IGet, "ZPlugin:Reference Scaler b16:Anchor Scale"]]
-	[VarSet, zrsBaseSize, [IGet, "ZPlugin:Reference Scaler b16:Anchor Size"]]
-	[If, zrsBaseScale <= 0,
+	[If, [IGet, "ZPlugin:Reference Scaler b17:Anchor Scale"] <= 0,
 		[VarSet, zrsMsg, "Not anchored: press Anchor first."]
+		[VarSet, zrsResult, 0]
 		,
-		[If, [IGet, Transform:Edit] == 0,
-			[VarSet, zrsMsg, "Put the model in Edit mode first."]
-			,
-			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-			[VarSet, zrsTarget, zrsBaseSize * zrsSx / zrsBaseScale]
-			[VarSet, zrsBefore, [IGet, "Texture:Image Plane:Image Size"]]
-			[ISet, "Texture:Image Plane:Image Size", zrsTarget]
-			[VarSet, zrsMsg, [StrMerge, "Model scale ", zrsSx, " (anchor ", zrsBaseScale, ")"]]
-			[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nImage Size ", zrsBefore, " -> wanted ", zrsTarget]]
-			[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nImage Size now ", [IGet, "Texture:Image Plane:Image Size"]]]
-		]
+		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b17:Anchor Scale"]]
+		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b17:Anchor X"]]
+		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b17:Anchor Y"]]
+		[RoutineCall, ZRSDraw]
 	]
 ]
 
 // Live loop: wakes on the timer (1) or on left mouse button up (8), i.e. when
-// a zoom drag finishes, updates, then goes back to sleep. It has no popups,
-// since a popup on every update would block zooming. Another ZScript starting
-// ends the loop (ZBrush only runs one script at a time).
+// a zoom drag finishes, and redraws only if the zoom or position changed. No
+// popups, since they would block zooming. Another ZScript starting ends the
+// loop (ZBrush only runs one script at a time).
 [RoutineDef, ZRSLiveLoop,
 	[Sleep, 0.5,
 		[If, zrsLive,
-			[RoutineCall, ZRSUpdate]
+			[If, [IGet, Transform:Edit],
+				[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b17:Anchor Scale"]]
+				[If, ABS(zrsRatio - zrsLastRatio) > 0.002 || ABS(zrsPx - zrsLastPx) > 0.5 || ABS(zrsPy - zrsLastPy) > 0.5,
+					[RoutineCall, ZRSUpdate]
+				]
+			]
 			[SleepAgain, 0.5, 9]
 		]
 	, 9]
@@ -89,53 +117,92 @@
 // ---------------------------------------------------------------------------
 // Interface
 // ---------------------------------------------------------------------------
-[ISubPalette, "ZPlugin:Reference Scaler b16"]
+[ISubPalette, "ZPlugin:Reference Scaler b17"]
 
-[IButton, "ZPlugin:Reference Scaler b16:Anchor",
-	"Line the Image Plane reference up with the model, then press to record this as the 1:1 zoom.",
-	[RoutineCall, ZRSAnchor]
-	[Note, zrsMsg]
+[IButton, "ZPlugin:Reference Scaler b17:Load Image",
+	"Choose the reference image and draw it behind the model, fitted to the document.",
+	[VarSet, zrsFile, [FileNameAsk, "Image (*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd)|*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd||", , "Choose reference image"]]
+	[If, [StrLength, zrsFile] == 0,
+		[Note, "No image chosen."]
+		,
+		[VarSet, zrsResult, [FileExecute, zrsDll, "RSSetImage", zrsFile]]
+		[If, zrsResult != 1,
+			[Note, [StrMerge, "Could not read the image (", zrsResult, "):\n", zrsFile, "\nDLL: ", [FileNameResolvePath, zrsDll]]]
+			,
+			[VarSet, zrsRatio, 1]
+			[VarSet, zrsPx, 0]
+			[VarSet, zrsPy, 0]
+			[VarSet, zrsAx, 0]
+			[VarSet, zrsAy, 0]
+			[RoutineCall, ZRSDraw]
+			[Note, [StrMerge, "Load Image\n", zrsMsg, "\n\nLine the model up with the image, then press Anchor."]]
+		]
+	]
+	, 0, 1
+]
+
+[IButton, "ZPlugin:Reference Scaler b17:Anchor",
+	"With the model lined up with the image, press to record this zoom and position as the 1:1 match.",
+	[If, [IGet, Transform:Edit] == 0,
+		[Note, "Put the model in Edit mode first."]
+		,
+		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+		[ISet, "ZPlugin:Reference Scaler b17:Anchor Scale", zrsSx]
+		[ISet, "ZPlugin:Reference Scaler b17:Anchor X", zrsPx]
+		[ISet, "ZPlugin:Reference Scaler b17:Anchor Y", zrsPy]
+		[Note, [StrMerge, "Anchored: model scale ", zrsSx, ", position ", zrsPx, ", ", zrsPy]]
+	]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b16:Sync",
-	"Rescale the reference to the current zoom once.",
+[IButton, "ZPlugin:Reference Scaler b17:Sync",
+	"Redraw the reference for the current zoom and position once.",
 	[RoutineCall, ZRSUpdate]
-	[Note, zrsMsg]
+	[Note, [StrMerge, "Sync\n", zrsMsg]]
 	, 0, 0.5
 ]
 
-[ISwitch, "ZPlugin:Reference Scaler b16:Live", 0,
-	"Keep rescaling the reference as the camera zooms.",
+[ISwitch, "ZPlugin:Reference Scaler b17:Live", 0,
+	"Keep redrawing the reference as the camera zooms and pans.",
 	[VarSet, zrsLive, 1]
 	[RoutineCall, ZRSUpdate]
-	[Note, [StrMerge, "Live on.\n", zrsMsg]]
+	[Note, [StrMerge, "Live on\n", zrsMsg]]
 	[RoutineCall, ZRSLiveLoop]
 	,
 	[VarSet, zrsLive, 0]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b16:Reset",
-	"Put Image Size back to its anchored value.",
-	[ISet, "Texture:Image Plane:Image Size", [IGet, "ZPlugin:Reference Scaler b16:Anchor Size"]]
-	[Note, [StrMerge, "Image Size reset to ", [IGet, "Texture:Image Plane:Image Size"]]]
+[IButton, "ZPlugin:Reference Scaler b17:Reset",
+	"Redraw the reference fitted to the document, as Load Image does.",
+	[VarSet, zrsRatio, 1]
+	[VarSet, zrsPx, 0]
+	[VarSet, zrsPy, 0]
+	[VarSet, zrsAx, 0]
+	[VarSet, zrsAy, 0]
+	[RoutineCall, ZRSDraw]
+	[Note, [StrMerge, "Reset\n", zrsMsg]]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b16:About",
-	"Show which build of the script this button is running.",
-	[Note, [StrMerge, "Reference Scaler ", zrsBuild]]
+[IButton, "ZPlugin:Reference Scaler b17:About",
+	"Show which build is running and whether the helper DLL loads.",
+	[Note, [StrMerge, "Reference Scaler ", zrsBuild, "\nDLL: ", [FileNameResolvePath, zrsDll], "\nDLL check: ", [FileExecute, zrsDll, "RSVersion"]]]
 	, 0, 0.5
 ]
 
 // Anchor storage. Set by Anchor; shown so the anchored values are visible.
-[ISlider, "ZPlugin:Reference Scaler b16:Anchor Scale", 0, 0.001, 0, 100000,
+[ISlider, "ZPlugin:Reference Scaler b17:Anchor Scale", 0, 0.001, 0, 100000,
 	"Model scale recorded by Anchor.",
 	, 0, 1
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b16:Anchor Size", 0, 0.001, 0, 10000,
-	"Image Plane Image Size recorded by Anchor.",
-	, 0, 1
+[ISlider, "ZPlugin:Reference Scaler b17:Anchor X", 0, 0.001, -100000, 100000,
+	"Model horizontal position recorded by Anchor.",
+	, 0, 0.5
+]
+
+[ISlider, "ZPlugin:Reference Scaler b17:Anchor Y", 0, 0.001, -100000, 100000,
+	"Model vertical position recorded by Anchor.",
+	, 0, 0.5
 ]
