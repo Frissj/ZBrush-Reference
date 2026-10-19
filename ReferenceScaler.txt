@@ -342,3 +342,109 @@
 	[Note, zrsInput]
 	, 0, 0.5
 ]
+
+// ---------------------------------------------------------------------------
+// Diagnostics: interface dump
+// ---------------------------------------------------------------------------
+// Walks every interface item by window ID and writes "id, path, value" lines
+// to ReferenceScaler_UI.txt. Values are also kept in the ZRSSnap memory block
+// (one float per ID) so "Dump Changes" can list only what changed since.
+[VarDef, zrsI, 0]
+[VarDef, zrsMiss, 0]
+[VarDef, zrsHits, 0]
+[VarDef, zrsOff, 0]
+[VarDef, zrsVal, 0]
+[VarDef, zrsOld, 0]
+[VarDef, zrsLine, ""]
+[VarDef, zrsItem, ""]
+[VarDef, zrsNL, ""]
+[VarDef, zrsTab, ""]
+[VarDef, zrsFile, ""]
+[VarDef, zrsShown, ""]
+[VarDef, zrsMaxID, 60000]
+
+// Appends zrsLine plus a line break to the ZRSOut memory block.
+[RoutineDef, ZRSOutLine,
+	[VarSet, zrsLine, [StrMerge, zrsLine, zrsNL]]
+	[If, zrsOff + [StrLength, zrsLine] < [MemGetSize, ZRSOut],
+		[MemWriteString, ZRSOut, zrsLine, zrsOff, 0]
+		[VarSet, zrsOff, zrsOff + [StrLength, zrsLine]]
+	]
+]
+
+[RoutineDef, ZRSOutBegin,
+	[VarSet, zrsNL, [StrMerge, [StrFromAsc, 13], [StrFromAsc, 10]]]
+	[VarSet, zrsTab, [StrFromAsc, 9]]
+	[If, [MemGetSize, ZRSOut], [MemDelete, ZRSOut]]
+	[MemCreate, ZRSOut, 8000000, 0]
+	[VarSet, zrsOff, 0]
+	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+	[VarSet, zrsLine, [StrMerge, "TransformGet pos ", zrsPx, " ", zrsPy, " ", zrsPz, "  scale ", zrsSx, " ", zrsSy, " ", zrsSz, "  rot ", zrsRx, " ", zrsRy, " ", zrsRz]]
+	[RoutineCall, ZRSOutLine]
+	[VarSet, zrsLine, [StrMerge, "Edit ", [IGet, Transform:Edit], "  Document ", [IGet, Document:Width], " x ", [IGet, Document:Height], "  CanvasZoom ", [CanvasZoomGet]]]
+	[RoutineCall, ZRSOutLine]
+	[VarSet, zrsLine, ""]
+	[RoutineCall, ZRSOutLine]
+]
+
+// Writes ZRSOut (trimmed to what was written) to zrsFile and shows its path.
+[RoutineDef, ZRSOutEnd,
+	[If, zrsOff > 0, [MemResize, ZRSOut, zrsOff]]
+	[MemSaveToFile, ZRSOut, zrsFile, 1]
+	[MemDelete, ZRSOut]
+	[Note, [StrMerge, "Reference Scaler: wrote ", zrsHits, " items to\n", [FileNameResolvePath, zrsFile], "\n\n", zrsShown]]
+]
+
+// mode 0 = full dump + snapshot, mode 1 = changes since snapshot.
+[RoutineDef, ZRSScan,
+	[If, [MemGetSize, ZRSSnap] == 0, [MemCreate, ZRSSnap, zrsMaxID * 4, 0]]
+	[VarSet, zrsHits, 0]
+	[VarSet, zrsMiss, 0]
+	[VarSet, zrsShown, ""]
+	[Loop, zrsMaxID,
+		[If, [IExists, zrsI],
+			[VarSet, zrsMiss, 0]
+			[VarSet, zrsItem, [IGetTitle, zrsI, 1]]
+			[VarSet, zrsVal, [IGet, zrsI]]
+			[MemRead, ZRSSnap, zrsOld, 0, zrsI * 4]
+			[If, mode == 0,
+				[VarSet, zrsLine, [StrMerge, zrsI, zrsTab, zrsItem, zrsTab, zrsVal]]
+				[RoutineCall, ZRSOutLine]
+				[VarSet, zrsHits, zrsHits + 1]
+				,
+				[If, ABS(zrsVal - zrsOld) > 0.00001,
+					[VarSet, zrsLine, [StrMerge, zrsI, zrsTab, zrsItem, zrsTab, zrsOld, " -> ", zrsVal]]
+					[RoutineCall, ZRSOutLine]
+					[If, zrsHits < 25, [VarSet, zrsShown, [StrMerge, zrsShown, zrsItem, ": ", zrsOld, " -> ", zrsVal, "\n"]]]
+					[VarSet, zrsHits, zrsHits + 1]
+				]
+			]
+			[MemWrite, ZRSSnap, zrsVal, 0, zrsI * 4]
+			,
+			[VarSet, zrsMiss, zrsMiss + 1]
+		]
+		[If, zrsHits > 0 && zrsMiss > 5000, [LoopExit]]
+	, zrsI]
+	[If, mode == 0 && zrsHits == 0,
+		[VarSet, zrsLine, "ID scan found no interface items (IExists does not accept IDs in this version)."]
+		[RoutineCall, ZRSOutLine]
+	]
+, mode]
+
+[IButton, "ZPlugin:Reference Scaler:Dump UI",
+	"Write every interface item (path and value) to ReferenceScaler_UI.txt and remember the values for Dump Changes.",
+	[RoutineCall, ZRSOutBegin]
+	[RoutineCall, ZRSScan, 0]
+	[VarSet, zrsFile, "ReferenceScaler_UI.txt"]
+	[RoutineCall, ZRSOutEnd]
+	, 0, 0.5
+]
+
+[IButton, "ZPlugin:Reference Scaler:Dump Changes",
+	"Write only the interface items whose value changed since the last dump to ReferenceScaler_Changes.txt.",
+	[RoutineCall, ZRSOutBegin]
+	[RoutineCall, ZRSScan, 1]
+	[VarSet, zrsFile, "ReferenceScaler_Changes.txt"]
+	[RoutineCall, ZRSOutEnd]
+	, 0, 0.5
+]

@@ -40,6 +40,12 @@ ZBrush has no script console. This plugin gives you three ways to see what it's 
   slider value and the detected slider paths.
 - **Debug** switch: while it's on, each update writes a one-line summary to the
   bar at the top of the canvas. **Sync** always writes that line.
+- **Dump UI**: writes every ZBrush interface item (ID, full path, value) to
+  `ReferenceScaler_UI.txt` and remembers the values. The popup shows where the
+  file was saved.
+- **Dump Changes**: writes only the items whose value changed since the last
+  dump to `ReferenceScaler_Changes.txt`, and lists the first 25 in the popup.
+  For example: Dump UI, zoom, then Dump Changes shows what zooming changes.
 - **Syntax errors**: ZBrush reports these in a popup with the line number
   when you load the `.txt` via **ZScript > Load**.
 
