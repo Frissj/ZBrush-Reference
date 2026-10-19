@@ -135,7 +135,8 @@ ZFUNC RSSetImage(char* text, double, char*, int, char*, int, char**)
 // aspect ratio. That layout is scaled by ratio about the anchored model
 // position and moved to the current model position (px, py), so the image
 // tracks the model as if the camera moved. Outside the image is black.
-// Writes frameName next to the DLL. Returns 1, or:
+// Writes frameName next to the DLL, or to frameName itself if it is an
+// absolute path (no spaces). Returns 1, or:
 // -1 bad arguments, -3 no reference image set, -4 could not write the frame.
 ZFUNC RSRender(char* text, double, char*, int, char*, int, char**)
 {
@@ -166,7 +167,10 @@ ZFUNC RSRender(char* text, double, char*, int, char*, int, char**)
 		g.DrawImage(gImage, Gdiplus::RectF(static_cast<Gdiplus::REAL>(x), static_cast<Gdiplus::REAL>(y),
 			static_cast<Gdiplus::REAL>(baseW * ratio), static_cast<Gdiplus::REAL>(baseH * ratio)));
 	}
-	if (!WritePng(DllFolder() + Widen(frameName), frame))
+	// frameName is relative to the DLL folder unless it is an absolute path.
+	const std::wstring name = Widen(frameName);
+	const bool absolute = name.size() > 2 && name[1] == L':';
+	if (!WritePng(absolute ? name : DllFolder() + name, frame))
 		return -4;
 	return 1;
 }
