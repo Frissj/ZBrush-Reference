@@ -451,3 +451,41 @@
 	[RoutineCall, ZRSOutEnd]
 	, 0, 0.5
 ]
+
+// ---------------------------------------------------------------------------
+// Diagnostics: probe
+// ---------------------------------------------------------------------------
+// Read-only. Finds the Image Plane sub-palette, then lists every interface
+// item with a nearby window ID whose path mentions "Image Plane", with its
+// value, in a popup. Each stage shows a popup so a silent failure is visible.
+[VarDef, zrsBaseID, -1]
+[VarDef, zrsRoot, ""]
+[VarDef, zrsOut, ""]
+[VarDef, zrsCount, 0]
+
+[IButton, "ZPlugin:Reference Scaler:Probe",
+	"Read-only: list the Image Plane controls and their values in a popup.",
+	[Note, "Reference Scaler probe: started.", , 1]
+	[VarSet, zrsRoot, ""]
+	[If, [IExists, "Texture:Image Plane"], [VarSet, zrsRoot, "Texture:Image Plane"]]
+	[If, [StrLength, zrsRoot] == 0, [If, [IExists, "ZPlugin:Image Plane"], [VarSet, zrsRoot, "ZPlugin:Image Plane"]]]
+	[If, [StrLength, zrsRoot] == 0,
+		[Note, "Probe: no 'Texture:Image Plane' or 'ZPlugin:Image Plane' sub-palette found."]
+		,
+		[VarSet, zrsBaseID, [IGetID, #zrsRoot]]
+		[Note, [StrMerge, "Probe: found ", zrsRoot, "  (window ID ", zrsBaseID, ")"], , 2]
+		[VarSet, zrsOut, ""]
+		[VarSet, zrsCount, 0]
+		[VarSet, zrsI, zrsBaseID - 20]
+		[Loop, 400,
+			[VarSet, zrsItem, [IGetTitle, zrsI, 1]]
+			[If, [StrFind, "Image Plane", zrsItem] >= 0,
+				[VarSet, zrsOut, [StrMerge, zrsOut, zrsItem, " = ", [IGet, zrsI], "\n"]]
+				[VarSet, zrsCount, zrsCount + 1]
+			]
+			[VarSet, zrsI, zrsI + 1]
+		]
+		[Note, [StrMerge, "Probe: ", zrsCount, " Image Plane items\n\n", zrsOut]]
+	]
+	, 0, 0.5
+]
