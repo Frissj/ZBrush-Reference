@@ -206,6 +206,48 @@ ZFUNC RSBlank(char* text, double, char*, int, char*, int, char**)
 	return WritePng(DllFolder() + Widen(frameName), frame) ? 1 : -4;
 }
 
+// The calibration pattern: random black and white blocks at two sizes, the
+// large ones aligned with Calibrate's sample grid so the coarse search locks
+// on, the small ones so the fine search is exact.
+static const int kBigBlocks = 18, kSmallBlocks = 144;
+
+static unsigned PatternBit(unsigned x, unsigned y, unsigned salt)
+{
+	unsigned h = x * 73856093u ^ y * 19349663u ^ salt * 83492791u;
+	h ^= h >> 13;
+	h *= 0x5bd1e995u;
+	h ^= h >> 15;
+	return h & 1;
+}
+
+// text: "docW docH frameName". Writes the calibration pattern. Returns 1, -1
+// for bad arguments, -4 if the frame cannot be written.
+ZFUNC RSPattern(char* text, double, char*, int, char*, int, char**)
+{
+	double docW, docH;
+	char frameName[256] = {0};
+	if (!text || sscanf(text, "%lf %lf %255s", &docW, &docH, frameName) != 3 || docW < 1 || docH < 1 || docW > 16384 || docH > 16384)
+		return -1;
+	StartGdiplus();
+	const int w = static_cast<int>(docW), h = static_cast<int>(docH);
+	Gdiplus::Bitmap frame(w, h, PixelFormat24bppRGB);
+	Gdiplus::Rect r(0, 0, w, h);
+	Gdiplus::BitmapData data;
+	if (frame.LockBits(&r, Gdiplus::ImageLockModeWrite, PixelFormat24bppRGB, &data) != Gdiplus::Ok)
+		return -4;
+	for (int y = 0; y < h; ++y) {
+		BYTE* row = static_cast<BYTE*>(data.Scan0) + y * data.Stride;
+		for (int x = 0; x < w; ++x) {
+			const unsigned big = PatternBit(x * kBigBlocks / w, y * kBigBlocks / h, 1);
+			const unsigned small = PatternBit(x * kSmallBlocks / w, y * kSmallBlocks / h, 2);
+			const BYTE v = static_cast<BYTE>(big * 160 + small * 95);
+			row[x * 3] = row[x * 3 + 1] = row[x * 3 + 2] = v;
+		}
+	}
+	frame.UnlockBits(&data);
+	return WritePng(DllFolder() + Widen(frameName), frame) ? 1 : -4;
+}
+
 // Settings snapshot, for comparing ZBrush state before and after another
 // plugin runs (which resets the script's variables). Values are kept in
 // snapshot.txt next to the DLL as "id value" lines.
@@ -613,23 +655,25 @@ struct Calibration {
 };
 static Calibration gCalibration;
 
-// Finds the frame in the screen capture. Returns false if the best
-// placement correlates under 0.5.
+// Finds the calibration pattern in the screen capture. Returns false if the
+// best placement correlates under 0.4.
 static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
 {
-	std::vector<Sample> samples;
-	const int grid = 36;
-	for (int j = 0; j < grid; ++j)
-		for (int i = 0; i < grid; ++i)
-			samples.push_back({(i + 0.5) * frame.w / grid, (j + 0.5) * frame.h / grid});
+	// Sample grids: one point in the middle of each large pattern block for
+	// the coarse search, four per block for the next pass, then a dense grid
+	// over the small blocks for the exact fit.
+	auto grid = [&](int n, double at) {
+		std::vector<Sample> s;
+		for (int j = 0; j < n; ++j)
+			for (int i = 0; i < n; ++i)
+				s.push_back({(i + at) * frame.w / n, (j + at) * frame.h / n});
+		return s;
+	};
+	const std::vector<Sample> coarse = grid(kBigBlocks, 0.5), medium = grid(4 * kBigBlocks, 0.5), fine = grid(110, 0.37);
 
 	// Coarse search on the capture shrunk by d, over scales 0.25 to 4.
 	const int d = 8;
 	const Rgb small = Shrink(screen, d);
-	std::vector<Sample> coarse;
-	for (int j = 0; j < grid; j += 2)
-		for (int i = 0; i < grid; i += 2)
-			coarse.push_back(samples[j * grid + i]);
 	std::vector<int> lums;
 	double best = -2, bestK = 1, bestX = 0, bestY = 0;
 	for (double k = 0.25; k <= 4.0; k *= 1.04) {
@@ -648,19 +692,25 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
 			}
 	}
 
-	// Refine at full resolution: scale within 5% in 0.5% steps, then 0.1%.
-	struct Pass { double scaleRange, scaleStep; int offRange, offStep; };
-	const Pass passes[] = {{0.05, 0.005, 2 * d + 4, 2}, {0.006, 0.001, 3, 1}};
+	// Refine at full resolution. The coarse fit is good to about half a large
+	// block, the medium one to about a small block.
+	struct Pass { const std::vector<Sample>* samples; double scaleRange, scaleStep; int offRange, offStep; };
+	const int halfBlock = static_cast<int>(0.6 * bestK * frame.w / kBigBlocks) + d;
+	const Pass passes[] = {
+		{&medium, 0.05, 0.01, halfBlock, 2},
+		{&fine, 0.012, 0.002, 2 + static_cast<int>(1.2 * bestK * frame.w / kSmallBlocks), 1},
+		{&fine, 0.004, 0.001, 2, 1}};
 	for (const Pass& pass : passes) {
 		const double k0 = bestK, x0 = bestX, y0 = bestY;
+		best = -2;
 		for (double f = 1 - pass.scaleRange; f <= 1 + pass.scaleRange + 1e-9; f += pass.scaleStep) {
 			const double k = k0 * f;
-			SampleLums(frame, samples, 0.5 / k, lums);
+			SampleLums(frame, *pass.samples, 0.5 / k, lums);
 			// Keep the document centre fixed while trying scales.
 			const double cx = floor(x0 + (k0 - k) * frame.w * 0.5), cy = floor(y0 + (k0 - k) * frame.h * 0.5);
 			for (int dy = -pass.offRange; dy <= pass.offRange; dy += pass.offStep)
 				for (int dx = -pass.offRange; dx <= pass.offRange; dx += pass.offStep) {
-					const double s = Score(screen, samples, lums, cx + dx, cy + dy, k);
+					const double s = Score(screen, *pass.samples, lums, cx + dx, cy + dy, k);
 					if (s > best) {
 						best = s;
 						bestK = k;
@@ -674,7 +724,7 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
 	out.screenX = bestX;
 	out.screenY = bestY;
 	out.percent = 100.0 * best;
-	return best >= 0.5;
+	return best >= 0.4;
 }
 
 // Saves an Rgb image as PNG, for diagnosing calibration.
@@ -693,11 +743,12 @@ static void SaveRgb(const std::wstring& path, const Rgb& img)
 
 // text: "docW docH alpha" — the document size and opacity 0-255. Hides the
 // overlay, captures ZBrush's window, finds the canvas by matching
-// frame0.png against it, then shows the overlay there with that frame's
-// layout. The capture is saved as capture.png. Returns the match strength
-// (correlation x100, 50-100), or -1 bad arguments, -2 the window
-// could not be created, -3 frame0.png missing (show the image first), -4 the
-// screen could not be captured, -5 the frame was not found on screen
+// pattern.png (which the canvas must be showing, see RSPattern) against it,
+// then shows the overlay there with the last rendered frame's layout. The
+// capture is saved as capture.png. Returns the match strength (correlation
+// x100, 40-100), or -1 bad arguments, -2 the window
+// could not be created, -3 pattern.png missing, -4 the screen could not be
+// captured, -5 the pattern was not found on screen
 // (RSOverlayInfo 3 gives the best match).
 ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 {
@@ -707,7 +758,7 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 	if (!EnsureOverlay())
 		return -2;
 	Rgb frame;
-	if (!LoadRgb(DllFolder() + L"frame0.png", frame))
+	if (!LoadRgb(DllFolder() + L"pattern.png", frame))
 		return -3;
 
 	EnterCriticalSection(&gOverlayLock);
