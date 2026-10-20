@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 68;
+static const int kDllBuild = 69;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -392,6 +392,9 @@ struct OverlayState {
 	// Rotation offset, in anchored document pixels: how far rotating has
 	// moved the model away from the reference. Added to the anchor.
 	double offX = 0, offY = 0;
+	// The image's own adjustment (Adjust Image): scale about its centre and
+	// shift, in anchored document pixels.
+	double imgS = 1, imgX = 0, imgY = 0;
 	int alpha = 128;
 	bool visible = false;
 };
@@ -690,6 +693,12 @@ static bool ZBrushInFront()
 	return pid == GetCurrentProcessId();
 }
 
+// Adjust Image: while on, mouse buttons on the canvas go to the image (ZBrush
+// does not see them): drag inside it to move it, drag a corner (or drag with
+// the right button) to scale it about its centre.
+static volatile bool gAdjust = false;
+static bool AdjustMouse(WPARAM wp, POINT pt);
+
 static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 {
 	if (code != HC_ACTION)
@@ -698,6 +707,11 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 	++gHookEvents;
 	const bool alt = gAltDown, ctrl = gCtrlDown;
 	EnterCriticalSection(&gOverlayLock);
+	if (gAdjust) {
+		const bool eaten = AdjustMouse(wp, m->pt);
+		LeaveCriticalSection(&gOverlayLock);
+		return eaten ? 1 : CallNextHookEx(gMouseHook, code, wp, lp);
+	}
 	Gesture& g = gGesture;
 	switch (wp) {
 	case WM_LBUTTONDOWN:
@@ -965,6 +979,133 @@ static void BuildLevels()
 	gLevelsFor = gImagePath;
 }
 
+static int gImgW = 0, gImgH = 0;  // the shown image's size (0: none)
+
+// The image's rectangle on the overlay, in overlay pixels: fitted to the
+// document and centred (as in RSRender), adjusted by Adjust Image, scaled by
+// ratio about the anchored model position and moved with the model.
+// Returns false if no image is shown.
+static bool ImageRect(const OverlayState& st, double& x0, double& y0, double& w, double& h)
+{
+	if (gImgW <= 0 || gImgH <= 0 || st.docW < 1 || st.docH < 1)
+		return false;
+	const double imgW = gImgW, imgH = gImgH;
+	const double fit = (st.docW / imgW < st.docH / imgH) ? st.docW / imgW : st.docH / imgH;
+	const double baseW = imgW * fit * st.imgS, baseH = imgH * fit * st.imgS;
+	const double cx = st.docW * 0.5 + st.imgX, cy = st.docH * 0.5 + st.imgY;
+	const double k = st.pixelsPerDoc;
+	x0 = (st.px + st.ratio * (cx - baseW * 0.5 - st.ax - st.offX)) * k;
+	y0 = (st.py + st.ratio * (cy - baseH * 0.5 - st.ay - st.offY)) * k;
+	w = baseW * st.ratio * k;
+	h = baseH * st.ratio * k;
+	return true;
+}
+
+static void SaveAdjustToView();
+
+static int gAdjustDrag = 0;  // 0 none, 1 moving, 2 scaling by corner, 3 scaling by right drag
+static POINT gAdjustDown;
+static double gAdjustS0 = 1, gAdjustX0 = 0, gAdjustY0 = 0, gAdjustCx = 0, gAdjustCy = 0;
+
+// Handles a mouse event in Adjust Image mode. Caller holds the lock.
+// Returns true if ZBrush must not see it.
+static bool AdjustMouse(WPARAM wp, POINT pt)
+{
+	OverlayState& st = gOverlay;
+	const double k = st.pixelsPerDoc;
+	switch (wp) {
+	case WM_LBUTTONDOWN:
+	case WM_RBUTTONDOWN: {
+		double x0, y0, w, h;
+		if (gAdjustDrag || !ZBrushInFront() || !CursorOverOverlay(pt, st) || !ImageRect(st, x0, y0, w, h))
+			return false;
+		x0 += st.screenX;
+		y0 += st.screenY;
+		gAdjustDown = pt;
+		gAdjustS0 = st.imgS;
+		gAdjustX0 = st.imgX;
+		gAdjustY0 = st.imgY;
+		gAdjustCx = x0 + w * 0.5;
+		gAdjustCy = y0 + h * 0.5;
+		// Corner handles stay on the canvas when the image is larger.
+		const double r = 14, right = st.screenX + st.docW * k - 1, bottom = st.screenY + st.docH * k - 1;
+		const double hx0 = std::max(x0, st.screenX), hx1 = std::min(x0 + w, right);
+		const double hy0 = std::max(y0, st.screenY), hy1 = std::min(y0 + h, bottom);
+		const bool nearX = fabs(pt.x - hx0) < r || fabs(pt.x - hx1) < r;
+		const bool nearY = fabs(pt.y - hy0) < r || fabs(pt.y - hy1) < r;
+		gAdjustDrag = wp == WM_RBUTTONDOWN ? 3 : nearX && nearY ? 2 : 1;
+		return true;
+	}
+	case WM_MOUSEMOVE: {
+		if (!gAdjustDrag || st.ratio <= 0 || k <= 0)
+			return false;
+		const double dx = pt.x - gAdjustDown.x, dy = pt.y - gAdjustDown.y;
+		if (gAdjustDrag == 1) {
+			st.imgX = gAdjustX0 + dx / (k * st.ratio);
+			st.imgY = gAdjustY0 + dy / (k * st.ratio);
+		} else if (gAdjustDrag == 2) {
+			const double d0 = hypot(gAdjustDown.x - gAdjustCx, gAdjustDown.y - gAdjustCy);
+			const double d = hypot(pt.x - gAdjustCx, pt.y - gAdjustCy);
+			if (d0 > 5)
+				st.imgS = gAdjustS0 * (d < 5 ? 5 : d) / d0;
+		} else {
+			st.imgS = gAdjustS0 * exp((dx - dy) / 400.0);
+		}
+		if (st.imgS < 0.01)
+			st.imgS = 0.01;
+		if (st.imgS > 100)
+			st.imgS = 100;
+		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+		return false;  // the cursor still moves
+	}
+	case WM_LBUTTONUP:
+	case WM_RBUTTONUP:
+		if (!gAdjustDrag)
+			return false;
+		gAdjustDrag = 0;
+		SaveAdjustToView();
+		return true;
+	}
+	return false;
+}
+
+static void FillBox(Buffer32& b, int x0, int y0, int x1, int y1, uint32_t bgr)
+{
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (x1 > b.w) x1 = b.w;
+	if (y1 > b.h) y1 = b.h;
+	for (int y = y0; y < y1; ++y) {
+		uint32_t* row = reinterpret_cast<uint32_t*>(b.bits) + static_cast<size_t>(y) * b.w;
+		for (int x = x0; x < x1; ++x)
+			row[x] = 0xFF000000u | bgr;
+	}
+}
+
+// Draws the Adjust Image handles: the image's outline, its corners and centre.
+static void DrawGizmo(const OverlayState& st, Buffer32& b)
+{
+	double fx, fy, fw, fh;
+	if (!ImageRect(st, fx, fy, fw, fh))
+		return;
+	const int x0 = static_cast<int>(fx), y0 = static_cast<int>(fy);
+	const int x1 = static_cast<int>(fx + fw), y1 = static_cast<int>(fy + fh);
+	const uint32_t orange = 0xFF9020;  // R, G, B as 0xRRGGBB in the BGRA buffer
+	FillBox(b, x0, y0, x1, y0 + 2, orange);
+	FillBox(b, x0, y1 - 2, x1, y1, orange);
+	FillBox(b, x0, y0, x0 + 2, y1, orange);
+	FillBox(b, x1 - 2, y0, x1, y1, orange);
+	const int c = 7;
+	// Corner handles stay on the canvas when the image is larger.
+	const int xs[2] = {std::max(x0, c), std::min(x1, b.w - c)}, ys[2] = {std::max(y0, c), std::min(y1, b.h - c)};
+	for (int i = 0; i < 2; ++i)
+		for (int j = 0; j < 2; ++j)
+			FillBox(b, xs[i] - c, ys[j] - c, xs[i] + c, ys[j] + c, orange);
+	const int cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+	FillBox(b, cx - 10, cy - 1, cx + 10, cy + 1, orange);
+	FillBox(b, cx - 1, cy - 10, cx + 1, cy + 10, orange);
+}
+
 // Resamples the reference for the current state into gRefLayer (bilinear,
 // premultiplied, scaled by the opacity, transparent outside the image).
 // Returns false if there is nothing to show.
@@ -979,18 +1120,15 @@ static bool BuildRefLayer(const OverlayState& st)
 		return false;
 	if (gLevels.empty()) {
 		// No image (a view's image was removed): the background shows black.
+		gImgW = gImgH = 0;
 		memset(gRefLayer.bits, 0, static_cast<size_t>(w) * h * 4);
 		return true;
 	}
 
-	// The image's rectangle on the overlay, as in RSRender.
-	const double imgW = gLevels[0].w, imgH = gLevels[0].h;
-	const double fit = (st.docW / imgW < st.docH / imgH) ? st.docW / imgW : st.docH / imgH;
-	const double baseW = imgW * fit, baseH = imgH * fit;
-	const double baseX = (st.docW - baseW) * 0.5, baseY = (st.docH - baseH) * 0.5;
-	const double k = st.pixelsPerDoc;
-	const double x0 = (st.px + st.ratio * (baseX - st.ax - st.offX)) * k, y0 = (st.py + st.ratio * (baseY - st.ay - st.offY)) * k;
-	const double dispW = baseW * st.ratio * k, dispH = baseH * st.ratio * k;
+	gImgW = gLevels[0].w;
+	gImgH = gLevels[0].h;
+	double x0, y0, dispW, dispH;
+	ImageRect(st, x0, y0, dispW, dispH);
 
 	// Smallest level still at least as large as the image on screen.
 	size_t li = 0;
@@ -1279,6 +1417,8 @@ static void Composite(HWND wnd, const OverlayState& st)
 	}
 	gMagentaShare = n ? 100.0 * magenta / n : 0;
 	gModelPixels = static_cast<double>(model);
+	if (gAdjust)
+		DrawGizmo(st, gOutput);
 	Present(wnd, st, gOutput, 255);
 }
 
@@ -1784,6 +1924,7 @@ static const int kViewSlots = 7, kDefaultView = 6;
 struct View {
 	bool used = false;
 	double rx = 0, ry = 0, rz = 0, scale = 0, ax = 0, ay = 0;
+	double imgS = 1, imgX = 0, imgY = 0;  // Adjust Image
 	std::string path;
 	// Silhouette in image space: 0 not seen, 1 background, 2 model.
 	std::vector<unsigned char> mask;
@@ -1820,7 +1961,8 @@ static void SaveViews()
 		return;
 	for (int i = 0; i < kViewSlots; ++i) {
 		const View& v = gViews[i];
-		fprintf(f, "%d %.6f %.6f %.6f %.6f %.6f %.6f|%s\n", v.used ? 1 : 0, v.rx, v.ry, v.rz, v.scale, v.ax, v.ay, v.path.c_str());
+		fprintf(f, "%d %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f|%s\n", v.used ? 1 : 0, v.rx, v.ry, v.rz, v.scale, v.ax, v.ay,
+			v.imgS, v.imgX, v.imgY, v.path.c_str());
 	}
 	fclose(f);
 }
@@ -1865,8 +2007,14 @@ static void LoadViews()
 		for (int i = 0; i < kViewSlots && fgets(line, sizeof(line), f); ++i) {
 			View& v = gViews[i];
 			int used = 0;
-			if (sscanf(line, "%d %lf %lf %lf %lf %lf %lf", &used, &v.rx, &v.ry, &v.rz, &v.scale, &v.ax, &v.ay) != 7)
+			const int got = sscanf(line, "%d %lf %lf %lf %lf %lf %lf %lf %lf %lf", &used, &v.rx, &v.ry, &v.rz, &v.scale,
+				&v.ax, &v.ay, &v.imgS, &v.imgX, &v.imgY);
+			if (got < 7)
 				continue;
+			if (got < 10 || v.imgS <= 0) {
+				v.imgS = 1;
+				v.imgX = v.imgY = 0;
+			}
 			v.used = used != 0;
 			const char* bar = strchr(line, '|');
 			v.path = bar ? bar + 1 : "";
@@ -1990,9 +2138,41 @@ static void ActivateView(int slot)
 	gAnchorScale = v.scale;
 	gOverlay.ax = v.ax;
 	gOverlay.ay = v.ay;
+	gOverlay.imgS = v.imgS;
+	gOverlay.imgX = v.imgX;
+	gOverlay.imgY = v.imgY;
 	gOverlay.offX = gOverlay.offY = 0;
 	QueueViewJob(v.mask.empty() ? 1 : 2, slot);
 	ViewLog(v.mask.empty() ? "activate (record)" : "activate (match)", slot);
+}
+
+// Adjust Image finished a drag: the showing view keeps the image's new size
+// and place. Caller holds the lock.
+static void SaveAdjustToView()
+{
+	if (gActiveView < 0 || gActiveView >= kViewSlots)
+		return;
+	View& v = gViews[gActiveView];
+	v.imgS = gOverlay.imgS;
+	v.imgX = gOverlay.imgX;
+	v.imgY = gOverlay.imgY;
+	SaveViews();
+	ViewLog("adjusted", gActiveView);
+}
+
+// Snapped to a view that has no image: nothing is shown (black) until a view
+// with one is snapped to. Caller holds the lock.
+static void BlankView()
+{
+	gActiveView = -2;
+	gViewAway = true;
+	gViewJob = 0;
+	WriteReferencePath(std::string());
+	gOverlay.imgS = 1;
+	gOverlay.imgX = gOverlay.imgY = 0;
+	gOverlay.offX = gOverlay.offY = 0;
+	gRedrawPending = true;
+	ViewLog("snapped to a view without an image: cleared", -2);
 }
 
 // The silhouette as currently on the canvas, in image space (doc x =
@@ -2194,7 +2374,8 @@ static bool OverlayStep(HWND wnd)
 		return false;
 	}
 	const bool layoutChanged = redraw || st.ratio != shown.ratio || st.px != shown.px || st.py != shown.py ||
-		st.ax != shown.ax || st.ay != shown.ay || st.offX != shown.offX || st.offY != shown.offY || st.alpha != shown.alpha || st.screenX != shown.screenX ||
+		st.ax != shown.ax || st.ay != shown.ay || st.offX != shown.offX || st.offY != shown.offY ||
+		st.imgS != shown.imgS || st.imgX != shown.imgX || st.imgY != shown.imgY || st.alpha != shown.alpha || st.screenX != shown.screenX ||
 		st.screenY != shown.screenY || st.pixelsPerDoc != shown.pixelsPerDoc;
 	if (layoutChanged) {
 		if (st.screenX != shown.screenX || st.screenY != shown.screenY || st.pixelsPerDoc != shown.pixelsPerDoc) {
@@ -2740,6 +2921,7 @@ ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 	case 35: return static_cast<float>(gViewShiftX);
 	case 36: return static_cast<float>(gViewShiftY);
 	case 37: return static_cast<float>(gActiveView);
+	case 38: return gAdjust ? 1 : 0;
 	case 27: case 28: case 29: case 30: case 31: return static_cast<float>(gScanStats[which - 27]);
 	case 18: return static_cast<float>(gGesture.mode + 10 * gGesture.scaleSegments + 100 * gGesture.active);
 	}
@@ -2868,6 +3050,33 @@ ZFUNC RSOverlayResetOffset(char*, double, char*, int, char*, int, char**)
 	return had ? 1 : 0;
 }
 
+// text: "1" turns Adjust Image on, "0" off (keeping the image's size and
+// place for the showing view). Returns 1, 0 if no image is showing, -1 if
+// the overlay is not on.
+ZFUNC RSAdjust(char* text, double, char*, int, char*, int, char**)
+{
+	const bool on = text && atoi(text) == 1;
+	if (!gOverlayWnd || !gOverlay.visible) {
+		gAdjust = false;
+		return -1;
+	}
+	EnsureLock();
+	EnterCriticalSection(&gOverlayLock);
+	float result = 1;
+	if (on && (gActiveView < 0 || gImgW <= 0)) {
+		result = 0;
+	} else {
+		if (!on && gAdjust)
+			SaveAdjustToView();
+		gAdjust = on;
+		gAdjustDrag = 0;
+		gRedrawPending = true;
+	}
+	LeaveCriticalSection(&gOverlayLock);
+	PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	return result;
+}
+
 // text: "rx ry rz", the view's rotation, from Live each tick. When the view
 // is snapped to a slot's rotation after being away from it (or to another
 // slot), that slot is shown and the model's silhouette matched. Returns
@@ -2884,12 +3093,23 @@ ZFUNC RSViewTick(char* text, double, char*, int, char*, int, char**)
 	int result = slot;
 	if (slot < 0) {
 		gViewAway = true;
+		// Snapped (every angle a multiple of 90) to a view with no image,
+		// while some view has one: clear the reference. Turning freely
+		// leaves it as it is.
+		bool snapped = true;
+		for (double a : {rx, ry, rz})
+			if (AngleDiff(a, 90 * floor(a / 90 + 0.5)) > 0.5)
+				snapped = false;
+		if (snapped && AnyViewImage() && gActiveView != -2) {
+			BlankView();
+			result = -2;
+		}
 	} else if (slot != gActiveView || gViewAway) {
 		ActivateView(slot);
 		result = 10 + slot;
 	}
 	LeaveCriticalSection(&gOverlayLock);
-	if (result >= 10 && gOverlayWnd)
+	if ((result >= 10 || result == -2) && gOverlayWnd)
 		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
 	return static_cast<float>(result);
 }
@@ -2972,6 +3192,8 @@ ZFUNC RSViewImage(char* text, double, char*, int, char*, int, char**)
 	EnterCriticalSection(&gOverlayLock);
 	LoadViews();
 	gViews[gPrepSlot].path = text;
+	gViews[gPrepSlot].imgS = 1;
+	gViews[gPrepSlot].imgX = gViews[gPrepSlot].imgY = 0;
 	AnchorSlot(gPrepSlot, gPrep);
 	gPrepSlot = -1;
 	LeaveCriticalSection(&gOverlayLock);
@@ -3014,12 +3236,9 @@ ZFUNC RSViewClear(char* text, double, char*, int, char*, int, char**)
 	gViews[slot] = View();
 	SaveMask(slot);
 	SaveViews();
-	if (gActiveView == slot) {
-		gActiveView = -1;
-		gViewAway = true;
-		WriteReferencePath(std::string());
-		gRedrawPending = true;
-	}
+	ViewLog("image removed", slot);
+	if (gActiveView == slot)
+		BlankView();
 	LeaveCriticalSection(&gOverlayLock);
 	if (gOverlayWnd)
 		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
@@ -3056,6 +3275,8 @@ ZFUNC RSOverlayStop(char*, double, char*, int, char*, int, char**)
 		gOverlay.visible = false;
 		gViewAway = true;
 		gViewJob = 0;
+		gAdjust = false;
+		gAdjustDrag = 0;
 		LeaveCriticalSection(&gOverlayLock);
 		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
 	}
