@@ -131,6 +131,8 @@ ZFUNC RSLog(char* text, double, char*, int, char*, int, char**)
 // The anchor (model scale, x, y and rotation x, y, z recorded by Anchor) is
 // kept in anchor.txt next to the DLL, so it survives script reloads and new
 // builds, whose sliders start empty.
+static void ViewsDefaultChanged(const double* anchor, const char* imagePath);
+
 static std::wstring AnchorPath()
 {
 	return DllFolder() + L"anchor.txt";
@@ -147,6 +149,7 @@ ZFUNC RSAnchorSave(char* text, double, char*, int, char*, int, char**)
 		return -1;
 	fprintf(f, "%.6f %.6f %.6f %.6f %.6f %.6f\n", v[0], v[1], v[2], v[3], v[4], v[5]);
 	fclose(f);
+	ViewsDefaultChanged(v, nullptr);
 	return 1;
 }
 
@@ -167,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 66;
+static const int kDllBuild = 67;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -185,6 +188,7 @@ ZFUNC RSSetImage(char* text, double, char*, int, char*, int, char**)
 		return -2;
 	fwrite(text, 1, strlen(text), f);
 	fclose(f);
+	ViewsDefaultChanged(nullptr, text);
 	return 1;
 }
 
@@ -920,7 +924,12 @@ static std::wstring gLevelsFor;
 
 static void BuildLevels()
 {
-	if (!LoadSavedImage() || gLevelsFor == gImagePath)
+	if (!LoadSavedImage()) {
+		gLevels.clear();
+		gLevelsFor.clear();
+		return;
+	}
+	if (gLevelsFor == gImagePath)
 		return;
 	gLevels.clear();
 	Level top;
@@ -964,12 +973,15 @@ static bool BuildRefLayer(const OverlayState& st)
 	if (!st.visible || st.docW < 1 || st.docH < 1)
 		return false;
 	BuildLevels();
-	if (gLevels.empty())
-		return false;
 	const int w = static_cast<int>(st.docW * st.pixelsPerDoc + 0.5);
 	const int h = static_cast<int>(st.docH * st.pixelsPerDoc + 0.5);
 	if (!gRefLayer.Resize(w, h) || !gCapture.Resize(w, h) || !gOutput.Resize(w, h))
 		return false;
+	if (gLevels.empty()) {
+		// No image (a view's image was removed): the background shows black.
+		memset(gRefLayer.bits, 0, static_cast<size_t>(w) * h * 4);
+		return true;
+	}
 
 	// The image's rectangle on the overlay, as in RSRender.
 	const double imgW = gLevels[0].w, imgH = gLevels[0].h;
@@ -1736,6 +1748,413 @@ static void MemFollow()
 
 static bool gRedrawPending = false;
 
+// ---------------------------------------------------------------------------
+// Views: a reference image per snapped view (slots 0-5, in the Image Plane
+// plugin's order Front, Back, Right, Left, Top, Bottom). Slot 6 is the plain
+// anchor (Load Image + Anchor), used while no view has an image.
+//
+// ZBrush rotates the model about a pivot that is not its TransformGet
+// position: rotating leaves that position unchanged (nav_log: rotation drags
+// start and end at the same x, y) but the model moves on screen. Snapped back
+// to a view, the model is shifted while ZBrush's position says it is not, so
+// the shift cannot be read, only seen. Each view keeps the model's
+// silhouette as it was lined up with the image (its mask, in image space);
+// when the view is snapped to again, the current silhouette is matched
+// against it and the difference becomes the offset.
+// ---------------------------------------------------------------------------
+static const int kViewSlots = 7, kDefaultView = 6;
+
+struct View {
+	bool used = false;
+	double rx = 0, ry = 0, rz = 0, scale = 0, ax = 0, ay = 0;
+	std::string path;
+	// Silhouette in image space: 0 not seen, 1 background, 2 model.
+	std::vector<unsigned char> mask;
+	int gw = 0, gh = 0;
+	double cell = 0, u0 = 0, v0 = 0;
+};
+static View gViews[kViewSlots];
+static bool gViewsLoaded = false;
+static int gActiveView = -1;
+static bool gViewAway = true;
+// Pending silhouette work for the overlay thread: 1 record, 2 match.
+static int gViewJob = 0, gViewJobSlot = -1;
+static DWORD gViewJobAt = 0, gViewSettledAt = 0;
+static double gViewLastCount = -1;
+static double gViewScore = -1, gViewShiftX = 0, gViewShiftY = 0;
+static DWORD gLastFrameAt = 0;  // when the overlay last composited a new capture
+
+static std::wstring ViewsPath()
+{
+	return DllFolder() + L"views.txt";
+}
+
+static std::wstring MaskPath(int i)
+{
+	wchar_t name[32];
+	swprintf(name, 32, L"view%d_mask.bin", i);
+	return DllFolder() + name;
+}
+
+static void SaveViews()
+{
+	FILE* f = _wfopen(ViewsPath().c_str(), L"wb");
+	if (!f)
+		return;
+	for (int i = 0; i < kViewSlots; ++i) {
+		const View& v = gViews[i];
+		fprintf(f, "%d %.6f %.6f %.6f %.6f %.6f %.6f|%s\n", v.used ? 1 : 0, v.rx, v.ry, v.rz, v.scale, v.ax, v.ay, v.path.c_str());
+	}
+	fclose(f);
+}
+
+static void SaveMask(int i)
+{
+	const View& v = gViews[i];
+	if (v.mask.empty()) {
+		_wremove(MaskPath(i).c_str());
+		return;
+	}
+	if (FILE* f = _wfopen(MaskPath(i).c_str(), L"wb")) {
+		fprintf(f, "%d %d %.6f %.6f %.6f\n", v.gw, v.gh, v.cell, v.u0, v.v0);
+		fwrite(v.mask.data(), 1, v.mask.size(), f);
+		fclose(f);
+	}
+}
+
+static void LoadMask(int i)
+{
+	View& v = gViews[i];
+	v.mask.clear();
+	FILE* f = _wfopen(MaskPath(i).c_str(), L"rb");
+	if (!f)
+		return;
+	if (fscanf(f, "%d %d %lf %lf %lf", &v.gw, &v.gh, &v.cell, &v.u0, &v.v0) == 5 && fgetc(f) == '\n' &&
+			v.gw > 0 && v.gh > 0 && v.gw < 4096 && v.gh < 4096) {
+		v.mask.resize(static_cast<size_t>(v.gw) * v.gh);
+		if (fread(v.mask.data(), 1, v.mask.size(), f) != v.mask.size())
+			v.mask.clear();
+	}
+	fclose(f);
+}
+
+static void LoadViews()
+{
+	if (gViewsLoaded)
+		return;
+	gViewsLoaded = true;
+	if (FILE* f = _wfopen(ViewsPath().c_str(), L"rb")) {
+		char line[2400];
+		for (int i = 0; i < kViewSlots && fgets(line, sizeof(line), f); ++i) {
+			View& v = gViews[i];
+			int used = 0;
+			if (sscanf(line, "%d %lf %lf %lf %lf %lf %lf", &used, &v.rx, &v.ry, &v.rz, &v.scale, &v.ax, &v.ay) != 7)
+				continue;
+			v.used = used != 0;
+			const char* bar = strchr(line, '|');
+			v.path = bar ? bar + 1 : "";
+			while (!v.path.empty() && (v.path.back() == '\n' || v.path.back() == '\r'))
+				v.path.pop_back();
+			LoadMask(i);
+		}
+		fclose(f);
+	} else {
+		// First run with views: the plain anchor from anchor.txt and the
+		// image from reference_path.txt.
+		View& d = gViews[kDefaultView];
+		if (FILE* a = _wfopen(AnchorPath().c_str(), L"rb")) {
+			d.used = fscanf(a, "%lf %lf %lf %lf %lf %lf", &d.scale, &d.ax, &d.ay, &d.rx, &d.ry, &d.rz) == 6 && d.scale > 0;
+			fclose(a);
+		}
+		if (FILE* c = _wfopen(ConfigPath().c_str(), L"rb")) {
+			char buf[2048] = {0};
+			buf[fread(buf, 1, sizeof(buf) - 1, c)] = 0;
+			fclose(c);
+			d.path = buf;
+		}
+	}
+}
+
+// Anchor or Load Image changed the plain anchor (slot 6).
+static void ViewsDefaultChanged(const double* anchor, const char* imagePath)
+{
+	LoadViews();
+	View& d = gViews[kDefaultView];
+	if (anchor) {
+		d.used = anchor[0] > 0;
+		d.scale = anchor[0];
+		d.ax = anchor[1];
+		d.ay = anchor[2];
+		d.rx = anchor[3];
+		d.ry = anchor[4];
+		d.rz = anchor[5];
+		d.mask.clear();
+		SaveMask(kDefaultView);
+	}
+	if (imagePath)
+		d.path = imagePath;
+	SaveViews();
+}
+
+static double AngleDiff(double a, double b)
+{
+	double d = fmod(fabs(a - b), 360.0);
+	return d > 180 ? 360 - d : d;
+}
+
+static bool SameRotation(const View& v, double rx, double ry, double rz)
+{
+	return AngleDiff(v.rx, rx) + AngleDiff(v.ry, ry) + AngleDiff(v.rz, rz) < 1;
+}
+
+static bool AnyViewImage()
+{
+	for (int i = 0; i < kDefaultView; ++i)
+		if (gViews[i].used)
+			return true;
+	return false;
+}
+
+// The slot whose rotation this is, or -1.
+static int MatchView(double rx, double ry, double rz)
+{
+	LoadViews();
+	if (AnyViewImage()) {
+		for (int i = 0; i < kDefaultView; ++i)
+			if (gViews[i].used && SameRotation(gViews[i], rx, ry, rz))
+				return i;
+		return -1;
+	}
+	const View& d = gViews[kDefaultView];
+	return d.used && SameRotation(d, rx, ry, rz) ? kDefaultView : -1;
+}
+
+static void WriteReferencePath(const std::string& path)
+{
+	if (FILE* f = _wfopen(ConfigPath().c_str(), L"wb")) {
+		fwrite(path.data(), 1, path.size(), f);
+		fclose(f);
+	}
+}
+
+static void ViewLog(const char* what, int slot)
+{
+	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu view %s slot %d score %.3f shift %.2f %.2f offset %.2f %.2f\n", GetTickCount(), what, slot,
+			gViewScore, gViewShiftX, gViewShiftY, gOverlay.offX, gOverlay.offY);
+		fclose(f);
+	}
+}
+
+// Queues recording (1) or matching (2) the silhouette for a slot. Only
+// while the overlay is showing (it is what sees the model).
+static void QueueViewJob(int job, int slot)
+{
+	if (!gOverlayWnd || !gOverlay.visible)
+		return;
+	gViewJob = job;
+	gViewJobSlot = slot;
+	gViewJobAt = GetTickCount();
+	gViewSettledAt = gViewJobAt;
+	gViewLastCount = -1;
+}
+
+// Makes a slot the shown one: its image and anchor, offset cleared, then
+// its silhouette matched (or recorded, the first time). Call with the lock.
+static void ActivateView(int slot)
+{
+	View& v = gViews[slot];
+	if (slot != gActiveView || gImagePath.empty()) {
+		WriteReferencePath(v.path);
+		gRedrawPending = true;
+	}
+	gActiveView = slot;
+	gViewAway = false;
+	gAnchorScale = v.scale;
+	gOverlay.ax = v.ax;
+	gOverlay.ay = v.ay;
+	gOverlay.offX = gOverlay.offY = 0;
+	QueueViewJob(v.mask.empty() ? 1 : 2, slot);
+	ViewLog(v.mask.empty() ? "activate (record)" : "activate (match)", slot);
+}
+
+// The silhouette as currently on the canvas, in image space (doc x =
+// px + ratio * (u - ax - offX), as BuildRefLayer places the image), sampled
+// on the grid of g (whose size is set here if empty).
+static void SampleSilhouette(const OverlayState& st, double offX, double offY, View& g, std::vector<unsigned char>& out)
+{
+	if (g.gw == 0) {
+		g.cell = st.docW / 640.0;
+		g.gw = 1280;
+		g.gh = static_cast<int>(st.docH * 2 / g.cell + 0.5);
+		g.u0 = -st.docW * 0.5;
+		g.v0 = -st.docH * 0.5;
+	}
+	out.assign(static_cast<size_t>(g.gw) * g.gh, 0);
+	const double k = st.pixelsPerDoc;
+	for (int j = 0; j < g.gh; ++j) {
+		const double v = g.v0 + (j + 0.5) * g.cell;
+		const int yp = static_cast<int>(floor((st.py + st.ratio * (v - st.ay - offY)) * k));
+		if (yp < 0 || yp >= gKeyH)
+			continue;
+		for (int i = 0; i < g.gw; ++i) {
+			const double u = g.u0 + (i + 0.5) * g.cell;
+			const int xp = static_cast<int>(floor((st.px + st.ratio * (u - st.ax - offX)) * k));
+			if (xp < 0 || xp >= gKeyW)
+				continue;
+			out[static_cast<size_t>(j) * g.gw + i] = gKeyShare[static_cast<size_t>(yp) * gKeyW + xp] < 128 ? 2 : 1;
+		}
+	}
+}
+
+// How well cur, shifted by (ox, oy) cells, matches saved: model cells in
+// both over model cells in either, where both were seen. -1 if too little.
+static double MaskScore(const View& g, const std::vector<unsigned char>& cur, int ox, int oy, int step)
+{
+	int both = 0, either = 0;
+	for (int j = 0; j < g.gh; j += step) {
+		const int cj = j - oy;
+		if (cj < 0 || cj >= g.gh)
+			continue;
+		const unsigned char* a = &g.mask[static_cast<size_t>(j) * g.gw];
+		const unsigned char* b = &cur[static_cast<size_t>(cj) * g.gw];
+		for (int i = 0; i < g.gw; i += step) {
+			const int ci = i - ox;
+			if (ci < 0 || ci >= g.gw)
+				continue;
+			const int x = a[i], y = b[ci];
+			if (!x || !y)
+				continue;
+			both += x == 2 && y == 2;
+			either += x == 2 || y == 2;
+		}
+	}
+	const int minEither = 40 / (step * step) + 4;
+	return either >= minEither ? static_cast<double>(both) / either : -1;
+}
+
+static void RunViewJob(const OverlayState& st)
+{
+	const int slot = gViewJobSlot, job = gViewJob;
+	if (slot < 0 || slot >= kViewSlots || gKeyShare.empty())
+		return;
+	View& v = gViews[slot];
+	if (job == 1) {
+		v.gw = 0;
+		SampleSilhouette(st, st.offX, st.offY, v, v.mask);
+		size_t model = 0;
+		for (unsigned char m : v.mask)
+			model += m == 2;
+		if (model < 50)
+			v.mask.clear();
+		SaveMask(slot);
+		gViewScore = static_cast<double>(model);
+		gViewShiftX = gViewShiftY = 0;
+		EnterCriticalSection(&gOverlayLock);
+		ViewLog(v.mask.empty() ? "record failed (model not seen)" : "recorded", slot);
+		LeaveCriticalSection(&gOverlayLock);
+		return;
+	}
+	if (v.mask.empty())
+		return;
+	std::vector<unsigned char> cur;
+	SampleSilhouette(st, 0, 0, v, cur);
+	// Coarse to fine: every 8th cell over half the document each way, then
+	// narrower and denser around the best.
+	int bx = 0, by = 0;
+	double best = -1;
+	const int rx = v.gw / 4, ry = v.gh / 4;
+	for (int oy = -ry; oy <= ry; oy += 8)
+		for (int ox = -rx; ox <= rx; ox += 8) {
+			const double s = MaskScore(v, cur, ox, oy, 8);
+			if (s > best) { best = s; bx = ox; by = oy; }
+		}
+	static const int kPasses[3][2] = {{8, 4}, {3, 2}, {1, 1}};  // reach, sampling
+	for (int pass = 0; pass < 3 && best >= 0; ++pass) {
+		const int r = kPasses[pass][0], step = kPasses[pass][1];
+		int nx = bx, ny = by;
+		double nb = -1;
+		for (int oy = by - r; oy <= by + r; ++oy)
+			for (int ox = bx - r; ox <= bx + r; ++ox) {
+				const double s = MaskScore(v, cur, ox, oy, step);
+				if (s > nb) { nb = s; nx = ox; ny = oy; }
+			}
+		bx = nx;
+		by = ny;
+		best = nb;
+	}
+	double fx = bx, fy = by;
+	if (best > 0) {
+		// Sub-cell: a parabola through the scores either side.
+		const double l = MaskScore(v, cur, bx - 1, by, 1), r = MaskScore(v, cur, bx + 1, by, 1);
+		const double u = MaskScore(v, cur, bx, by - 1, 1), d = MaskScore(v, cur, bx, by + 1, 1);
+		if (l >= 0 && r >= 0 && l + r - 2 * best < 0)
+			fx += 0.5 * (l - r) / (l + r - 2 * best);
+		if (u >= 0 && d >= 0 && u + d - 2 * best < 0)
+			fy += 0.5 * (u - d) / (u + d - 2 * best);
+	}
+	gViewScore = best;
+	gViewShiftX = fx * v.cell;
+	gViewShiftY = fy * v.cell;
+	EnterCriticalSection(&gOverlayLock);
+	if (best >= 0.6) {
+		gOverlay.offX = gViewShiftX;
+		gOverlay.offY = gViewShiftY;
+		ViewLog("matched", slot);
+	} else {
+		ViewLog("match too weak, not moved", slot);
+	}
+	LeaveCriticalSection(&gOverlayLock);
+}
+
+// Runs the queued job and marks it done (a button may be waiting on it),
+// unless another was queued meanwhile.
+static void FinishViewJob(const OverlayState& st)
+{
+	const int job = gViewJob, slot = gViewJobSlot;
+	const DWORD at = gViewJobAt;
+	RunViewJob(st);
+	EnterCriticalSection(&gOverlayLock);
+	if (gViewJob == job && gViewJobSlot == slot && gViewJobAt == at)
+		gViewJob = 0;
+	LeaveCriticalSection(&gOverlayLock);
+}
+
+// Each overlay step: runs a queued job. Recording uses the first capture
+// taken after it was asked for (the button that asked waits, so nothing it
+// shows afterwards gets in). Matching waits until the view has settled (no
+// drag, the model's pixel count steady for 300 ms, after the snap
+// animation).
+static void ViewJobStep(const OverlayState& st)
+{
+	if (!gViewJob)
+		return;
+	const DWORD now = GetTickCount();
+	if (gViewJob == 1) {
+		const bool fresh = static_cast<int>(gLastFrameAt - gViewJobAt) > 100 || now - gLastFrameAt > 250;
+		if ((now - gViewJobAt >= 150 && fresh) || now - gViewJobAt > 1500)
+			FinishViewJob(st);
+		return;
+	}
+	if (gGesture.active || fabs(gModelPixels - gViewLastCount) > 0.002 * (gModelPixels + 100)) {
+		gViewLastCount = gModelPixels;
+		gViewSettledAt = now;
+		if (now - gViewJobAt < 5000)
+			return;
+	}
+	if (now - gViewSettledAt < 300 || now - gViewJobAt < 400)
+		return;
+	FinishViewJob(st);
+}
+
+// Waits (up to 2 s) for a queued recording to be done.
+static void WaitViewRecord()
+{
+	for (int i = 0; i < 200 && gViewJob == 1; ++i)
+		Sleep(10);
+}
+
+
 // One pass of the overlay loop: rebuilds the reference if its layout
 // changed, captures, composites and presents. Returns false when idle.
 static bool OverlayStep(HWND wnd)
@@ -1784,6 +2203,7 @@ static bool OverlayStep(HWND wnd)
 	}
 	if (Capture(st) || layoutChanged) {
 		Composite(wnd, st);
+		gLastFrameAt = GetTickCount();
 		++fpsFrames;
 		const DWORD now = GetTickCount();
 		if (now - fpsStart >= 1000) {
@@ -1792,6 +2212,7 @@ static bool OverlayStep(HWND wnd)
 			fpsFrames = 0;
 		}
 	}
+	ViewJobStep(st);
 	return true;
 }
 
@@ -2298,6 +2719,10 @@ ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 	case 26: return static_cast<float>(gTriplets.size());
 	case 32: return static_cast<float>(floor(gMagentaShare + 0.5));
 	case 33: return static_cast<float>(gModelPixels);
+	case 34: return static_cast<float>(gViewScore);
+	case 35: return static_cast<float>(gViewShiftX);
+	case 36: return static_cast<float>(gViewShiftY);
+	case 37: return static_cast<float>(gActiveView);
 	case 27: case 28: case 29: case 30: case 31: return static_cast<float>(gScanStats[which - 27]);
 	case 18: return static_cast<float>(gGesture.mode + 10 * gGesture.scaleSegments + 100 * gGesture.active);
 	}
@@ -2426,12 +2851,194 @@ ZFUNC RSOverlayResetOffset(char*, double, char*, int, char*, int, char**)
 	return had ? 1 : 0;
 }
 
+// text: "rx ry rz", the view's rotation, from Live each tick. When the view
+// is snapped to a slot's rotation after being away from it (or to another
+// slot), that slot is shown and the model's silhouette matched. Returns
+// 10 + slot when it activated one, the slot if it was already showing, or
+// -1 when the rotation is no slot's.
+ZFUNC RSViewTick(char* text, double, char*, int, char*, int, char**)
+{
+	double rx, ry, rz;
+	if (!text || sscanf(text, "%lf %lf %lf", &rx, &ry, &rz) != 3)
+		return -1;
+	EnsureLock();
+	EnterCriticalSection(&gOverlayLock);
+	const int slot = MatchView(rx, ry, rz);
+	int result = slot;
+	if (slot < 0) {
+		gViewAway = true;
+	} else if (slot != gActiveView || gViewAway) {
+		ActivateView(slot);
+		result = 10 + slot;
+	}
+	LeaveCriticalSection(&gOverlayLock);
+	if (result >= 10 && gOverlayWnd)
+		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	return static_cast<float>(result);
+}
+
+// text: "rx ry rz". 1 if every angle is a multiple of 90 degrees (a
+// snapped view), else 0.
+ZFUNC RSViewSnapped(char* text, double, char*, int, char*, int, char**)
+{
+	double r[3];
+	if (!text || sscanf(text, "%lf %lf %lf", &r[0], &r[1], &r[2]) != 3)
+		return 0;
+	for (double a : r)
+		if (AngleDiff(a, 90 * floor(a / 90 + 0.5)) > 0.5)
+			return 0;
+	return 1;
+}
+
+// text: "slot rx ry rz". The other slot (0-5) already using this rotation,
+// or -1.
+ZFUNC RSViewOwner(char* text, double, char*, int, char*, int, char**)
+{
+	int slot;
+	double rx, ry, rz;
+	if (!text || sscanf(text, "%d %lf %lf %lf", &slot, &rx, &ry, &rz) != 4)
+		return -1;
+	LoadViews();
+	for (int i = 0; i < kDefaultView; ++i)
+		if (i != slot && gViews[i].used && SameRotation(gViews[i], rx, ry, rz))
+			return static_cast<float>(i);
+	return -1;
+}
+
+static int gPrepSlot = -1;
+static double gPrep[6];
+
+// text: "slot scale x y rx ry rz", the view an image is about to be loaded
+// for (RSViewImage takes the path). Returns 1, or -1.
+ZFUNC RSViewPrep(char* text, double, char*, int, char*, int, char**)
+{
+	int slot;
+	double v[6];
+	if (!text || sscanf(text, "%d %lf %lf %lf %lf %lf %lf", &slot, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 7 ||
+			slot < 0 || slot >= kDefaultView || v[0] <= 0)
+		return -1;
+	gPrepSlot = slot;
+	memcpy(gPrep, v, sizeof(gPrep));
+	return 1;
+}
+
+// Sets a slot's anchor from RSViewPrep's values and shows it; the
+// silhouette is recorded as it is now. Call with the lock.
+static void AnchorSlot(int slot, const double* v)
+{
+	View& w = gViews[slot];
+	w.used = true;
+	w.scale = v[0];
+	w.ax = v[1];
+	w.ay = v[2];
+	w.rx = v[3];
+	w.ry = v[4];
+	w.rz = v[5];
+	w.mask.clear();
+	w.gw = 0;
+	SaveMask(slot);
+	SaveViews();
+	gActiveView = -1;
+	ActivateView(slot);
+}
+
+// text: the image's full path, for the slot given to RSViewPrep. The view
+// is anchored at the current zoom and position and shown, fitted to the
+// document. Returns 1, -1 if the image cannot be read, -2 without RSViewPrep.
+ZFUNC RSViewImage(char* text, double, char*, int, char*, int, char**)
+{
+	if (gPrepSlot < 0)
+		return -2;
+	if (!text || !LoadImage(Widen(text)))
+		return -1;
+	EnsureLock();
+	EnterCriticalSection(&gOverlayLock);
+	LoadViews();
+	gViews[gPrepSlot].path = text;
+	AnchorSlot(gPrepSlot, gPrep);
+	gPrepSlot = -1;
+	LeaveCriticalSection(&gOverlayLock);
+	if (gOverlayWnd)
+		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	WaitViewRecord();
+	return 1;
+}
+
+// text: "slot scale x y rx ry rz": Anchor pressed while a view is showing.
+// Returns 1, or -1.
+ZFUNC RSViewAnchor(char* text, double, char*, int, char*, int, char**)
+{
+	int slot;
+	double v[6];
+	if (!text || sscanf(text, "%d %lf %lf %lf %lf %lf %lf", &slot, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 7 ||
+			slot < 0 || slot >= kViewSlots || v[0] <= 0)
+		return -1;
+	EnsureLock();
+	EnterCriticalSection(&gOverlayLock);
+	LoadViews();
+	AnchorSlot(slot, v);
+	LeaveCriticalSection(&gOverlayLock);
+	if (gOverlayWnd)
+		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	WaitViewRecord();
+	return 1;
+}
+
+// text: "slot". Removes a view's image. If it was showing, the background
+// goes black until another view is snapped to. Returns 1.
+ZFUNC RSViewClear(char* text, double, char*, int, char*, int, char**)
+{
+	const int slot = text ? atoi(text) : -1;
+	if (slot < 0 || slot >= kDefaultView)
+		return -1;
+	EnsureLock();
+	EnterCriticalSection(&gOverlayLock);
+	LoadViews();
+	gViews[slot] = View();
+	SaveMask(slot);
+	SaveViews();
+	if (gActiveView == slot) {
+		gActiveView = -1;
+		gViewAway = true;
+		WriteReferencePath(std::string());
+		gRedrawPending = true;
+	}
+	LeaveCriticalSection(&gOverlayLock);
+	if (gOverlayWnd)
+		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	return 1;
+}
+
+// text: "slot". 1 if the view has an image, else 0.
+ZFUNC RSViewUsed(char* text, double, char*, int, char*, int, char**)
+{
+	const int slot = text ? atoi(text) : -1;
+	if (slot < 0 || slot >= kViewSlots)
+		return 0;
+	LoadViews();
+	return gViews[slot].used ? 1 : 0;
+}
+
+// text: "slot field", field 0-5: scale, x, y, rx, ry, rz of its anchor.
+ZFUNC RSViewGet(char* text, double, char*, int, char*, int, char**)
+{
+	int slot = -1, field = -1;
+	if (!text || sscanf(text, "%d %d", &slot, &field) != 2 || slot < 0 || slot >= kViewSlots || field < 0 || field > 5)
+		return 0;
+	LoadViews();
+	const View& v = gViews[slot];
+	const double f[6] = {v.scale, v.ax, v.ay, v.rx, v.ry, v.rz};
+	return static_cast<float>(f[field]);
+}
+
 // Hides the overlay. Returns 1.
 ZFUNC RSOverlayStop(char*, double, char*, int, char*, int, char**)
 {
 	if (gOverlayWnd) {
 		EnterCriticalSection(&gOverlayLock);
 		gOverlay.visible = false;
+		gViewAway = true;
+		gViewJob = 0;
 		LeaveCriticalSection(&gOverlayLock);
 		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
 	}
