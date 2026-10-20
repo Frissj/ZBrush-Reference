@@ -188,20 +188,21 @@ ZFUNC RSRender(char* text, double, char*, int, char*, int, char**)
 	return 1;
 }
 
-// text: "docW docH frameName". Writes an all-black document-sized frame, used
-// to clear the canvas while the overlay shows the reference. Returns 1, -1 for
-// bad arguments, -4 if the frame cannot be written.
+// text: "docW docH frameName [r g b]". Writes a document-sized frame of one
+// colour (default black), used to fill the canvas with the overlay's key
+// colour. Returns 1, -1 for bad arguments, -4 if the frame cannot be written.
 ZFUNC RSBlank(char* text, double, char*, int, char*, int, char**)
 {
 	double docW, docH;
+	int r = 0, g = 0, b = 0;
 	char frameName[256] = {0};
-	if (!text || sscanf(text, "%lf %lf %255s", &docW, &docH, frameName) != 3 || docW < 1 || docH < 1 || docW > 16384 || docH > 16384)
+	if (!text || sscanf(text, "%lf %lf %255s %d %d %d", &docW, &docH, frameName, &r, &g, &b) < 3 || docW < 1 || docH < 1 || docW > 16384 || docH > 16384)
 		return -1;
 	StartGdiplus();
 	Gdiplus::Bitmap frame(static_cast<INT>(docW), static_cast<INT>(docH), PixelFormat24bppRGB);
 	{
-		Gdiplus::Graphics g(&frame);
-		g.Clear(Gdiplus::Color(255, 0, 0, 0));
+		Gdiplus::Graphics gr(&frame);
+		gr.Clear(Gdiplus::Color(255, static_cast<BYTE>(r), static_cast<BYTE>(g), static_cast<BYTE>(b)));
 	}
 	return WritePng(DllFolder() + Widen(frameName), frame) ? 1 : -4;
 }
@@ -314,12 +315,12 @@ ZFUNC RSPixel(char* text, double, char*, int, char*, int, char**)
 }
 
 // ---------------------------------------------------------------------------
-// Overlay window (stage 1 of the live reference)
+// Overlay window (stages 1 and 2 of the live reference)
 // ---------------------------------------------------------------------------
 // A click-through layered window owned by ZBrush's main window (so it stays
 // above ZBrush but not above other programs), placed over the canvas and
 // redrawn on its own thread. It shows the reference with the same layout as
-// RSRender, at a constant opacity. The DLL pins itself when the overlay
+// RSRender, keyed behind the model (see Composite). The DLL pins itself when the overlay
 // starts, since ZBrush may unload it between [FileExecute] calls while the
 // overlay thread is still running.
 
@@ -381,63 +382,194 @@ static BOOL CALLBACK FindZBrushWindow(HWND wnd, LPARAM param)
 	return TRUE;
 }
 
-// Renders the current state into a premultiplied 32bpp bitmap the size of
-// the document area on screen and pushes it to the layered window.
+// Stage 2 (keying): the canvas is filled with the key colour, magenta, so
+// the model is the only thing drawn on it that is not magenta. Every tick the
+// overlay captures the screen under itself (it is excluded from capture with
+// SetWindowDisplayAffinity) and, where it sees magenta, replaces it with the
+// reference. A pixel that is part magenta (model edges, X-ray) has the same
+// share of magenta swapped for the reference. Elsewhere the overlay is fully
+// transparent, so the model and anything ZBrush draws over the canvas show.
+//
+// If capture exclusion is unavailable (older Windows) or does not work (the
+// capture shows the overlay's own output), it falls back to drawing the
+// reference at a constant opacity over everything, as in stage 1.
+
+struct Buffer32 {
+	HDC dc = nullptr;
+	HBITMAP bmp = nullptr;
+	HGDIOBJ old = nullptr;
+	unsigned char* bits = nullptr;  // B, G, R, A, top-down
+	int w = 0, h = 0;
+	bool Resize(int nw, int nh)
+	{
+		if (nw == w && nh == h && dc)
+			return true;
+		Free();
+		BITMAPINFO bi = {};
+		bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+		bi.bmiHeader.biWidth = nw;
+		bi.bmiHeader.biHeight = -nh;
+		bi.bmiHeader.biPlanes = 1;
+		bi.bmiHeader.biBitCount = 32;
+		bi.bmiHeader.biCompression = BI_RGB;
+		HDC screen = GetDC(nullptr);
+		dc = CreateCompatibleDC(screen);
+		void* p = nullptr;
+		bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &p, nullptr, 0);
+		ReleaseDC(nullptr, screen);
+		if (!bmp) {
+			DeleteDC(dc);
+			dc = nullptr;
+			return false;
+		}
+		old = SelectObject(dc, bmp);
+		bits = static_cast<unsigned char*>(p);
+		w = nw;
+		h = nh;
+		return true;
+	}
+	void Free()
+	{
+		if (dc) {
+			SelectObject(dc, old);
+			DeleteObject(bmp);
+			DeleteDC(dc);
+		}
+		dc = nullptr;
+		bits = nullptr;
+		w = h = 0;
+	}
+};
+
+static Buffer32 gRefLayer, gCapture, gOutput;
+static int gKeyState = 0;     // 1 keying, 0 no capture exclusion, -1 exclusion not working
+static int gFeedbackFrames = 0;
+static const UINT_PTR kTickTimer = 1;
+
+// Draws the reference for the current state into gRefLayer (premultiplied,
+// transparent outside the image). Returns false if there is nothing to show.
+static bool BuildRefLayer(const OverlayState& st)
+{
+	if (!st.visible || !LoadSavedImage() || st.docW < 1 || st.docH < 1)
+		return false;
+	const int w = static_cast<int>(st.docW * st.pixelsPerDoc + 0.5);
+	const int h = static_cast<int>(st.docH * st.pixelsPerDoc + 0.5);
+	if (!gRefLayer.Resize(w, h) || !gCapture.Resize(w, h) || !gOutput.Resize(w, h))
+		return false;
+	Gdiplus::Bitmap target(w, h, w * 4, PixelFormat32bppPARGB, gRefLayer.bits);
+	Gdiplus::Graphics g(&target);
+	g.Clear(Gdiplus::Color(0, 0, 0, 0));
+	g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+	g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+	const double imgW = gImage->GetWidth(), imgH = gImage->GetHeight();
+	const double fit = (st.docW / imgW < st.docH / imgH) ? st.docW / imgW : st.docH / imgH;
+	const double baseW = imgW * fit, baseH = imgH * fit;
+	const double baseX = (st.docW - baseW) * 0.5, baseY = (st.docH - baseH) * 0.5;
+	const double x = st.px + st.ratio * (baseX - st.ax);
+	const double y = st.py + st.ratio * (baseY - st.ay);
+	const double k = st.pixelsPerDoc;
+	g.DrawImage(gImage, Gdiplus::RectF(static_cast<Gdiplus::REAL>(x * k), static_cast<Gdiplus::REAL>(y * k),
+		static_cast<Gdiplus::REAL>(baseW * st.ratio * k), static_cast<Gdiplus::REAL>(baseH * st.ratio * k)));
+	return true;
+}
+
+static void Present(HWND wnd, const OverlayState& st, Buffer32& buf, BYTE alpha)
+{
+	POINT dst = {static_cast<LONG>(st.screenX), static_cast<LONG>(st.screenY)};
+	SIZE size = {buf.w, buf.h};
+	POINT src = {0, 0};
+	BLENDFUNCTION blend = {AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+	UpdateLayeredWindow(wnd, nullptr, &dst, &size, buf.dc, &src, 0, &blend, ULW_ALPHA);
+	if (!IsWindowVisible(wnd))
+		ShowWindow(wnd, SW_SHOWNOACTIVATE);
+}
+
+// Captures the screen under the overlay and composites the reference into
+// the magenta parts. opacity 0-255 scales the reference (black behind it).
+static void Composite(HWND wnd, const OverlayState& st)
+{
+	const int w = gOutput.w, h = gOutput.h;
+#ifdef RS_TEST_HIDE_CAPTURE
+	// Test builds (Wine has no capture exclusion): hide while capturing.
+	ShowWindow(wnd, SW_HIDE);
+	Sleep(60);
+#endif
+	HDC screen = GetDC(nullptr);
+	BitBlt(gCapture.dc, 0, 0, w, h, screen, static_cast<int>(st.screenX), static_cast<int>(st.screenY), SRCCOPY);
+	ReleaseDC(nullptr, screen);
+	GdiFlush();
+
+	const int op = st.alpha;
+	const unsigned char* cap = gCapture.bits;
+	const unsigned char* ref = gRefLayer.bits;
+	unsigned char* out = gOutput.bits;
+	size_t opaque = 0, echoed = 0;
+	for (size_t i = 0, n = static_cast<size_t>(w) * h; i < n; ++i, cap += 4, ref += 4, out += 4) {
+		const int b = cap[0], g = cap[1], r = cap[2];
+		// The overlay's last output showing up in the capture means it is
+		// not excluded from capture.
+		if (out[3] == 255) {
+			++opaque;
+			if (out[0] == b && out[1] == g && out[2] == r)
+				++echoed;
+		}
+		// Share of magenta in this pixel, 0-256: blending any grey with
+		// magenta (255, 0, 255) by t raises R and B above G by t * 255.
+		const int m = r < b ? r : b;
+		int t = m > g ? ((m - g) << 8) / 255 : 0;
+		if (t < 26) {
+			out[0] = out[1] = out[2] = out[3] = 0;
+			continue;
+		}
+		if (t > 230)
+			t = 256;
+		// Replace that share of magenta (255, 0, 255) with the reference.
+		const int rb = ref[0] * op / 255, rg = ref[1] * op / 255, rr = ref[2] * op / 255;
+		int ob = b + (t * (rb - 255) >> 8), og = g + (t * rg >> 8), orr = r + (t * (rr - 255) >> 8);
+		out[0] = static_cast<unsigned char>(ob < 0 ? 0 : ob > 255 ? 255 : ob);
+		out[1] = static_cast<unsigned char>(og < 0 ? 0 : og > 255 ? 255 : og);
+		out[2] = static_cast<unsigned char>(orr < 0 ? 0 : orr > 255 ? 255 : orr);
+		out[3] = 255;
+	}
+	if (opaque > 1000 && echoed * 2 > opaque) {
+		if (++gFeedbackFrames >= 3)
+			gKeyState = -1;
+	} else {
+		gFeedbackFrames = 0;
+	}
+	Present(wnd, st, gOutput, 255);
+}
+
+// Rebuilds the reference layer after a state change, then draws.
 static void OverlayRedraw(HWND wnd)
 {
 	EnterCriticalSection(&gOverlayLock);
 	const OverlayState st = gOverlay;
-	const bool haveImage = LoadSavedImage();
-	if (!st.visible || !haveImage || st.docW < 1 || st.docH < 1) {
-		LeaveCriticalSection(&gOverlayLock);
+	const bool show = BuildRefLayer(st);
+	LeaveCriticalSection(&gOverlayLock);
+	if (!show) {
 		ShowWindow(wnd, SW_HIDE);
 		return;
 	}
-	const int w = static_cast<int>(st.docW * st.pixelsPerDoc + 0.5);
-	const int h = static_cast<int>(st.docH * st.pixelsPerDoc + 0.5);
+	if (gKeyState == 1)
+		Composite(wnd, st);
+	else
+		Present(wnd, st, gRefLayer, static_cast<BYTE>(st.alpha));
+}
 
-	BITMAPINFO bi = {};
-	bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-	bi.bmiHeader.biWidth = w;
-	bi.bmiHeader.biHeight = -h;
-	bi.bmiHeader.biPlanes = 1;
-	bi.bmiHeader.biBitCount = 32;
-	bi.bmiHeader.biCompression = BI_RGB;
-	void* bits = nullptr;
-	HDC screen = GetDC(nullptr);
-	HDC mem = CreateCompatibleDC(screen);
-	HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-	HGDIOBJ old = SelectObject(mem, dib);
-	{
-		Gdiplus::Bitmap target(w, h, w * 4, PixelFormat32bppPARGB, static_cast<BYTE*>(bits));
-		Gdiplus::Graphics g(&target);
-		g.Clear(Gdiplus::Color(0, 0, 0, 0));
-		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
-		g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-
-		const double imgW = gImage->GetWidth(), imgH = gImage->GetHeight();
-		const double fit = (st.docW / imgW < st.docH / imgH) ? st.docW / imgW : st.docH / imgH;
-		const double baseW = imgW * fit, baseH = imgH * fit;
-		const double baseX = (st.docW - baseW) * 0.5, baseY = (st.docH - baseH) * 0.5;
-		const double x = st.px + st.ratio * (baseX - st.ax);
-		const double y = st.py + st.ratio * (baseY - st.ay);
-		const double k = st.pixelsPerDoc;
-		g.DrawImage(gImage, Gdiplus::RectF(static_cast<Gdiplus::REAL>(x * k), static_cast<Gdiplus::REAL>(y * k),
-			static_cast<Gdiplus::REAL>(baseW * st.ratio * k), static_cast<Gdiplus::REAL>(baseH * st.ratio * k)));
-	}
+// Timer tick: while keying, recomposite with a fresh capture.
+static void OverlayTick(HWND wnd)
+{
+	if (gKeyState != 1)
+		return;
+	EnterCriticalSection(&gOverlayLock);
+	const OverlayState st = gOverlay;
 	LeaveCriticalSection(&gOverlayLock);
-
-	POINT dst = {static_cast<LONG>(st.screenX), static_cast<LONG>(st.screenY)};
-	SIZE size = {w, h};
-	POINT src = {0, 0};
-	BLENDFUNCTION blend = {AC_SRC_OVER, 0, static_cast<BYTE>(st.alpha), AC_SRC_ALPHA};
-	UpdateLayeredWindow(wnd, screen, &dst, &size, mem, &src, 0, &blend, ULW_ALPHA);
-	ShowWindow(wnd, SW_SHOWNOACTIVATE);
-
-	SelectObject(mem, old);
-	DeleteObject(dib);
-	DeleteDC(mem);
-	ReleaseDC(nullptr, screen);
+	if (!st.visible || !gOutput.dc)
+		return;
+	Composite(wnd, st);
+	if (gKeyState != 1)
+		OverlayRedraw(wnd);
 }
 
 static LRESULT CALLBACK OverlayProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -445,6 +577,10 @@ static LRESULT CALLBACK OverlayProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 	switch (msg) {
 	case WM_RS_REDRAW:
 		OverlayRedraw(wnd);
+		return 0;
+	case WM_TIMER:
+		if (wp == kTickTimer)
+			OverlayTick(wnd);
 		return 0;
 	case WM_RS_CLOSE:
 		DestroyWindow(wnd);
@@ -475,6 +611,15 @@ static DWORD WINAPI OverlayThread(LPVOID ready)
 	EnumWindows(FindZBrushWindow, reinterpret_cast<LPARAM>(&owner));
 	gOverlayWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
 		wc.lpszClassName, L"Reference Scaler", WS_POPUP, 0, 0, 1, 1, owner, nullptr, wc.hInstance, nullptr);
+	// WDA_EXCLUDEFROMCAPTURE (Windows 10 2004 and later): the overlay's own
+	// captures of the screen see what is underneath it.
+#ifdef RS_TEST_HIDE_CAPTURE
+	gKeyState = 1;
+#else
+	gKeyState = gOverlayWnd && SetWindowDisplayAffinity(gOverlayWnd, 0x11) ? 1 : 0;
+#endif
+	if (gOverlayWnd)
+		SetTimer(gOverlayWnd, kTickTimer, 40, nullptr);
 	SetEvent(static_cast<HANDLE>(ready));
 	MSG msg;
 	while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -859,7 +1004,9 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 
 // text: "0" screen X of the document's top-left corner, "1" screen Y, "2"
 // screen pixels per document pixel (x1000), "3" match strength, from the
-// last RSOverlayStart; "4" 1 if the overlay is showing, else 0.
+// last RSOverlayStart; "4" 1 if the overlay is showing, else 0; "5" 1 if the
+// model is keyed in front (capture exclusion works), 0 if Windows has no
+// capture exclusion, -1 if it did not work.
 ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 {
 	const int which = text ? atoi(text) : -1;
@@ -869,6 +1016,7 @@ ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 	case 2: return static_cast<float>(floor(gCalibration.pixelsPerDoc * 1000 + 0.5));
 	case 3: return static_cast<float>(floor(gCalibration.percent));
 	case 4: return gOverlayWnd && gOverlay.visible ? 1 : 0;
+	case 5: return static_cast<float>(gKeyState);
 	}
 	return -1;
 }
