@@ -25,7 +25,7 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 31"]
+[VarDef, zrsBuild, "build 33"]
 [VarDef, zrsDll, "ReferenceScaler_Data\ReferenceScaler64.dll"]
 [VarDef, zrsDepth, -1]
 [VarDef, zrsTexBefore, -1]
@@ -108,14 +108,14 @@
 // Works out the ratio and positions from the current model and the anchor
 // sliders, then draws. Leaves a result in zrsMsg.
 [RoutineDef, ZRSUpdate,
-	[If, [IGet, "ZPlugin:Reference Scaler b31:Anchor Scale"] <= 0,
+	[If, [IGet, "ZPlugin:Reference Scaler b33:Anchor Scale"] <= 0,
 		[VarSet, zrsMsg, "Not anchored: press Anchor first."]
 		[VarSet, zrsResult, 0]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b31:Anchor Scale"]]
-		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b31:Anchor X"]]
-		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b31:Anchor Y"]]
+		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b33:Anchor Scale"]]
+		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b33:Anchor X"]]
+		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b33:Anchor Y"]]
 		[RoutineCall, ZRSDraw]
 	]
 ]
@@ -129,7 +129,7 @@
 		[If, zrsLive,
 			[If, [IGet, Transform:Edit],
 				[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b31:Anchor Scale"]]
+				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b33:Anchor Scale"]]
 				[If, ABS(zrsRatio - zrsLastRatio) > 0.002 || ABS(zrsPx - zrsLastPx) > 0.5 || ABS(zrsPy - zrsLastPy) > 0.5,
 					[RoutineCall, ZRSUpdate]
 				]
@@ -152,176 +152,12 @@
 	[VarSet, zrsTexAfter, [IGet, "Texture:Item Info"]]
 ]
 
-// Settings snapshot: Snapshot records about 42 settings and the model's
-// transform through the DLL (another plugin running resets this script's
-// variables); Compare lists what changed since, e.g. after Image Plane loads
-// an image. Results are shown in popups of up to about 220 characters.
-[VarDef, zrsVal, 0]
-[VarDef, zrsOut, ""]
-[VarDef, zrsItem, ""]
-[VarDef, zrsCount, 0]
-
-[RoutineDef, ZRSCmpAdd,
-	[If, [StrLength, zrsOut] + [StrLength, zrsItem] > 220,
-		[Note, zrsOut]
-		[VarSet, zrsOut, "Changed (continued)\n"]
-	]
-	[VarSet, zrsOut, [StrMerge, zrsOut, zrsItem, "\n"]]
-	[VarSet, zrsCount, zrsCount + 1]
-]
-
-[RoutineDef, ZRSSnap1,
-	[If, [IExists, "Texture:Clear Depth"], [FileExecute, zrsDll, "RSPut", [StrMerge, "0 ", [IGet, "Texture:Clear Depth"]]]]
-	[If, [IExists, "Texture:Item Info"], [FileExecute, zrsDll, "RSPut", [StrMerge, "1 ", [IGet, "Texture:Item Info"]]]]
-	[If, [IExists, "Transform:Edit"], [FileExecute, zrsDll, "RSPut", [StrMerge, "2 ", [IGet, "Transform:Edit"]]]]
-	[If, [IExists, "Transform:Move"], [FileExecute, zrsDll, "RSPut", [StrMerge, "3 ", [IGet, "Transform:Move"]]]]
-	[If, [IExists, "Transform:Scale"], [FileExecute, zrsDll, "RSPut", [StrMerge, "4 ", [IGet, "Transform:Scale"]]]]
-	[If, [IExists, "Transform:Rotate"], [FileExecute, zrsDll, "RSPut", [StrMerge, "5 ", [IGet, "Transform:Rotate"]]]]
-	[If, [IExists, "Transform:Draw"], [FileExecute, zrsDll, "RSPut", [StrMerge, "6 ", [IGet, "Transform:Draw"]]]]
-	[If, [IExists, "Transform:Persp"], [FileExecute, zrsDll, "RSPut", [StrMerge, "7 ", [IGet, "Transform:Persp"]]]]
-]
-
-[RoutineDef, ZRSSnap2,
-	[If, [IExists, "Transform:Floor"], [FileExecute, zrsDll, "RSPut", [StrMerge, "8 ", [IGet, "Transform:Floor"]]]]
-	[If, [IExists, "Transform:Transp"], [FileExecute, zrsDll, "RSPut", [StrMerge, "9 ", [IGet, "Transform:Transp"]]]]
-	[If, [IExists, "Transform:Ghost"], [FileExecute, zrsDll, "RSPut", [StrMerge, "10 ", [IGet, "Transform:Ghost"]]]]
-	[If, [IExists, "Transform:Solo"], [FileExecute, zrsDll, "RSPut", [StrMerge, "11 ", [IGet, "Transform:Solo"]]]]
-	[If, [IExists, "Transform:Local"], [FileExecute, zrsDll, "RSPut", [StrMerge, "12 ", [IGet, "Transform:Local"]]]]
-	[If, [IExists, "Draw:Persp"], [FileExecute, zrsDll, "RSPut", [StrMerge, "13 ", [IGet, "Draw:Persp"]]]]
-	[If, [IExists, "Draw:Floor"], [FileExecute, zrsDll, "RSPut", [StrMerge, "14 ", [IGet, "Draw:Floor"]]]]
-	[If, [IExists, "Draw:Angle of View"], [FileExecute, zrsDll, "RSPut", [StrMerge, "15 ", [IGet, "Draw:Angle of View"]]]]
-]
-
-[RoutineDef, ZRSSnap3,
-	[If, [IExists, "Draw:Draw Size"], [FileExecute, zrsDll, "RSPut", [StrMerge, "16 ", [IGet, "Draw:Draw Size"]]]]
-	[If, [IExists, "Draw:Z Intensity"], [FileExecute, zrsDll, "RSPut", [StrMerge, "17 ", [IGet, "Draw:Z Intensity"]]]]
-	[If, [IExists, "Draw:ZAdd"], [FileExecute, zrsDll, "RSPut", [StrMerge, "18 ", [IGet, "Draw:ZAdd"]]]]
-	[If, [IExists, "Draw:ZSub"], [FileExecute, zrsDll, "RSPut", [StrMerge, "19 ", [IGet, "Draw:ZSub"]]]]
-	[If, [IExists, "Draw:Zcut"], [FileExecute, zrsDll, "RSPut", [StrMerge, "20 ", [IGet, "Draw:Zcut"]]]]
-	[If, [IExists, "Draw:Rgb"], [FileExecute, zrsDll, "RSPut", [StrMerge, "21 ", [IGet, "Draw:Rgb"]]]]
-	[If, [IExists, "Draw:Mrgb"], [FileExecute, zrsDll, "RSPut", [StrMerge, "22 ", [IGet, "Draw:Mrgb"]]]]
-	[If, [IExists, "Draw:M"], [FileExecute, zrsDll, "RSPut", [StrMerge, "23 ", [IGet, "Draw:M"]]]]
-]
-
-[RoutineDef, ZRSSnap4,
-	[If, [IExists, "Draw:Elv"], [FileExecute, zrsDll, "RSPut", [StrMerge, "24 ", [IGet, "Draw:Elv"]]]]
-	[If, [IExists, "Draw:Fill Mode"], [FileExecute, zrsDll, "RSPut", [StrMerge, "25 ", [IGet, "Draw:Fill Mode"]]]]
-	[If, [IExists, "Document:Width"], [FileExecute, zrsDll, "RSPut", [StrMerge, "26 ", [IGet, "Document:Width"]]]]
-	[If, [IExists, "Document:Height"], [FileExecute, zrsDll, "RSPut", [StrMerge, "27 ", [IGet, "Document:Height"]]]]
-	[If, [IExists, "Document:Zoom"], [FileExecute, zrsDll, "RSPut", [StrMerge, "28 ", [IGet, "Document:Zoom"]]]]
-	[If, [IExists, "Document:Range"], [FileExecute, zrsDll, "RSPut", [StrMerge, "29 ", [IGet, "Document:Range"]]]]
-	[If, [IExists, "Document:Rate"], [FileExecute, zrsDll, "RSPut", [StrMerge, "30 ", [IGet, "Document:Rate"]]]]
-	[If, [IExists, "Document:Border"], [FileExecute, zrsDll, "RSPut", [StrMerge, "31 ", [IGet, "Document:Border"]]]]
-]
-
-[RoutineDef, ZRSSnap5,
-	[If, [IExists, "Tool:Item Info"], [FileExecute, zrsDll, "RSPut", [StrMerge, "32 ", [IGet, "Tool:Item Info"]]]]
-	[If, [IExists, "Material:Item Info"], [FileExecute, zrsDll, "RSPut", [StrMerge, "33 ", [IGet, "Material:Item Info"]]]]
-	[If, [IExists, "Alpha:Item Info"], [FileExecute, zrsDll, "RSPut", [StrMerge, "34 ", [IGet, "Alpha:Item Info"]]]]
-	[If, [IExists, "Stroke:Item Info"], [FileExecute, zrsDll, "RSPut", [StrMerge, "35 ", [IGet, "Stroke:Item Info"]]]]
-	[If, [IExists, "Layer:Item Info"], [FileExecute, zrsDll, "RSPut", [StrMerge, "36 ", [IGet, "Layer:Item Info"]]]]
-	[If, [IExists, "Render:Flat"], [FileExecute, zrsDll, "RSPut", [StrMerge, "37 ", [IGet, "Render:Flat"]]]]
-	[If, [IExists, "Render:Fast"], [FileExecute, zrsDll, "RSPut", [StrMerge, "38 ", [IGet, "Render:Fast"]]]]
-	[If, [IExists, "Render:Preview"], [FileExecute, zrsDll, "RSPut", [StrMerge, "39 ", [IGet, "Render:Preview"]]]]
-]
-
-[RoutineDef, ZRSSnap6,
-	[If, [IExists, "Render:Best"], [FileExecute, zrsDll, "RSPut", [StrMerge, "40 ", [IGet, "Render:Best"]]]]
-	[If, [IExists, "Color:Main Color"], [FileExecute, zrsDll, "RSPut", [StrMerge, "41 ", [IGet, "Color:Main Color"]]]]
-]
-
-[RoutineDef, ZRSSnapT,
-	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[FileExecute, zrsDll, "RSPut", [StrMerge, "900 ", zrsPx]]
-	[FileExecute, zrsDll, "RSPut", [StrMerge, "901 ", zrsPy]]
-	[FileExecute, zrsDll, "RSPut", [StrMerge, "902 ", zrsPz]]
-	[FileExecute, zrsDll, "RSPut", [StrMerge, "903 ", zrsSx]]
-	[FileExecute, zrsDll, "RSPut", [StrMerge, "904 ", zrsSy]]
-	[FileExecute, zrsDll, "RSPut", [StrMerge, "905 ", zrsSz]]
-	[FileExecute, zrsDll, "RSPut", [StrMerge, "906 ", zrsRx]]
-	[FileExecute, zrsDll, "RSPut", [StrMerge, "907 ", zrsRy]]
-	[FileExecute, zrsDll, "RSPut", [StrMerge, "908 ", zrsRz]]
-]
-
-[RoutineDef, ZRSCmp1,
-	[If, [IExists, "Texture:Clear Depth"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "0"]] [If, ABS(zrsVal - [IGet, "Texture:Clear Depth"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Texture:Clear Depth: ", zrsVal, " -> ", [IGet, "Texture:Clear Depth"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Texture:Item Info"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "1"]] [If, ABS(zrsVal - [IGet, "Texture:Item Info"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Texture:Item Info: ", zrsVal, " -> ", [IGet, "Texture:Item Info"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Transform:Edit"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "2"]] [If, ABS(zrsVal - [IGet, "Transform:Edit"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "T:Edit: ", zrsVal, " -> ", [IGet, "Transform:Edit"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Transform:Move"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "3"]] [If, ABS(zrsVal - [IGet, "Transform:Move"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "T:Move: ", zrsVal, " -> ", [IGet, "Transform:Move"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Transform:Scale"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "4"]] [If, ABS(zrsVal - [IGet, "Transform:Scale"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "T:Scale: ", zrsVal, " -> ", [IGet, "Transform:Scale"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Transform:Rotate"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "5"]] [If, ABS(zrsVal - [IGet, "Transform:Rotate"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "T:Rotate: ", zrsVal, " -> ", [IGet, "Transform:Rotate"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Transform:Draw"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "6"]] [If, ABS(zrsVal - [IGet, "Transform:Draw"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "T:Draw: ", zrsVal, " -> ", [IGet, "Transform:Draw"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Transform:Persp"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "7"]] [If, ABS(zrsVal - [IGet, "Transform:Persp"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "T:Persp: ", zrsVal, " -> ", [IGet, "Transform:Persp"]]] [RoutineCall, ZRSCmpAdd]]]
-]
-
-[RoutineDef, ZRSCmp2,
-	[If, [IExists, "Transform:Floor"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "8"]] [If, ABS(zrsVal - [IGet, "Transform:Floor"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "T:Floor: ", zrsVal, " -> ", [IGet, "Transform:Floor"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Transform:Transp"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "9"]] [If, ABS(zrsVal - [IGet, "Transform:Transp"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "T:Transp: ", zrsVal, " -> ", [IGet, "Transform:Transp"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Transform:Ghost"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "10"]] [If, ABS(zrsVal - [IGet, "Transform:Ghost"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "T:Ghost: ", zrsVal, " -> ", [IGet, "Transform:Ghost"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Transform:Solo"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "11"]] [If, ABS(zrsVal - [IGet, "Transform:Solo"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "T:Solo: ", zrsVal, " -> ", [IGet, "Transform:Solo"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Transform:Local"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "12"]] [If, ABS(zrsVal - [IGet, "Transform:Local"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "T:Local: ", zrsVal, " -> ", [IGet, "Transform:Local"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Draw:Persp"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "13"]] [If, ABS(zrsVal - [IGet, "Draw:Persp"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Draw:Persp: ", zrsVal, " -> ", [IGet, "Draw:Persp"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Draw:Floor"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "14"]] [If, ABS(zrsVal - [IGet, "Draw:Floor"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Draw:Floor: ", zrsVal, " -> ", [IGet, "Draw:Floor"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Draw:Angle of View"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "15"]] [If, ABS(zrsVal - [IGet, "Draw:Angle of View"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Draw:Angle of View: ", zrsVal, " -> ", [IGet, "Draw:Angle of View"]]] [RoutineCall, ZRSCmpAdd]]]
-]
-
-[RoutineDef, ZRSCmp3,
-	[If, [IExists, "Draw:Draw Size"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "16"]] [If, ABS(zrsVal - [IGet, "Draw:Draw Size"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Draw:Draw Size: ", zrsVal, " -> ", [IGet, "Draw:Draw Size"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Draw:Z Intensity"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "17"]] [If, ABS(zrsVal - [IGet, "Draw:Z Intensity"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Draw:Z Intensity: ", zrsVal, " -> ", [IGet, "Draw:Z Intensity"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Draw:ZAdd"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "18"]] [If, ABS(zrsVal - [IGet, "Draw:ZAdd"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Draw:ZAdd: ", zrsVal, " -> ", [IGet, "Draw:ZAdd"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Draw:ZSub"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "19"]] [If, ABS(zrsVal - [IGet, "Draw:ZSub"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Draw:ZSub: ", zrsVal, " -> ", [IGet, "Draw:ZSub"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Draw:Zcut"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "20"]] [If, ABS(zrsVal - [IGet, "Draw:Zcut"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Draw:Zcut: ", zrsVal, " -> ", [IGet, "Draw:Zcut"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Draw:Rgb"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "21"]] [If, ABS(zrsVal - [IGet, "Draw:Rgb"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Draw:Rgb: ", zrsVal, " -> ", [IGet, "Draw:Rgb"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Draw:Mrgb"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "22"]] [If, ABS(zrsVal - [IGet, "Draw:Mrgb"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Draw:Mrgb: ", zrsVal, " -> ", [IGet, "Draw:Mrgb"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Draw:M"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "23"]] [If, ABS(zrsVal - [IGet, "Draw:M"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Draw:M: ", zrsVal, " -> ", [IGet, "Draw:M"]]] [RoutineCall, ZRSCmpAdd]]]
-]
-
-[RoutineDef, ZRSCmp4,
-	[If, [IExists, "Draw:Elv"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "24"]] [If, ABS(zrsVal - [IGet, "Draw:Elv"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Draw:Elv: ", zrsVal, " -> ", [IGet, "Draw:Elv"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Draw:Fill Mode"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "25"]] [If, ABS(zrsVal - [IGet, "Draw:Fill Mode"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Draw:Fill Mode: ", zrsVal, " -> ", [IGet, "Draw:Fill Mode"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Document:Width"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "26"]] [If, ABS(zrsVal - [IGet, "Document:Width"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Doc:Width: ", zrsVal, " -> ", [IGet, "Document:Width"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Document:Height"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "27"]] [If, ABS(zrsVal - [IGet, "Document:Height"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Doc:Height: ", zrsVal, " -> ", [IGet, "Document:Height"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Document:Zoom"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "28"]] [If, ABS(zrsVal - [IGet, "Document:Zoom"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Doc:Zoom: ", zrsVal, " -> ", [IGet, "Document:Zoom"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Document:Range"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "29"]] [If, ABS(zrsVal - [IGet, "Document:Range"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Doc:Range: ", zrsVal, " -> ", [IGet, "Document:Range"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Document:Rate"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "30"]] [If, ABS(zrsVal - [IGet, "Document:Rate"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Doc:Rate: ", zrsVal, " -> ", [IGet, "Document:Rate"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Document:Border"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "31"]] [If, ABS(zrsVal - [IGet, "Document:Border"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Doc:Border: ", zrsVal, " -> ", [IGet, "Document:Border"]]] [RoutineCall, ZRSCmpAdd]]]
-]
-
-[RoutineDef, ZRSCmp5,
-	[If, [IExists, "Tool:Item Info"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "32"]] [If, ABS(zrsVal - [IGet, "Tool:Item Info"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Tool:Item Info: ", zrsVal, " -> ", [IGet, "Tool:Item Info"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Material:Item Info"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "33"]] [If, ABS(zrsVal - [IGet, "Material:Item Info"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Material:Item Info: ", zrsVal, " -> ", [IGet, "Material:Item Info"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Alpha:Item Info"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "34"]] [If, ABS(zrsVal - [IGet, "Alpha:Item Info"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Alpha:Item Info: ", zrsVal, " -> ", [IGet, "Alpha:Item Info"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Stroke:Item Info"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "35"]] [If, ABS(zrsVal - [IGet, "Stroke:Item Info"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Stroke:Item Info: ", zrsVal, " -> ", [IGet, "Stroke:Item Info"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Layer:Item Info"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "36"]] [If, ABS(zrsVal - [IGet, "Layer:Item Info"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Layer:Item Info: ", zrsVal, " -> ", [IGet, "Layer:Item Info"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Render:Flat"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "37"]] [If, ABS(zrsVal - [IGet, "Render:Flat"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Render:Flat: ", zrsVal, " -> ", [IGet, "Render:Flat"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Render:Fast"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "38"]] [If, ABS(zrsVal - [IGet, "Render:Fast"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Render:Fast: ", zrsVal, " -> ", [IGet, "Render:Fast"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Render:Preview"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "39"]] [If, ABS(zrsVal - [IGet, "Render:Preview"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Render:Preview: ", zrsVal, " -> ", [IGet, "Render:Preview"]]] [RoutineCall, ZRSCmpAdd]]]
-]
-
-[RoutineDef, ZRSCmp6,
-	[If, [IExists, "Render:Best"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "40"]] [If, ABS(zrsVal - [IGet, "Render:Best"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Render:Best: ", zrsVal, " -> ", [IGet, "Render:Best"]]] [RoutineCall, ZRSCmpAdd]]]
-	[If, [IExists, "Color:Main Color"], [VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "41"]] [If, ABS(zrsVal - [IGet, "Color:Main Color"]) > 0.0001, [VarSet, zrsItem, [StrMerge, "Color:Main Color: ", zrsVal, " -> ", [IGet, "Color:Main Color"]]] [RoutineCall, ZRSCmpAdd]]]
-]
-
-[RoutineDef, ZRSCmpT,
-	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "900"]] [If, ABS(zrsVal - zrsPx) > 0.0001, [VarSet, zrsItem, [StrMerge, "Model pos X: ", zrsVal, " -> ", zrsPx]] [RoutineCall, ZRSCmpAdd]]
-	[VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "901"]] [If, ABS(zrsVal - zrsPy) > 0.0001, [VarSet, zrsItem, [StrMerge, "Model pos Y: ", zrsVal, " -> ", zrsPy]] [RoutineCall, ZRSCmpAdd]]
-	[VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "902"]] [If, ABS(zrsVal - zrsPz) > 0.0001, [VarSet, zrsItem, [StrMerge, "Model pos Z: ", zrsVal, " -> ", zrsPz]] [RoutineCall, ZRSCmpAdd]]
-	[VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "903"]] [If, ABS(zrsVal - zrsSx) > 0.0001, [VarSet, zrsItem, [StrMerge, "Model scale X: ", zrsVal, " -> ", zrsSx]] [RoutineCall, ZRSCmpAdd]]
-	[VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "904"]] [If, ABS(zrsVal - zrsSy) > 0.0001, [VarSet, zrsItem, [StrMerge, "Model scale Y: ", zrsVal, " -> ", zrsSy]] [RoutineCall, ZRSCmpAdd]]
-	[VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "905"]] [If, ABS(zrsVal - zrsSz) > 0.0001, [VarSet, zrsItem, [StrMerge, "Model scale Z: ", zrsVal, " -> ", zrsSz]] [RoutineCall, ZRSCmpAdd]]
-	[VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "906"]] [If, ABS(zrsVal - zrsRx) > 0.0001, [VarSet, zrsItem, [StrMerge, "Model rot X: ", zrsVal, " -> ", zrsRx]] [RoutineCall, ZRSCmpAdd]]
-	[VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "907"]] [If, ABS(zrsVal - zrsRy) > 0.0001, [VarSet, zrsItem, [StrMerge, "Model rot Y: ", zrsVal, " -> ", zrsRy]] [RoutineCall, ZRSCmpAdd]]
-	[VarSet, zrsVal, [FileExecute, zrsDll, "RSGet", "908"]] [If, ABS(zrsVal - zrsRz) > 0.0001, [VarSet, zrsItem, [StrMerge, "Model rot Z: ", zrsVal, " -> ", zrsRz]] [RoutineCall, ZRSCmpAdd]]
-]
-
 // ---------------------------------------------------------------------------
 // Interface
 // ---------------------------------------------------------------------------
-[ISubPalette, "ZPlugin:Reference Scaler b31"]
+[ISubPalette, "ZPlugin:Reference Scaler b33"]
 
-[IButton, "ZPlugin:Reference Scaler b31:Load Image",
+[IButton, "ZPlugin:Reference Scaler b33:Load Image",
 	"Choose the reference image and draw it behind the model, fitted to the document.",
 	[VarSet, zrsFile, [FileNameAsk, "Image (*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd)|*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd||", , "Choose reference image"]]
 	[If, [StrLength, zrsFile] == 0,
@@ -343,28 +179,28 @@
 	, 0, 1
 ]
 
-[IButton, "ZPlugin:Reference Scaler b31:Anchor",
+[IButton, "ZPlugin:Reference Scaler b33:Anchor",
 	"With the model lined up with the image, press to record this zoom and position as the 1:1 match.",
 	[If, [IGet, Transform:Edit] == 0,
 		[Note, "Put the model in Edit mode first."]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[ISet, "ZPlugin:Reference Scaler b31:Anchor Scale", zrsSx]
-		[ISet, "ZPlugin:Reference Scaler b31:Anchor X", zrsPx]
-		[ISet, "ZPlugin:Reference Scaler b31:Anchor Y", zrsPy]
+		[ISet, "ZPlugin:Reference Scaler b33:Anchor Scale", zrsSx]
+		[ISet, "ZPlugin:Reference Scaler b33:Anchor X", zrsPx]
+		[ISet, "ZPlugin:Reference Scaler b33:Anchor Y", zrsPy]
 		[Note, [StrMerge, "Anchored: model scale ", zrsSx, ", position ", zrsPx, ", ", zrsPy]]
 	]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b31:Sync",
+[IButton, "ZPlugin:Reference Scaler b33:Sync",
 	"Redraw the reference for the current zoom and position once.",
 	[RoutineCall, ZRSUpdate]
 	[Note, [StrMerge, "Sync\n", zrsMsg]]
 	, 0, 0.5
 ]
 
-[ISwitch, "ZPlugin:Reference Scaler b31:Live", 0,
+[ISwitch, "ZPlugin:Reference Scaler b33:Live", 0,
 	"Keep redrawing the reference as the camera zooms and pans.",
 	[VarSet, zrsLive, 1]
 	[RoutineCall, ZRSUpdate]
@@ -375,7 +211,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b31:Reset",
+[IButton, "ZPlugin:Reference Scaler b33:Reset",
 	"Redraw the reference fitted to the document, as Load Image does.",
 	[VarSet, zrsRatio, 1]
 	[VarSet, zrsPx, 0]
@@ -389,7 +225,7 @@
 
 // Step-by-step test of the drawing pipeline: each button does one stage and
 // reports it in its own popup (popups hold about 255 characters).
-[IButton, "ZPlugin:Reference Scaler b31:1 Render",
+[IButton, "ZPlugin:Reference Scaler b33:1 Render",
 	"Test step 1: have the DLL write frame0.png (the image fitted to the document).",
 	[VarSet, zrsArgs, [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " 1 0 0 0 0 frame0.png"]]
 	[VarSet, zrsResult, [FileExecute, zrsDll, "RSRender", zrsArgs]]
@@ -398,7 +234,7 @@
 	, 0, 0.33
 ]
 
-[IButton, "ZPlugin:Reference Scaler b31:2 Import",
+[IButton, "ZPlugin:Reference Scaler b33:2 Import",
 	"Test step 2: import frame0.png into the Texture palette and select it.",
 	[VarSet, zrsFile, [FileNameResolvePath, "ReferenceScaler_Data\frame0.png"]]
 	[RoutineCall, ZRSImport]
@@ -406,98 +242,17 @@
 	, 0, 0.33
 ]
 
-[IButton, "ZPlugin:Reference Scaler b31:3 Fill",
-	"Test step 3: Color > FillLayer with the current texture, nothing else.",
-	[IPress, Color:FillLayer]
-	[VarSet, zrsTexAfter, -1]
-	[If, [IExists, "Texture:Item Info"], [VarSet, zrsTexAfter, [IGet, "Texture:Item Info"]]]
-	[VarSet, zrsDepth, -1]
-	[If, [IExists, "Texture:Clear Depth"], [VarSet, zrsDepth, [IGet, "Texture:Clear Depth"]]]
-	[Note, [StrMerge, "3 Fill done. Current texture ", zrsTexAfter, "  Clear Depth ", zrsDepth, "\nImage or grey? In front of or behind the model?"]]
-	, 0, 0.33
-]
-
-// Depth tests: fill with the current texture under different settings, to
-// find which one puts the image behind the model the way a manual FillLayer
-// did. Undo (Ctrl+Z) between tries.
-[IButton, "ZPlugin:Reference Scaler b31:6 Fill CD Off",
-	"Test step 6: Clear Depth off, then Color > FillLayer.",
-	[If, [IExists, "Texture:Clear Depth"], [ISet, "Texture:Clear Depth", 0]]
-	[IPress, Color:FillLayer]
-	[VarSet, zrsDepth, -1]
-	[If, [IExists, "Texture:Clear Depth"], [VarSet, zrsDepth, [IGet, "Texture:Clear Depth"]]]
-	[Note, [StrMerge, "6 Fill CD Off: Clear Depth is ", zrsDepth, "\nIs the image behind the model? Zoom out: does the model still clip into it?"]]
-	, 0, 0.33
-]
-
-[IButton, "ZPlugin:Reference Scaler b31:6 Fill CD On",
-	"Test step 6: Clear Depth on, then Color > FillLayer.",
-	[If, [IExists, "Texture:Clear Depth"], [ISet, "Texture:Clear Depth", 1]]
-	[IPress, Color:FillLayer]
-	[VarSet, zrsDepth, -1]
-	[If, [IExists, "Texture:Clear Depth"], [VarSet, zrsDepth, [IGet, "Texture:Clear Depth"]]]
-	[Note, [StrMerge, "6 Fill CD On: Clear Depth is ", zrsDepth, "\nIs the image behind the model? Zoom out: does the model still clip into it?"]]
-	, 0, 0.33
-]
-
-[IButton, "ZPlugin:Reference Scaler b31:6 Clear+Fill",
-	"Test step 6: Layer > Clear, then Clear Depth off and Color > FillLayer.",
-	[If, [IExists, "Layer:Clear"], [IPress, Layer:Clear], [Note, "Layer > Clear not found; filling without clearing."]]
-	[If, [IExists, "Texture:Clear Depth"], [ISet, "Texture:Clear Depth", 0]]
-	[IPress, Color:FillLayer]
-	[VarSet, zrsDepth, -1]
-	[If, [IExists, "Texture:Clear Depth"], [VarSet, zrsDepth, [IGet, "Texture:Clear Depth"]]]
-	[Note, [StrMerge, "6 Clear+Fill: Clear Depth is ", zrsDepth, "\nIs the image behind the model? Zoom out: does the model still clip into it?"]]
-	, 0, 0.33
-]
-
-// Fill command tests: the two fill commands other than Color > FillLayer,
-// using the current texture (press 2 Import first).
-[IButton, "ZPlugin:Reference Scaler b31:7 Layer Fill",
-	"Test step 7: Layer > Fill with the current texture.",
-	[If, [IExists, "Layer:Fill"],
-		[IPress, Layer:Fill]
-		[Note, "7 Layer Fill done.\nImage behind the model? Zoom out: does it still clip?"]
-		,
-		[Note, "7 Layer Fill: Layer > Fill not found."]
-	]
-	, 0, 0.5
-]
-
-[IButton, "ZPlugin:Reference Scaler b31:7 Crop Fill",
-	"Test step 7: Texture > CropAndFill with the current texture (the frame is document-sized, so the document size should not change).",
-	[If, [IExists, "Texture:CropAndFill"],
-		[IPress, Texture:CropAndFill]
-		[Note, [StrMerge, "7 Crop Fill done. Document ", [IGet, Document:Width], " x ", [IGet, Document:Height], "\nImage behind the model? Zoom out: does it still clip?"]]
-		,
-		[Note, "7 Crop Fill: Texture > CropAndFill not found."]
-	]
-	, 0, 0.5
-]
-
-// Clipping test: zooming out moves the model back in Z, past the filled
-// image. Moves the model 500 forward in Z and reports Z before and after.
-[IButton, "ZPlugin:Reference Scaler b31:8 Model Forward",
-	"Test step 8: when the zoomed-out model clips into the image, move it 500 forward in Z.",
-	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[VarSet, zrsBefore, zrsPz]
-	[TransformSet, zrsPx, zrsPy, zrsPz - 500, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[Note, [StrMerge, "8 Model Forward: Z ", zrsBefore, " -> ", zrsPz, "\nDid the clipping stop? Did the model's size change?"]]
-	, 0, 0.5
-]
-
 // Hand-off test: render the frame for the current zoom, import and select it,
 // then let Image Plane's own Load Image put it behind the model (Load Image
 // uses the selected texture instead of asking for a file). Pressing Image
 // Plane's button ends this script, so the popup comes before it.
-[IButton, "ZPlugin:Reference Scaler b31:9 Via Image Plane",
+[IButton, "ZPlugin:Reference Scaler b33:9 Via Image Plane",
 	"Test step 9: render the frame, select it, and load it with Texture > Image Plane > Load Image.",
-	[If, [IGet, "ZPlugin:Reference Scaler b31:Anchor Scale"] > 0,
+	[If, [IGet, "ZPlugin:Reference Scaler b33:Anchor Scale"] > 0,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b31:Anchor Scale"]]
-		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b31:Anchor X"]]
-		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b31:Anchor Y"]]
+		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b33:Anchor Scale"]]
+		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b33:Anchor X"]]
+		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b33:Anchor Y"]]
 		,
 		[VarSet, zrsRatio, 1]
 		[VarSet, zrsPx, 0]
@@ -517,54 +272,96 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b31:Snapshot",
-	"Record current ZBrush settings and the model's transform, to compare after another plugin runs.",
-	[FileExecute, zrsDll, "RSPut", "clear"]
-	[RoutineCall, ZRSSnap1]
-	[RoutineCall, ZRSSnap2]
-	[RoutineCall, ZRSSnap3]
-	[RoutineCall, ZRSSnap4]
-	[RoutineCall, ZRSSnap5]
-	[RoutineCall, ZRSSnap6]
-	[RoutineCall, ZRSSnapT]
-	[Note, "Snapshot saved. Now load the image with Texture > Image Plane, then press Compare."]
+// Redraw tests: each fills with the current texture (press 2 Import first),
+// then tries one way of making ZBrush redraw the model over the fill.
+[IButton, "ZPlugin:Reference Scaler b33:R1 IUpdate",
+	"Redraw test: FillLayer, then IUpdate.",
+	[IPress, Color:FillLayer]
+	[IUpdate, 1]
+	[Note, "R1 IUpdate: FillLayer, then IUpdate.\nIs your model visible in front of the image?"]
+	, 0, 0.25
+]
+
+[IButton, "ZPlugin:Reference Scaler b33:R2 Persp x2",
+	"Redraw test: FillLayer, then Draw > Persp pressed twice.",
+	[IPress, Color:FillLayer]
+	[IPress, Draw:Persp]
+	[IPress, Draw:Persp]
+	[Note, "R2 Persp x2: FillLayer, then Draw > Persp pressed twice.\nIs your model visible in front of the image?"]
+	, 0, 0.25
+]
+
+[IButton, "ZPlugin:Reference Scaler b33:R3 Pan",
+	"Redraw test: FillLayer, then canvas pan moved 1 pixel.",
+	[IPress, Color:FillLayer]
+	[CanvasPanSet, [CanvasPanGetH] + 1, [CanvasPanGetV]]
+	[Note, "R3 Pan: FillLayer, then canvas pan moved 1 pixel.\nIs your model visible in front of the image?"]
+	, 0, 0.25
+]
+
+[IButton, "ZPlugin:Reference Scaler b33:R4 Rotate",
+	"Redraw test: FillLayer, then model rotated 0.5 degrees.",
+	[IPress, Color:FillLayer]
+	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+	[TransformSet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy + 0.5, zrsRz]
+	[Note, "R4 Rotate: FillLayer, then model rotated 0.5 degrees.\nIs your model visible in front of the image?"]
+	, 0, 0.25
+]
+
+[IButton, "ZPlugin:Reference Scaler b33:R5 Tool",
+	"Redraw test: FillLayer, then current tool reselected.",
+	[IPress, Color:FillLayer]
+	[If, [IExists, "Tool:Item Info"], [ISet, "Tool:Item Info", [IGet, "Tool:Item Info"]]]
+	[Note, "R5 Tool: FillLayer, then current tool reselected.\nIs your model visible in front of the image?"]
+	, 0, 0.25
+]
+
+[IButton, "ZPlugin:Reference Scaler b33:R6 Edit x2",
+	"Redraw test: FillLayer, then Edit pressed twice.",
+	[IPress, Color:FillLayer]
+	[IPress, Transform:Edit]
+	[IPress, Transform:Edit]
+	[Note, "R6 Edit x2: FillLayer, then Edit pressed twice.\nIs your model visible in front of the image?"]
+	, 0, 0.25
+]
+
+[IButton, "ZPlugin:Reference Scaler b33:R7 Zoom",
+	"Redraw test: FillLayer, then canvas zoom set to itself.",
+	[IPress, Color:FillLayer]
+	[CanvasZoomSet, [CanvasZoomGet]]
+	[Note, "R7 Zoom: FillLayer, then canvas zoom set to itself.\nIs your model visible in front of the image?"]
+	, 0, 0.25
+]
+
+// Continuation test: does this script keep running after pressing Image
+// Plane's Load Image? If the second popup appears, Live can work through it.
+[IButton, "ZPlugin:Reference Scaler b33:10 Continue?",
+	"Test: press Image Plane > Load Image with the current texture, then try to show a popup.",
+	[Note, "10 Continue?: pressing Image Plane > Load Image next. Watch for a second popup afterwards."]
+	[ISet, "Texture:Image Plane:Image Size", 100]
+	[IPress, "Texture:Image Plane:Load Image"]
+	[Note, "10 Continue?: STILL RUNNING after Image Plane's Load Image."]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b31:Compare",
-	"List the settings and model transform values that changed since Snapshot.",
-	[VarSet, zrsOut, "Changed since Snapshot\n"]
-	[VarSet, zrsCount, 0]
-	[RoutineCall, ZRSCmp1]
-	[RoutineCall, ZRSCmp2]
-	[RoutineCall, ZRSCmp3]
-	[RoutineCall, ZRSCmp4]
-	[RoutineCall, ZRSCmp5]
-	[RoutineCall, ZRSCmp6]
-	[RoutineCall, ZRSCmpT]
-	[If, zrsCount == 0, [VarSet, zrsOut, "Nothing changed since Snapshot."]]
-	[Note, zrsOut]
-	, 0, 0.5
-]
-
-[IButton, "ZPlugin:Reference Scaler b31:About",
+[IButton, "ZPlugin:Reference Scaler b33:About",
 	"Show which build is running and whether the helper DLL loads.",
 	[Note, [StrMerge, "Reference Scaler ", zrsBuild, "\nDLL: ", [FileNameResolvePath, zrsDll], "\nDLL check: ", [FileExecute, zrsDll, "RSVersion"]]]
 	, 0, 0.5
 ]
 
 // Anchor storage. Set by Anchor; shown so the anchored values are visible.
-[ISlider, "ZPlugin:Reference Scaler b31:Anchor Scale", 0, 0.001, 0, 100000,
+[ISlider, "ZPlugin:Reference Scaler b33:Anchor Scale", 0, 0.001, 0, 100000,
 	"Model scale recorded by Anchor.",
 	, 0, 1
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b31:Anchor X", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b33:Anchor X", 0, 0.001, -100000, 100000,
 	"Model horizontal position recorded by Anchor.",
 	, 0, 0.5
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b31:Anchor Y", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b33:Anchor Y", 0, 0.001, -100000, 100000,
 	"Model vertical position recorded by Anchor.",
 	, 0, 0.5
 ]
