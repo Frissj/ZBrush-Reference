@@ -167,7 +167,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 61;
+static const int kDllBuild = 62;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1184,6 +1184,7 @@ struct Duplicator {
 
 static Duplicator gDup;
 static double gMagentaShare = 0;  // percent of the overlay that was key colour
+static double gModelPixels = 0;   // pixels of the overlay that were not
 static int gCaptureMethod = 0;  // 1 desktop duplication, 0 BitBlt
 static double gFps = 0;
 
@@ -1240,7 +1241,7 @@ static void Composite(HWND wnd, const OverlayState& st)
 	const unsigned char* cap = gCapture.bits;
 	const unsigned char* ref = gRefLayer.bits;
 	unsigned char* out = gOutput.bits;
-	size_t magenta = 0;
+	size_t magenta = 0, model = 0;
 	for (size_t i = 0; i < n; ++i, cap += 4, ref += 4, out += 4) {
 		const int b = cap[0], g = cap[1], r = cap[2];
 		// Share of magenta: blending any grey with magenta (255, 0, 255) by t
@@ -1250,6 +1251,7 @@ static void Composite(HWND wnd, const OverlayState& st)
 		gKeyShare[i] = static_cast<unsigned char>(t);
 		out[3] = 255;
 		if (t < kModelBelow) {
+			++model;
 			out[0] = static_cast<unsigned char>(b);
 			out[1] = static_cast<unsigned char>(g);
 			out[2] = static_cast<unsigned char>(r);
@@ -1264,6 +1266,7 @@ static void Composite(HWND wnd, const OverlayState& st)
 		out[2] = static_cast<unsigned char>(orr < 0 ? 0 : orr > 255 ? 255 : orr);
 	}
 	gMagentaShare = n ? 100.0 * magenta / n : 0;
+	gModelPixels = static_cast<double>(model);
 	Present(wnd, st, gOutput, 255);
 }
 
@@ -1561,6 +1564,7 @@ struct MemTriplet {
 	MemCand s, x, y;
 	DWORD changedAt;
 	int dragFrames;  // frames in which it changed while the mouse was dragging
+	int posFrames;   // ... of which its position changed
 };
 static int gTripletInUse = -1;
 static std::vector<MemTriplet> gTriplets;
@@ -1575,7 +1579,7 @@ static void BuildTriplets()
 				continue;
 			for (const MemCand& sc : gMemScale.cands)
 				if (sc.isDouble == x.isDouble && (sc.addr > x.addr ? sc.addr - x.addr : x.addr - sc.addr) <= 1024)
-					gTriplets.push_back({sc, x, y, 0, 0});
+					gTriplets.push_back({sc, x, y, 0, 0, 0});
 		}
 }
 
@@ -1593,25 +1597,47 @@ static bool TripletValues(double& sx, double& px, double& py, bool dragging)
 		if (!MemRead(t.s, a) || !MemRead(t.x, b) || !MemRead(t.y, c))
 			continue;
 		if (a != t.s.last || b != t.x.last || c != t.y.last) {
+			if (dragging) {
+				++t.dragFrames;
+				if (b != t.x.last || c != t.y.last)
+					++t.posFrames;
+			}
 			t.s.last = a;
 			t.x.last = b;
 			t.y.last = c;
 			t.changedAt = now;
-			if (dragging)
-				++t.dragFrames;
 		}
 		if (best < 0) {
 			best = static_cast<int>(i);
 			continue;
 		}
+		// Prefer the copy whose position follows drags (some copies only
+		// ever update the scale), then the busiest, then the latest.
 		const MemTriplet& o = gTriplets[best];
-		if (t.dragFrames > o.dragFrames || (t.dragFrames == o.dragFrames && static_cast<int>(t.changedAt - o.changedAt) > 0))
+		if (t.posFrames != o.posFrames ? t.posFrames > o.posFrames :
+				t.dragFrames != o.dragFrames ? t.dragFrames > o.dragFrames : static_cast<int>(t.changedAt - o.changedAt) > 0)
 			best = static_cast<int>(i);
 	}
 	if (best < 0)
 		return false;
 	const MemTriplet& t = gTriplets[best];
 	const bool jump = sx > 0 && (fabs(t.s.last / sx - 1) > 0.3 || fabs(t.x.last - px) > 200 || fabs(t.y.last - py) > 200);
+	// ZBrush briefly reuses the view's memory, for example to draw the
+	// navigation head (scale 64 at whole-pixel positions). A big jump is only
+	// taken once the next read still shows it.
+	static bool pending = false;
+	static double pendS = 0, pendX = 0, pendY = 0;
+	if (jump) {
+		const bool confirmed = pending && fabs(t.s.last / pendS - 1) < 0.02 && fabs(t.x.last - pendX) < 5 && fabs(t.y.last - pendY) < 5;
+		if (!confirmed) {
+			pending = true;
+			pendS = t.s.last;
+			pendX = t.x.last;
+			pendY = t.y.last;
+			return true;  // keep the values passed in
+		}
+	}
+	pending = false;
 	if (best != gTripletInUse || jump) {
 		if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
 			fprintf(f, "%lu read triplet %d of %zu (drag frames %d)%s: scale %.4f x %.3f y %.3f, was %.4f %.3f %.3f\n",
@@ -2219,7 +2245,8 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 // memory, "23" to "25" memory candidates left for scale, x and y, "26" how
 // many of them sit together the way ZBrush stores a view; "27" to "31" the
 // last scan's MB scanned, x matches, x-y pairs, scales near pairs and ms;
-// "32" percent of the overlay showing the key colour in the last frame.
+// "32" percent of the overlay showing the key colour in the last frame, "33"
+// how many of its pixels were not key colour (the model).
 ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 {
 	const int which = text ? atoi(text) : -1;
@@ -2255,6 +2282,7 @@ ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 	case 25: return static_cast<float>(gMemY.cands.size());
 	case 26: return static_cast<float>(gTriplets.size());
 	case 32: return static_cast<float>(floor(gMagentaShare + 0.5));
+	case 33: return static_cast<float>(gModelPixels);
 	case 27: case 28: case 29: case 30: case 31: return static_cast<float>(gScanStats[which - 27]);
 	case 18: return static_cast<float>(gGesture.mode + 10 * gGesture.scaleSegments + 100 * gGesture.active);
 	}
