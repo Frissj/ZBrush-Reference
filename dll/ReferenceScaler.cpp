@@ -167,7 +167,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 65;
+static const int kDllBuild = 66;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
