@@ -128,9 +128,46 @@ ZFUNC RSLog(char* text, double, char*, int, char*, int, char**)
 	return 1;
 }
 
+// The anchor (model scale, x, y and rotation x, y, z recorded by Anchor) is
+// kept in anchor.txt next to the DLL, so it survives script reloads and new
+// builds, whose sliders start empty.
+static std::wstring AnchorPath()
+{
+	return DllFolder() + L"anchor.txt";
+}
+
+// text: "scale x y rx ry rz". Returns 1, or -1 if it cannot be saved.
+ZFUNC RSAnchorSave(char* text, double, char*, int, char*, int, char**)
+{
+	double v[6];
+	if (!text || sscanf(text, "%lf %lf %lf %lf %lf %lf", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
+		return -1;
+	FILE* f = _wfopen(AnchorPath().c_str(), L"wb");
+	if (!f)
+		return -1;
+	fprintf(f, "%.6f %.6f %.6f %.6f %.6f %.6f\n", v[0], v[1], v[2], v[3], v[4], v[5]);
+	fclose(f);
+	return 1;
+}
+
+// text: "0" to "5", which saved anchor value. Returns it, or 0 if none.
+ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
+{
+	const int i = text ? atoi(text) : -1;
+	double v[6] = {0, 0, 0, 0, 0, 0};
+	if (i < 0 || i > 5)
+		return 0;
+	if (FILE* f = _wfopen(AnchorPath().c_str(), L"rb")) {
+		if (fscanf(f, "%lf %lf %lf %lf %lf %lf", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
+			v[0] = 0;
+		fclose(f);
+	}
+	return v[0] > 0 ? static_cast<float>(v[i]) : 0;
+}
+
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 59;
+static const int kDllBuild = 60;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
