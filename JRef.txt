@@ -7,8 +7,8 @@
 //
 // Install: put JRef.zsc (ZBrush writes it next to this file when this file is
 // loaded with ZScript > Load) and the JRef_Data folder into ZBrush's
-// ZStartup\ZPlugs64 folder; JRef then loads every time ZBrush starts, as the
-// JRef menu. Where JRef_Data cannot be written, the DLL writes its frames,
+// ZStartup\ZPlugs64 folder; JRef then loads every time ZBrush starts, in
+// ZPlugin > JRef. Where JRef_Data cannot be written, the DLL writes its frames,
 // log and settings to C:\Users\Public\Documents\JRef instead.
 //
 // A project's views, outlines and settings live in a JRef folder next to the
@@ -21,9 +21,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 88"]
+[VarDef, zrsBuild, "build 89"]
 [VarDef, zrsDll, "JRef_Data\JRef64.dll"]
-[VarDef, zrsDllBuild, 88]
+[VarDef, zrsDllBuild, 89]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -78,6 +78,8 @@
 [VarDef, zrsL1, ""]
 [VarDef, zrsL2, ""]
 [VarDef, zrsL3, ""]
+// 1 shows the popups used for finding problems (overlay details, depth fix).
+[VarDef, zrsDebug, 0]
 
 // Sets the variables for the base layout: the image fitted to the document,
 // unscaled (ratio 1, model position = anchor position).
@@ -161,9 +163,9 @@
 
 // Sends the Gamma and Saturation sliders to the DLL (in percent).
 [RoutineDef, ZRSLevels,
-	[VarSet, zrsTick, [IGet, "JRef:Image:Gamma"] * 100 + 0.5]
+	[VarSet, zrsTick, [IGet, "ZPlugin:JRef:Image:Gamma"] * 100 + 0.5]
 	[FileExecute, zrsDll, "RSDisplay", [StrMerge, "gamma ", zrsTick]]
-	[VarSet, zrsTick, [IGet, "JRef:Image:Saturation"] + 0.5]
+	[VarSet, zrsTick, [IGet, "ZPlugin:JRef:Image:Saturation"] + 0.5]
 	[FileExecute, zrsDll, "RSDisplay", [StrMerge, "sat ", zrsTick]]
 ]
 
@@ -231,7 +233,11 @@
 			[If, [FileExecute, zrsDll, "RSOverlayInfo", "39"] > 0,
 				[Note, [StrMerge, zrsMsg2, " image loaded. It shows when you snap to the ", zrsMsg2, " view."], , 2]
 				,
-				[Note, [StrMerge, zrsMsg2, " image loaded, but ZBrush's rotation was not found, so views cannot switch.\nPress Overlay again and send nav_log.txt if this keeps happening."]]
+				[If, zrsDebug,
+					[Note, [StrMerge, zrsMsg2, " image loaded, but ZBrush's rotation was not found, so views cannot switch.\nPress Overlay again and send nav_log.txt if this keeps happening."]]
+					,
+					[Note, [StrMerge, zrsMsg2, " image loaded."], , 2]
+				]
 			]
 		]
 		[If, zrsResult == 1,
@@ -449,12 +455,9 @@
 ]
 
 // ---------------------------------------------------------------------------
-// Interface: the JRef menu
+// Interface: ZPlugin > JRef
 // ---------------------------------------------------------------------------
-[IPalette, "JRef"]
-
-// Main buttons, in a group without a title.
-[ISubPalette, "JRef:Main", 2]
+[ISubPalette, "ZPlugin:JRef"]
 
 // Overlay: works out the layout for the current camera (rendering it to
 // frame0.png also saves the layout for the DLL), fills the canvas with the
@@ -465,14 +468,15 @@
 // magenta, so the model stays in front.
 // Every fill uses frame0.png: importing a name that already exists replaces
 // that texture in place, so a single name keeps it the last texture.
-[IButton, "JRef:Main:Overlay",
+[IButton, "ZPlugin:JRef:Overlay",
 	"Show the reference in a click-through window over the canvas, behind the model. Press again to find the canvas again.",
 	[RoutineCall, ZRSCheckDll]
 	[FileExecute, zrsDll, "RSOverlayStop"]
 	[If, [IGet, Transform:Edit] == 0,
 		[Note, "Put the model in Edit mode first."]
 		,
-				[VarSet, zrsAutoAnchored, 0]
+		[Note, "JRef: starting the overlay...", "ZPlugin:JRef:Overlay", 0.5]
+		[VarSet, zrsAutoAnchored, 0]
 		[If, [FileExecute, zrsDll, "RSAnchorGet", "0"] <= 0,
 			[RoutineCall, ZRSAnchorNow]
 			[VarSet, zrsAutoAnchored, 1]
@@ -494,7 +498,7 @@
 		[VarSet, zrsResult, [FileExecute, zrsDll, "RSRender", zrsArgs]]
 		[If, zrsResult == -3, [VarSet, zrsResult, 1]]
 		[If, zrsResult != 1,
-			[Note, [StrMerge, "Render failed (", zrsResult, ")."]]
+			[If, zrsDebug, [Note, [StrMerge, "Render failed (", zrsResult, ")."]], [Note, "Overlay could not start. Press Overlay again."]]
 			,
 			[FileExecute, zrsDll, "RSPattern", [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " frame0.png"]]
 			[RoutineCall, ZRSFramePath]
@@ -507,6 +511,7 @@
 			[Sleep, 1, [VarSet, zrsTick, 0]]
 			[RoutineCall, ZRSOverlayOn]
 			[If, zrsResult > 0,
+				[Note, "JRef: canvas found, lining up with ZBrush's view...", "ZPlugin:JRef:Overlay", 0.5]
 				[RoutineCall, ZRSKeyBackground]
 				,
 				[VarSet, zrsTick, [FileExecute, zrsDll, "RSRender", zrsArgs]]
@@ -555,27 +560,34 @@
 				]
 				[If, zrsCleared == 0, [VarSet, zrsMsg, [StrMerge, zrsMsg, "\nLayer:Clear not found, the model may show stripes."]]]
 				[If, zrsAutoAnchored, [VarSet, zrsMsg, [StrMerge, zrsMsg, "\nNo anchor was set: anchored at the current view."]]]
-				[Note, [StrMerge, zrsArgs, "\n", zrsMsg]]
-				[If, [FileExecute, zrsDll, "RSValue", "depth"] != 0,
-					[Note, [StrMerge, "Moved the model off ZBrush's back clipping plane, to depth ", zrsBestZ]]
-					,
-					[Note, [StrMerge, "Depth unchanged: the model showed at ", zrsMemFound, " / ", zrsTurn, " / ", zrsCount, " of 900 points (now / in front / behind)."]]
+				[If, zrsDebug,
+					[Note, [StrMerge, zrsArgs, "\n", zrsMsg]]
+					[If, [FileExecute, zrsDll, "RSValue", "depth"] != 0,
+						[Note, [StrMerge, "Moved the model off ZBrush's back clipping plane, to depth ", zrsBestZ]]
+						,
+						[Note, [StrMerge, "Depth unchanged: the model showed at ", zrsMemFound, " / ", zrsTurn, " / ", zrsCount, " of 900 points (now / in front / behind)."]]
+					]
 				]
+				[Note, "Overlay on.", "ZPlugin:JRef:Overlay", 1.5]
 				// No image is shown until a view is snapped to (the DLL looks views
 				// up as the rotation changes).
 				,
 				[VarSet, zrsMsg, "-3: frame0.png missing.\n-4: screen capture failed.\n-5: the pattern was not found on screen."]
 				[VarSet, zrsArgs, [StrMerge, "Overlay failed (", zrsResult, "). Best match ", zrsTick, "% at ", zrsOx, ", ", zrsOy]]
-				[Note, [StrMerge, zrsArgs, " scale ", zrsZoom, "\n", zrsMsg]]
-				[RoutineCall, ZRSFramePath]
-				[Note, [StrMerge, "What the plugin saw is saved as capture.png next to\n", zrsFile, "\nPlease send that file."]]
+				[If, zrsDebug,
+					[Note, [StrMerge, zrsArgs, " scale ", zrsZoom, "\n", zrsMsg]]
+					[RoutineCall, ZRSFramePath]
+					[Note, [StrMerge, "What the plugin saw is saved as capture.png next to\n", zrsFile, "\nPlease send that file."]]
+					,
+					[Note, "Overlay could not find the canvas. Make sure the whole canvas is showing and press Overlay again."]
+				]
 			]
 		]
 	]
 	, 0, 0.5
 ]
 
-[IButton, "JRef:Main:Overlay Off",
+[IButton, "ZPlugin:JRef:Overlay Off",
 	"Hide the overlay and give the document its own background back.",
 	[FileExecute, zrsDll, "RSOverlayStop"]
 	[RoutineCall, ZRSRestoreBackground]
@@ -583,13 +595,13 @@
 	, 0, 0.5
 ]
 
-[IButton, "JRef:Main:Classic",
+[IButton, "ZPlugin:JRef:Classic",
 	"Classic: the reference shows behind the model.",
 	[FileExecute, zrsDll, "RSDisplay", "mode 0"]
 	[Note, "Classic: the reference shows behind the model.", , 1.5]
 	, 0, 0.5
 ]
-[IButton, "JRef:Main:PureRef",
+[IButton, "ZPlugin:JRef:PureRef",
 	"PureRef: the reference shows in a panel at the side, zoomed and panned with the camera.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSValue", "back"]]
 	[If, zrsTick < 256, [FileExecute, zrsDll, "RSDisplay", [StrMerge, "back ", zrsTick]]]
@@ -597,14 +609,14 @@
 	[Note, "PureRef: the reference shows in a panel at the side.", , 1.5]
 	, 0, 0.5
 ]
-[IButton, "JRef:Main:Panel Side",
+[IButton, "ZPlugin:JRef:Panel Side",
 	"PureRef: move the panel to the other side of the canvas.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "left -1"]]
 	[If, zrsTick == 1, [Note, "PureRef panel on the left.", , 1], [Note, "PureRef panel on the right.", , 1]]
 	, 0, 0.5
 ]
 
-[IButton, "JRef:Main:Reset",
+[IButton, "ZPlugin:JRef:Reset",
 	"Snap to the Front view lined up with its reference, like Front in Image Plane's reference views, keeping your references.",
 	[If, [IGet, Transform:Edit] == 0,
 		[Note, "Put the model in Edit mode first."]
@@ -623,7 +635,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "JRef:Main:Adjust Image",
+[IButton, "ZPlugin:JRef:Adjust Image",
 	"Press to move and scale the reference image: drag inside it to move it, drag a corner or edge (or right-drag) to scale it. Press again or Esc when done.",
 	[If, [FileExecute, zrsDll, "RSOverlayInfo", "38"] == 1,
 		[FileExecute, zrsDll, "RSAdjust", "0"]
@@ -638,12 +650,12 @@
 			,
 			[If, zrsTick == 0, [Note, "No reference image is showing: snap to a view that has one."]]
 			[If, zrsTick == -1, [Note, "Press Overlay first."]]
-			[If, zrsTick == -2, [Note, "Adjust Image works in Classic mode (JRef > Classic)."]]
+			[If, zrsTick == -2, [Note, "Adjust Image works in Classic mode (ZPlugin > JRef > Classic)."]]
 		]
 	]
 	, 0, 0.5
 ]
-[IButton, "JRef:Main:Anchor",
+[IButton, "ZPlugin:JRef:Anchor",
 	"With the model lined up with the image, press to record this zoom and position as the 1:1 match.",
 	[If, [IGet, Transform:Edit] == 0,
 		[Note, "Put the model in Edit mode first."]
@@ -660,16 +672,22 @@
 			,
 			[VarSet, zrsArgs, [StrMerge, zrsView, " ", zrsSx, " ", zrsPx, " ", zrsPy, " ", zrsRot]]
 			[FileExecute, zrsDll, "RSViewAnchor", zrsArgs]
-			[Note, [StrMerge, "Anchored view ", zrsView, " (0 Front 1 Back 2 Right 3 Left 4 Top 5 Bottom): model scale ", zrsSx, ", position ", zrsPx, ", ", zrsPy]]
+			[If, zrsDebug,
+				[Note, [StrMerge, "Anchored view ", zrsView, " (0 Front 1 Back 2 Right 3 Left 4 Top 5 Bottom): model scale ", zrsSx, ", position ", zrsPx, ", ", zrsPy]]
+				,
+				[VarSet, zrsTick, zrsView]
+				[RoutineCall, ZRSViewName]
+				[Note, [StrMerge, zrsMsg2, " view anchored."], , 1.5]
+			]
 		]
 	]
 	, 0, 0.5
 ]
 
 // One reference image per view, in Image Plane's order.
-[ISubPalette, "JRef:Views", 1]
+[ISubPalette, "ZPlugin:JRef:Views", 1]
 
-[IButton, "JRef:Views:Load Front",
+[IButton, "ZPlugin:JRef:Views:Load Front",
 	"Snap to the Front view, then load its reference image.",
 	[VarSet, zrsView, 0]
 	[VarSet, zrsMsg2, "Front"]
@@ -677,7 +695,7 @@
 	, 0, 0.8
 ]
 
-[IButton, "JRef:Views:Remove Front",
+[IButton, "ZPlugin:JRef:Views:Remove Front",
 	"Remove the Front image, so another can be loaded.",
 	[VarSet, zrsView, 0]
 	[VarSet, zrsMsg2, "Front"]
@@ -685,7 +703,7 @@
 	, 0, 0.2, , "JRef_Data\trash.psd"
 ]
 
-[IButton, "JRef:Views:Load Back",
+[IButton, "ZPlugin:JRef:Views:Load Back",
 	"Snap to the Back view, then load its reference image.",
 	[VarSet, zrsView, 1]
 	[VarSet, zrsMsg2, "Back"]
@@ -693,7 +711,7 @@
 	, 0, 0.8
 ]
 
-[IButton, "JRef:Views:Remove Back",
+[IButton, "ZPlugin:JRef:Views:Remove Back",
 	"Remove the Back image, so another can be loaded.",
 	[VarSet, zrsView, 1]
 	[VarSet, zrsMsg2, "Back"]
@@ -701,7 +719,7 @@
 	, 0, 0.2, , "JRef_Data\trash.psd"
 ]
 
-[IButton, "JRef:Views:Load Right",
+[IButton, "ZPlugin:JRef:Views:Load Right",
 	"Snap to the Right view, then load its reference image.",
 	[VarSet, zrsView, 2]
 	[VarSet, zrsMsg2, "Right"]
@@ -709,7 +727,7 @@
 	, 0, 0.8
 ]
 
-[IButton, "JRef:Views:Remove Right",
+[IButton, "ZPlugin:JRef:Views:Remove Right",
 	"Remove the Right image, so another can be loaded.",
 	[VarSet, zrsView, 2]
 	[VarSet, zrsMsg2, "Right"]
@@ -717,7 +735,7 @@
 	, 0, 0.2, , "JRef_Data\trash.psd"
 ]
 
-[IButton, "JRef:Views:Load Left",
+[IButton, "ZPlugin:JRef:Views:Load Left",
 	"Snap to the Left view, then load its reference image.",
 	[VarSet, zrsView, 3]
 	[VarSet, zrsMsg2, "Left"]
@@ -725,7 +743,7 @@
 	, 0, 0.8
 ]
 
-[IButton, "JRef:Views:Remove Left",
+[IButton, "ZPlugin:JRef:Views:Remove Left",
 	"Remove the Left image, so another can be loaded.",
 	[VarSet, zrsView, 3]
 	[VarSet, zrsMsg2, "Left"]
@@ -733,7 +751,7 @@
 	, 0, 0.2, , "JRef_Data\trash.psd"
 ]
 
-[IButton, "JRef:Views:Load Top",
+[IButton, "ZPlugin:JRef:Views:Load Top",
 	"Snap to the Top view, then load its reference image.",
 	[VarSet, zrsView, 4]
 	[VarSet, zrsMsg2, "Top"]
@@ -741,7 +759,7 @@
 	, 0, 0.8
 ]
 
-[IButton, "JRef:Views:Remove Top",
+[IButton, "ZPlugin:JRef:Views:Remove Top",
 	"Remove the Top image, so another can be loaded.",
 	[VarSet, zrsView, 4]
 	[VarSet, zrsMsg2, "Top"]
@@ -749,7 +767,7 @@
 	, 0, 0.2, , "JRef_Data\trash.psd"
 ]
 
-[IButton, "JRef:Views:Load Bottom",
+[IButton, "ZPlugin:JRef:Views:Load Bottom",
 	"Snap to the Bottom view, then load its reference image.",
 	[VarSet, zrsView, 5]
 	[VarSet, zrsMsg2, "Bottom"]
@@ -757,7 +775,7 @@
 	, 0, 0.8
 ]
 
-[IButton, "JRef:Views:Remove Bottom",
+[IButton, "ZPlugin:JRef:Views:Remove Bottom",
 	"Remove the Bottom image, so another can be loaded.",
 	[VarSet, zrsView, 5]
 	[VarSet, zrsMsg2, "Bottom"]
@@ -766,46 +784,46 @@
 ]
 
 // The reference's gamma and saturation.
-[ISubPalette, "JRef:Image", 1]
+[ISubPalette, "ZPlugin:JRef:Image", 1]
 
-[ISlider, "JRef:Image:Gamma", 1, 0.01, 0.2, 3,
+[ISlider, "ZPlugin:JRef:Image:Gamma", 1, 0.01, 0.2, 3,
 	"Gamma of the reference image: above 1 brightens its midtones, below 1 darkens them.",
 	[RoutineCall, ZRSLevels]
 	, 0, 1
 ]
 
-[ISlider, "JRef:Image:Saturation", 100, 1, 0, 200,
+[ISlider, "ZPlugin:JRef:Image:Saturation", 100, 1, 0, 200,
 	"Saturation of the reference image, in percent: 0 is greyscale, 100 as loaded.",
 	[RoutineCall, ZRSLevels]
 	, 0, 1
 ]
 
 // Multiview (PureRef): four views in the panel.
-[ISubPalette, "JRef:Multiview", 1]
+[ISubPalette, "ZPlugin:JRef:Multiview", 1]
 
-[IButton, "JRef:Multiview:Multiview On",
+[IButton, "ZPlugin:JRef:Multiview:Multiview On",
 	"PureRef: show four views in the panel (choose them with Views).",
 	[FileExecute, zrsDll, "RSDisplay", "multi 1"]
 	[Note, "Multiview on: four views in the PureRef panel.", , 1.5]
 	, 0, 0.5
 ]
-[IButton, "JRef:Multiview:Multiview Off",
+[IButton, "ZPlugin:JRef:Multiview:Multiview Off",
 	"PureRef: the panel shows the view you are snapped to.",
 	[FileExecute, zrsDll, "RSDisplay", "multi 0"]
 	[Note, "Multiview off: the panel shows the view you are snapped to.", , 1.5]
 	, 0, 0.5
 ]
 
-[IButton, "JRef:Multiview:Views",
+[IButton, "ZPlugin:JRef:Multiview:Views",
 	"Choose the view in each corner of the Multiview panel: Top Left, Top Right, Bottom Right, Bottom Left.",
 	[RoutineCall, ZRSMultiDialog]
 	, 0, 1
 ]
 
 // The project, and help.
-[ISubPalette, "JRef:Project", 1]
+[ISubPalette, "ZPlugin:JRef:Project", 1]
 
-[IButton, "JRef:Project:Open Project",
+[IButton, "ZPlugin:JRef:Project:Open Project",
 	"Open a JRef project: the project.jref file in a project's JRef folder (made next to the first image you load). Use it on another computer, or to switch projects.",
 	[VarSet, zrsFile, [FileNameAsk, "JRef project (*.jref)|*.jref||", , "Open project.jref in a JRef folder"]]
 	[If, [StrLength, zrsFile] == 0,
@@ -821,7 +839,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "JRef:Project:Snapshot",
+[IButton, "ZPlugin:JRef:Project:Snapshot",
 	"Save what the overlay captured and what it showed, to send when something looks wrong.",
 	[VarSet, zrsMsg2, "snapshot"]
 	[RoutineCall, ZRSDepthProbe]
@@ -834,7 +852,7 @@
 	]
 	, 0, 0.25
 ]
-[IButton, "JRef:Project:About",
+[IButton, "ZPlugin:JRef:Project:About",
 	"Show which build is running and whether the helper DLL loads.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSVersion"]]
 	[Note, [StrMerge, "JRef ", zrsBuild, "\nDLL build ", zrsTick, " (needs ", zrsDllBuild, ")\n", [FileNameResolvePath, zrsDll]]]

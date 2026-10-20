@@ -236,7 +236,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 88;
+static const int kDllBuild = 89;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -4718,7 +4718,8 @@ static void SwitchProject(const std::wstring& dir)
 // project gets "<project>.jref" next to it naming its JRef folder (relative to
 // the project, and absolute): opening the project again, on this computer or
 // another, reopens its references. A .zpr read only in part (Lightbox
-// thumbnails) does not count; a project without a .jref has none.
+// thumbnails) does not count; a project without a .jref keeps the references
+// open at the time.
 // ---------------------------------------------------------------------------
 static CRITICAL_SECTION gZprLock;
 static bool gZprReady = false;
@@ -4833,12 +4834,10 @@ static void ZprDone(const std::wstring& zpr, bool write)
 	} else {
 		const std::wstring dir = ReadLink(LinkFor(zpr));
 		ProjectLog(dir.empty() ? "zbrush project opened, no JRef project:" : "zbrush project opened:", zpr);
-		if (!dir.empty() && _wcsicmp(dir.c_str(), gProjectDir.c_str()) != 0) {
+		// A project without a link (saved before JRef watched it, or ZBrush's
+		// own startup files) keeps the references open now; saving it links it.
+		if (!dir.empty() && _wcsicmp(dir.c_str(), gProjectDir.c_str()) != 0)
 			SwitchProject(dir);
-		} else if (dir.empty() && !gProjectDir.empty()) {
-			// Another model: no references until one is loaded for it.
-			SwitchProject(L"");
-		}
 	}
 	LeaveCriticalSection(&gOverlayLock);
 	if (gOverlayWnd)
