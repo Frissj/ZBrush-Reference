@@ -610,10 +610,10 @@ static int Lum(const unsigned char* p)
 // Correlation between the frame's sample luminances and the screen image at
 // the same points, for the document placed at (ox, oy) in img pixels with k
 // img pixels per document pixel. Correlation ignores brightness and contrast
-// changes in how ZBrush displays the canvas. Returns -1 if under 70% of the
-// samples land on the image.
+// changes in how ZBrush displays the canvas. Returns -1 if under 15% of the
+// samples land on the image (the canvas can extend past the window).
 static double Score(const Rgb& img, const std::vector<Sample>& samples, const std::vector<int>& lums,
-	double ox, double oy, double k)
+	double ox, double oy, double k, int* inBounds = nullptr)
 {
 	double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
 	int n = 0;
@@ -630,12 +630,22 @@ static double Score(const Rgb& img, const std::vector<Sample>& samples, const st
 		sab += va * vb;
 		++n;
 	}
-	if (n < samples.size() * 0.7)
+	if (n < 40 || n < samples.size() * 0.15)
 		return -1;
 	const double cov = sab - sa * sb / n, va = saa - sa * sa / n, vb = sbb - sb * sb / n;
 	if (va <= 0 || vb <= 0)
 		return -1;
+	if (inBounds)
+		*inBounds = n;
 	return cov / sqrt(va * vb);
+}
+
+// Ranks placements by how unlikely their correlation is by chance, so a
+// placement with few samples on screen (canvas zoomed past the window) only
+// wins with a strong correlation.
+static double Significance(double corr, int n)
+{
+	return corr * sqrt(static_cast<double>(n));
 }
 
 static void SampleLums(const Rgb& frame, const std::vector<Sample>& samples, double radius, std::vector<int>& lums)
@@ -675,16 +685,21 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
 	const int d = 8;
 	const Rgb small = Shrink(screen, d);
 	std::vector<int> lums;
-	double best = -2, bestK = 1, bestX = 0, bestY = 0;
+	double best = -1e9, bestCorr = -1, bestK = 1, bestX = 0, bestY = 0;
 	for (double k = 0.25; k <= 4.0; k *= 1.04) {
 		const double ks = k / d;  // small-image pixels per document pixel
 		SampleLums(frame, coarse, 0.5 / ks, lums);
 		const double tw = ks * frame.w, th = ks * frame.h;
-		for (double oy = -th * 0.3; oy <= small.h - th * 0.7; oy += 1)
-			for (double ox = -tw * 0.3; ox <= small.w - tw * 0.7; ox += 1) {
-				const double s = Score(small, coarse, lums, ox, oy, ks);
+		// Step a quarter of a large block, at least one small-image pixel.
+		const double step = fmax(1.0, tw / kBigBlocks / 4);
+		for (double oy = -th * 0.85; oy <= small.h - th * 0.15; oy += step)
+			for (double ox = -tw * 0.85; ox <= small.w - tw * 0.15; ox += step) {
+				int n = 0;
+				const double c = Score(small, coarse, lums, ox, oy, ks, &n);
+				const double s = c > -1 ? Significance(c, n) : -1e9;
 				if (s > best) {
 					best = s;
+					bestCorr = c;
 					bestK = k;
 					bestX = ox * d;
 					bestY = oy * d;
@@ -695,14 +710,14 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
 	// Refine at full resolution. The coarse fit is good to about half a large
 	// block, the medium one to about a small block.
 	struct Pass { const std::vector<Sample>* samples; double scaleRange, scaleStep; int offRange, offStep; };
-	const int halfBlock = static_cast<int>(0.6 * bestK * frame.w / kBigBlocks) + d;
+	const int halfBlock = static_cast<int>(0.6 * bestK * frame.w / kBigBlocks) + 2 * d;
 	const Pass passes[] = {
 		{&medium, 0.05, 0.01, halfBlock, 2},
 		{&fine, 0.012, 0.002, 2 + static_cast<int>(1.2 * bestK * frame.w / kSmallBlocks), 1},
 		{&fine, 0.004, 0.001, 2, 1}};
 	for (const Pass& pass : passes) {
 		const double k0 = bestK, x0 = bestX, y0 = bestY;
-		best = -2;
+		best = -1e9;
 		for (double f = 1 - pass.scaleRange; f <= 1 + pass.scaleRange + 1e-9; f += pass.scaleStep) {
 			const double k = k0 * f;
 			SampleLums(frame, *pass.samples, 0.5 / k, lums);
@@ -710,9 +725,12 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
 			const double cx = floor(x0 + (k0 - k) * frame.w * 0.5), cy = floor(y0 + (k0 - k) * frame.h * 0.5);
 			for (int dy = -pass.offRange; dy <= pass.offRange; dy += pass.offStep)
 				for (int dx = -pass.offRange; dx <= pass.offRange; dx += pass.offStep) {
-					const double s = Score(screen, *pass.samples, lums, cx + dx, cy + dy, k);
+					int n = 0;
+					const double c = Score(screen, *pass.samples, lums, cx + dx, cy + dy, k, &n);
+					const double s = c > -1 ? Significance(c, n) : -1e9;
 					if (s > best) {
 						best = s;
+						bestCorr = c;
 						bestK = k;
 						bestX = cx + dx;
 						bestY = cy + dy;
@@ -723,8 +741,8 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
 	out.pixelsPerDoc = bestK;
 	out.screenX = bestX;
 	out.screenY = bestY;
-	out.percent = 100.0 * best;
-	return best >= 0.4;
+	out.percent = 100.0 * bestCorr;
+	return bestCorr >= 0.4;
 }
 
 // Saves an Rgb image as PNG, for diagnosing calibration.
@@ -743,11 +761,12 @@ static void SaveRgb(const std::wstring& path, const Rgb& img)
 
 // text: "docW docH alpha" — the document size and opacity 0-255. Hides the
 // overlay, captures ZBrush's window, finds the canvas by matching
-// pattern.png (which the canvas must be showing, see RSPattern) against it,
+// frame0.png, which must hold the calibration pattern the canvas is showing
+// (see RSPattern), against it,
 // then shows the overlay there with the last rendered frame's layout. The
 // capture is saved as capture.png. Returns the match strength (correlation
 // x100, 40-100), or -1 bad arguments, -2 the window
-// could not be created, -3 pattern.png missing, -4 the screen could not be
+// could not be created, -3 frame0.png missing, -4 the screen could not be
 // captured, -5 the pattern was not found on screen
 // (RSOverlayInfo 3 gives the best match).
 ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
@@ -758,7 +777,7 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 	if (!EnsureOverlay())
 		return -2;
 	Rgb frame;
-	if (!LoadRgb(DllFolder() + L"pattern.png", frame))
+	if (!LoadRgb(DllFolder() + L"frame0.png", frame))
 		return -3;
 
 	EnterCriticalSection(&gOverlayLock);
