@@ -1,13 +1,13 @@
 // ReferenceScaler.txt
-// ZBrush 2022 ZScript plugin.
-// Shows a reference image behind the model being edited and keeps it scaled
-// and positioned with the model as the camera zooms and pans.
+// ZBrush 2022+ ZScript plugin.
+// Keeps a reference image behind the model scaled and positioned with the
+// model as the camera zooms and pans.
 //
-// Image Plane only applies its Image Size when an image is loaded, so this
-// plugin draws the background itself: ReferenceScaler64.dll renders the image,
-// scaled and placed, into a document-sized BMP, which is imported as a texture
-// and painted in with Color > FillLayer (with the model in Edit mode, FillLayer
-// paints behind it, and X-ray works).
+// ReferenceScaler64.dll renders the reference, scaled and placed for the
+// current zoom, into a document-sized PNG. The plugin imports it, selects it,
+// and presses Texture > Image Plane > Load Image, which uses the selected
+// texture and puts it behind the model with Image Plane's own method. This
+// script keeps running after that press, so Live can repeat it.
 //
 // Install: keep the ReferenceScaler_Data folder next to this file, then
 // ZScript > Load > pick this file. The buttons appear under
@@ -15,25 +15,17 @@
 // version that first created them until it restarts, so the sub-palette name
 // carries the build number: each new build gets fresh buttons without a restart.
 //
-// ZScript file commands need "!:" in front of an absolute path; without it
-// Texture > Import reports "Unable to open specified file".
-//
-// Feedback uses [Note, text] popups only: the note bar is cleared when the
-// script ends. The anchor is stored in sliders rather than variables, because
-// variables reset whenever ZBrush reloads the script.
+// ZScript file commands need "!:" in front of an absolute path. Feedback uses
+// [Note, text] popups only: the note bar is cleared when the script ends. The
+// anchor is stored in sliders, because variables reset whenever ZBrush reloads
+// the script.
 
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 33"]
+[VarDef, zrsBuild, "build 34"]
 [VarDef, zrsDll, "ReferenceScaler_Data\ReferenceScaler64.dll"]
-[VarDef, zrsDepth, -1]
-[VarDef, zrsTexBefore, -1]
-[VarDef, zrsTexAfter, -1]
-[VarDef, zrsTexMax, -1]
-[VarDef, zrsBefore, 0]
 [VarDef, zrsLive, 0]
-[VarDef, zrsFrame, 0]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -51,85 +43,75 @@
 [VarDef, zrsLastPy, 0]
 [VarDef, zrsResult, 0]
 [VarDef, zrsArgs, ""]
-[VarDef, zrsFrameName, ""]
 [VarDef, zrsFile, ""]
 [VarDef, zrsMsg, ""]
 
-// The fill paints over the model and ZBrush does not redraw it until the
-// transform changes; a change that is undone within the same script run is
-// ignored. So the model is left moved by half a pixel, alternating direction
-// with each frame (zrsFrame) so it never drifts.
-[RoutineDef, ZRSRedraw,
-	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[TransformSet, zrsPx + zrsFrame - 0.5, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+// Sets the variables for the base layout: the image fitted to the document,
+// unscaled (ratio 1, model position = anchor position).
+[RoutineDef, ZRSBase,
+	[VarSet, zrsRatio, 1]
+	[VarSet, zrsPx, 0]
+	[VarSet, zrsPy, 0]
+	[VarSet, zrsAx, 0]
+	[VarSet, zrsAy, 0]
 ]
 
-// Renders a frame with the DLL for zrsRatio, model position (zrsPx, zrsPy)
-// and anchor position (zrsAx, zrsAy), imports it as a texture and fills the
-// canvas behind the model with it. Frame names alternate so ZBrush never
-// reuses a cached texture. Leaves a result in zrsMsg; zrsResult is 1 on
-// success. Ratio 1 with model position = anchor position draws the base
-// layout: the image fitted to the document. Texture > Clear Depth is turned on
-// before the fill, and ZRSRedraw makes ZBrush draw the model over the new
-// background afterwards.
-[RoutineDef, ZRSDraw,
+// Renders frame0.png with the DLL for zrsRatio, model position (zrsPx, zrsPy)
+// and anchor position (zrsAx, zrsAy), imports it, selects it (an import does
+// not make it current; the newest texture is the last one) and hands it to
+// Image Plane's Load Image. Leaves a result in zrsMsg; zrsResult is 1 on
+// success.
+[RoutineDef, ZRSShow,
 	[VarSet, zrsResult, 0]
 	[If, [IGet, Transform:Edit] == 0,
-		[VarSet, zrsMsg, "Put the model in Edit mode first (FillLayer would paint over it otherwise)."]
+		[VarSet, zrsMsg, "Put the model in Edit mode first."]
 		,
-		[VarSet, zrsFrame, 1 - zrsFrame]
-		[VarSet, zrsFrameName, [StrMerge, "frame", zrsFrame, ".png"]]
 		[VarSet, zrsArgs, [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " ", zrsRatio, " ", zrsPx]]
 		[VarSet, zrsArgs, [StrMerge, zrsArgs, " ", zrsPy, " ", zrsAx, " ", zrsAy]]
-		[VarSet, zrsArgs, [StrMerge, zrsArgs, " ", zrsFrameName]]
+		[VarSet, zrsArgs, [StrMerge, zrsArgs, " frame0.png"]]
 		[VarSet, zrsResult, [FileExecute, zrsDll, "RSRender", zrsArgs]]
 		[If, zrsResult != 1,
 			[VarSet, zrsMsg, [StrMerge, "Render failed (", zrsResult, "). -3 means no image: press Load Image.\nArgs: ", zrsArgs]]
 			,
-			[VarSet, zrsFile, [FileNameResolvePath, [StrMerge, "ReferenceScaler_Data\frame", zrsFrame, ".png"]]]
-			[RoutineCall, ZRSImport]
-			[VarSet, zrsDepth, -1]
-			[If, [IExists, "Texture:Clear Depth"],
-				[ISet, "Texture:Clear Depth", 1]
-				[VarSet, zrsDepth, [IGet, "Texture:Clear Depth"]]
-			]
-			[IPress, Color:FillLayer]
-			[RoutineCall, ZRSRedraw]
+			[VarSet, zrsFile, [FileNameResolvePath, "ReferenceScaler_Data\frame0.png"]]
+			[FileNameSetNext, [StrMerge, "!:", zrsFile]]
+			[IPress, Texture:Import]
+			[ISet, "Texture:Item Info", [IGetMax, "Texture:Item Info"]]
+			[ISet, "Texture:Image Plane:Image Size", 100]
+			[IPress, "Texture:Image Plane:Load Image"]
 			[VarSet, zrsLastRatio, zrsRatio]
 			[VarSet, zrsLastPx, zrsPx]
 			[VarSet, zrsLastPy, zrsPy]
-			[VarSet, zrsMsg, [StrMerge, "Drew ", zrsFrameName, ", ratio ", zrsRatio]]
-			[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nFrame exists: ", [FileExists, zrsFile], "  Clear Depth: ", zrsDepth]]
-			[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nTexture before ", zrsTexBefore, ", last ", zrsTexMax, ", now ", zrsTexAfter]]
+			[VarSet, zrsMsg, [StrMerge, "Shown at ratio ", zrsRatio, ", model at ", zrsPx, ", ", zrsPy]]
 		]
 	]
 ]
 
 // Works out the ratio and positions from the current model and the anchor
-// sliders, then draws. Leaves a result in zrsMsg.
+// sliders, then shows the frame. Leaves a result in zrsMsg.
 [RoutineDef, ZRSUpdate,
-	[If, [IGet, "ZPlugin:Reference Scaler b33:Anchor Scale"] <= 0,
-		[VarSet, zrsMsg, "Not anchored: press Anchor first."]
+	[If, [IGet, "ZPlugin:Reference Scaler b34:Anchor Scale"] <= 0,
+		[VarSet, zrsMsg, "Not anchored: line the model up with the image and press Anchor first."]
 		[VarSet, zrsResult, 0]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b33:Anchor Scale"]]
-		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b33:Anchor X"]]
-		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b33:Anchor Y"]]
-		[RoutineCall, ZRSDraw]
+		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b34:Anchor Scale"]]
+		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b34:Anchor X"]]
+		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b34:Anchor Y"]]
+		[RoutineCall, ZRSShow]
 	]
 ]
 
 // Live loop: wakes on the timer (1) or on left mouse button up (8), i.e. when
 // a zoom drag finishes, and redraws only if the zoom or position changed. No
-// popups, since they would block zooming. Another ZScript starting ends the
-// loop (ZBrush only runs one script at a time).
+// popups, since they would block zooming. Another plugin's button pressed by
+// you (not by this script) ends the loop.
 [RoutineDef, ZRSLiveLoop,
 	[Sleep, 0.5,
 		[If, zrsLive,
 			[If, [IGet, Transform:Edit],
 				[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b33:Anchor Scale"]]
+				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b34:Anchor Scale"]]
 				[If, ABS(zrsRatio - zrsLastRatio) > 0.002 || ABS(zrsPx - zrsLastPx) > 0.5 || ABS(zrsPy - zrsLastPy) > 0.5,
 					[RoutineCall, ZRSUpdate]
 				]
@@ -139,229 +121,93 @@
 	, 9]
 ]
 
-// Imports zrsFile into the Texture palette and selects it. An import adds the
-// texture to the palette but does not make it current, so the last texture
-// (the one just imported) is selected through Texture > Item Info. Records
-// the index before, the highest index and the index after in zrsTex*.
-[RoutineDef, ZRSImport,
-	[VarSet, zrsTexBefore, [IGet, "Texture:Item Info"]]
-	[FileNameSetNext, [StrMerge, "!:", zrsFile]]
-	[IPress, Texture:Import]
-	[VarSet, zrsTexMax, [IGetMax, "Texture:Item Info"]]
-	[ISet, "Texture:Item Info", zrsTexMax]
-	[VarSet, zrsTexAfter, [IGet, "Texture:Item Info"]]
-]
-
 // ---------------------------------------------------------------------------
 // Interface
 // ---------------------------------------------------------------------------
-[ISubPalette, "ZPlugin:Reference Scaler b33"]
+[ISubPalette, "ZPlugin:Reference Scaler b34"]
 
-[IButton, "ZPlugin:Reference Scaler b33:Load Image",
-	"Choose the reference image and draw it behind the model, fitted to the document.",
+[IButton, "ZPlugin:Reference Scaler b34:Load Image",
+	"Choose the reference image and show it behind the model, fitted to the document.",
 	[VarSet, zrsFile, [FileNameAsk, "Image (*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd)|*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd||", , "Choose reference image"]]
 	[If, [StrLength, zrsFile] == 0,
 		[Note, "No image chosen."]
 		,
 		[VarSet, zrsResult, [FileExecute, zrsDll, "RSSetImage", zrsFile]]
 		[If, zrsResult != 1,
-			[Note, [StrMerge, "Could not read the image (", zrsResult, "):\n", zrsFile, "\nDLL: ", [FileNameResolvePath, zrsDll]]]
+			[Note, [StrMerge, "Could not read the image (", zrsResult, "):\n", zrsFile]]
 			,
-			[VarSet, zrsRatio, 1]
-			[VarSet, zrsPx, 0]
-			[VarSet, zrsPy, 0]
-			[VarSet, zrsAx, 0]
-			[VarSet, zrsAy, 0]
-			[RoutineCall, ZRSDraw]
-			[Note, [StrMerge, "Load Image\n", zrsMsg, "\n\nLine the model up with the image, then press Anchor."]]
+			[RoutineCall, ZRSBase]
+			[RoutineCall, ZRSShow]
+			[If, zrsResult != 1, [Note, zrsMsg]]
 		]
 	]
 	, 0, 1
 ]
 
-[IButton, "ZPlugin:Reference Scaler b33:Anchor",
+[IButton, "ZPlugin:Reference Scaler b34:Anchor",
 	"With the model lined up with the image, press to record this zoom and position as the 1:1 match.",
 	[If, [IGet, Transform:Edit] == 0,
 		[Note, "Put the model in Edit mode first."]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[ISet, "ZPlugin:Reference Scaler b33:Anchor Scale", zrsSx]
-		[ISet, "ZPlugin:Reference Scaler b33:Anchor X", zrsPx]
-		[ISet, "ZPlugin:Reference Scaler b33:Anchor Y", zrsPy]
+		[ISet, "ZPlugin:Reference Scaler b34:Anchor Scale", zrsSx]
+		[ISet, "ZPlugin:Reference Scaler b34:Anchor X", zrsPx]
+		[ISet, "ZPlugin:Reference Scaler b34:Anchor Y", zrsPy]
 		[Note, [StrMerge, "Anchored: model scale ", zrsSx, ", position ", zrsPx, ", ", zrsPy]]
 	]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b33:Sync",
+[IButton, "ZPlugin:Reference Scaler b34:Sync",
 	"Redraw the reference for the current zoom and position once.",
 	[RoutineCall, ZRSUpdate]
-	[Note, [StrMerge, "Sync\n", zrsMsg]]
+	[If, zrsResult != 1, [Note, zrsMsg], [Note, [StrMerge, "Sync: ", zrsMsg], , 1]]
 	, 0, 0.5
 ]
 
-[ISwitch, "ZPlugin:Reference Scaler b33:Live", 0,
+[ISwitch, "ZPlugin:Reference Scaler b34:Live", 0,
 	"Keep redrawing the reference as the camera zooms and pans.",
 	[VarSet, zrsLive, 1]
 	[RoutineCall, ZRSUpdate]
-	[Note, [StrMerge, "Live on\n", zrsMsg]]
-	[RoutineCall, ZRSLiveLoop]
+	[If, zrsResult != 1,
+		[Note, [StrMerge, "Live could not start: ", zrsMsg]]
+		[VarSet, zrsLive, 0]
+		[ISet, "ZPlugin:Reference Scaler b34:Live", 0]
+		,
+		[Note, "Live on: zoom or pan, and the reference follows when you release the mouse.", , 2]
+		[RoutineCall, ZRSLiveLoop]
+	]
 	,
 	[VarSet, zrsLive, 0]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b33:Reset",
-	"Redraw the reference fitted to the document, as Load Image does.",
-	[VarSet, zrsRatio, 1]
-	[VarSet, zrsPx, 0]
-	[VarSet, zrsPy, 0]
-	[VarSet, zrsAx, 0]
-	[VarSet, zrsAy, 0]
-	[RoutineCall, ZRSDraw]
-	[Note, [StrMerge, "Reset\n", zrsMsg]]
+[IButton, "ZPlugin:Reference Scaler b34:Reset",
+	"Show the reference fitted to the document again, unscaled.",
+	[RoutineCall, ZRSBase]
+	[RoutineCall, ZRSShow]
+	[If, zrsResult != 1, [Note, zrsMsg]]
 	, 0, 0.5
 ]
 
-// Step-by-step test of the drawing pipeline: each button does one stage and
-// reports it in its own popup (popups hold about 255 characters).
-[IButton, "ZPlugin:Reference Scaler b33:1 Render",
-	"Test step 1: have the DLL write frame0.png (the image fitted to the document).",
-	[VarSet, zrsArgs, [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " 1 0 0 0 0 frame0.png"]]
-	[VarSet, zrsResult, [FileExecute, zrsDll, "RSRender", zrsArgs]]
-	[VarSet, zrsFile, [FileNameResolvePath, "ReferenceScaler_Data\frame0.png"]]
-	[Note, [StrMerge, "1 Render: DLL result ", zrsResult, " (1 = ok)\nFile exists: ", [FileExists, zrsFile], "\nArgs: ", zrsArgs]]
-	, 0, 0.33
-]
-
-[IButton, "ZPlugin:Reference Scaler b33:2 Import",
-	"Test step 2: import frame0.png into the Texture palette and select it.",
-	[VarSet, zrsFile, [FileNameResolvePath, "ReferenceScaler_Data\frame0.png"]]
-	[RoutineCall, ZRSImport]
-	[Note, [StrMerge, "2 Import: texture before ", zrsTexBefore, ", last ", zrsTexMax, ", now ", zrsTexAfter, "\nIs the reference now the current texture in the Texture palette?"]]
-	, 0, 0.33
-]
-
-// Hand-off test: render the frame for the current zoom, import and select it,
-// then let Image Plane's own Load Image put it behind the model (Load Image
-// uses the selected texture instead of asking for a file). Pressing Image
-// Plane's button ends this script, so the popup comes before it.
-[IButton, "ZPlugin:Reference Scaler b33:9 Via Image Plane",
-	"Test step 9: render the frame, select it, and load it with Texture > Image Plane > Load Image.",
-	[If, [IGet, "ZPlugin:Reference Scaler b33:Anchor Scale"] > 0,
-		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b33:Anchor Scale"]]
-		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b33:Anchor X"]]
-		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b33:Anchor Y"]]
-		,
-		[VarSet, zrsRatio, 1]
-		[VarSet, zrsPx, 0]
-		[VarSet, zrsPy, 0]
-		[VarSet, zrsAx, 0]
-		[VarSet, zrsAy, 0]
-	]
-	[VarSet, zrsArgs, [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " ", zrsRatio, " ", zrsPx]]
-	[VarSet, zrsArgs, [StrMerge, zrsArgs, " ", zrsPy, " ", zrsAx, " ", zrsAy]]
-	[VarSet, zrsArgs, [StrMerge, zrsArgs, " frame0.png"]]
-	[VarSet, zrsResult, [FileExecute, zrsDll, "RSRender", zrsArgs]]
-	[VarSet, zrsFile, [FileNameResolvePath, "ReferenceScaler_Data\frame0.png"]]
-	[RoutineCall, ZRSImport]
-	[Note, [StrMerge, "9 Via Image Plane: render ", zrsResult, ", ratio ", zrsRatio, "\nTexture now ", zrsTexAfter, " of ", zrsTexMax, "\nClick OK to hand over to Image Plane > Load Image."]]
-	[ISet, "Texture:Image Plane:Image Size", 100]
-	[IPress, "Texture:Image Plane:Load Image"]
-	, 0, 0.5
-]
-
-// Redraw tests: each fills with the current texture (press 2 Import first),
-// then tries one way of making ZBrush redraw the model over the fill.
-[IButton, "ZPlugin:Reference Scaler b33:R1 IUpdate",
-	"Redraw test: FillLayer, then IUpdate.",
-	[IPress, Color:FillLayer]
-	[IUpdate, 1]
-	[Note, "R1 IUpdate: FillLayer, then IUpdate.\nIs your model visible in front of the image?"]
-	, 0, 0.25
-]
-
-[IButton, "ZPlugin:Reference Scaler b33:R2 Persp x2",
-	"Redraw test: FillLayer, then Draw > Persp pressed twice.",
-	[IPress, Color:FillLayer]
-	[IPress, Draw:Persp]
-	[IPress, Draw:Persp]
-	[Note, "R2 Persp x2: FillLayer, then Draw > Persp pressed twice.\nIs your model visible in front of the image?"]
-	, 0, 0.25
-]
-
-[IButton, "ZPlugin:Reference Scaler b33:R3 Pan",
-	"Redraw test: FillLayer, then canvas pan moved 1 pixel.",
-	[IPress, Color:FillLayer]
-	[CanvasPanSet, [CanvasPanGetH] + 1, [CanvasPanGetV]]
-	[Note, "R3 Pan: FillLayer, then canvas pan moved 1 pixel.\nIs your model visible in front of the image?"]
-	, 0, 0.25
-]
-
-[IButton, "ZPlugin:Reference Scaler b33:R4 Rotate",
-	"Redraw test: FillLayer, then model rotated 0.5 degrees.",
-	[IPress, Color:FillLayer]
-	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[TransformSet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy + 0.5, zrsRz]
-	[Note, "R4 Rotate: FillLayer, then model rotated 0.5 degrees.\nIs your model visible in front of the image?"]
-	, 0, 0.25
-]
-
-[IButton, "ZPlugin:Reference Scaler b33:R5 Tool",
-	"Redraw test: FillLayer, then current tool reselected.",
-	[IPress, Color:FillLayer]
-	[If, [IExists, "Tool:Item Info"], [ISet, "Tool:Item Info", [IGet, "Tool:Item Info"]]]
-	[Note, "R5 Tool: FillLayer, then current tool reselected.\nIs your model visible in front of the image?"]
-	, 0, 0.25
-]
-
-[IButton, "ZPlugin:Reference Scaler b33:R6 Edit x2",
-	"Redraw test: FillLayer, then Edit pressed twice.",
-	[IPress, Color:FillLayer]
-	[IPress, Transform:Edit]
-	[IPress, Transform:Edit]
-	[Note, "R6 Edit x2: FillLayer, then Edit pressed twice.\nIs your model visible in front of the image?"]
-	, 0, 0.25
-]
-
-[IButton, "ZPlugin:Reference Scaler b33:R7 Zoom",
-	"Redraw test: FillLayer, then canvas zoom set to itself.",
-	[IPress, Color:FillLayer]
-	[CanvasZoomSet, [CanvasZoomGet]]
-	[Note, "R7 Zoom: FillLayer, then canvas zoom set to itself.\nIs your model visible in front of the image?"]
-	, 0, 0.25
-]
-
-// Continuation test: does this script keep running after pressing Image
-// Plane's Load Image? If the second popup appears, Live can work through it.
-[IButton, "ZPlugin:Reference Scaler b33:10 Continue?",
-	"Test: press Image Plane > Load Image with the current texture, then try to show a popup.",
-	[Note, "10 Continue?: pressing Image Plane > Load Image next. Watch for a second popup afterwards."]
-	[ISet, "Texture:Image Plane:Image Size", 100]
-	[IPress, "Texture:Image Plane:Load Image"]
-	[Note, "10 Continue?: STILL RUNNING after Image Plane's Load Image."]
-	, 0, 0.5
-]
-
-[IButton, "ZPlugin:Reference Scaler b33:About",
+[IButton, "ZPlugin:Reference Scaler b34:About",
 	"Show which build is running and whether the helper DLL loads.",
-	[Note, [StrMerge, "Reference Scaler ", zrsBuild, "\nDLL: ", [FileNameResolvePath, zrsDll], "\nDLL check: ", [FileExecute, zrsDll, "RSVersion"]]]
+	[Note, [StrMerge, "Reference Scaler ", zrsBuild, "\nDLL check: ", [FileExecute, zrsDll, "RSVersion"], " (1 = ok)"]]
 	, 0, 0.5
 ]
 
 // Anchor storage. Set by Anchor; shown so the anchored values are visible.
-[ISlider, "ZPlugin:Reference Scaler b33:Anchor Scale", 0, 0.001, 0, 100000,
+[ISlider, "ZPlugin:Reference Scaler b34:Anchor Scale", 0, 0.001, 0, 100000,
 	"Model scale recorded by Anchor.",
 	, 0, 1
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b33:Anchor X", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b34:Anchor X", 0, 0.001, -100000, 100000,
 	"Model horizontal position recorded by Anchor.",
 	, 0, 0.5
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b33:Anchor Y", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b34:Anchor Y", 0, 0.001, -100000, 100000,
 	"Model vertical position recorded by Anchor.",
 	, 0, 0.5
 ]
