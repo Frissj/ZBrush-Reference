@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 75;
+static const int kDllBuild = 76;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -2663,7 +2663,9 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 			continue;
 		bool moved = false;
 		for (int i = 0; i < 9; ++i) {
-			if (fabs(m[i] - c.m[i]) > 1e-5)
+			// Changes this small are ZBrush easing the end of a snap: the
+			// view counts as still.
+			if (fabs(m[i] - c.m[i]) > 5e-4)
 				any = true;
 			if (fabs(m[i] - c.settled[i]) > 1e-4)
 				moved = true;
@@ -2689,7 +2691,8 @@ static int ViewTickCodes(const std::vector<int>& codes);
 
 // Each overlay frame: when the rotation has changed and then held still for
 // 200 ms (a snap's animation has finished), the view is looked up. Every
-// candidate's matrix is logged then, to show what ZBrush keeps.
+// candidate's matrix is logged then, and every 250 ms while it moves, to
+// show what ZBrush does.
 static void RotFollow()
 {
 	if (!gRotLocked)
@@ -2698,11 +2701,31 @@ static void RotFollow()
 	bool changed = false;
 	const std::vector<int> codes = RotCodes(&changed, true);
 	const DWORD now = GetTickCount();
+	static DWORD loggedAt = 0;
+	if (changed && now - loggedAt >= 250) {
+		loggedAt = now;
+		if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			fprintf(f, "%lu rotation moving, dragging %d:", now, gGesture.active ? 1 : 0);
+			for (const RotCand& c : gRotCands) {
+				fprintf(f, " [%d", RotCode(c.m));
+				for (int i = 0; i < 9; ++i)
+					fprintf(f, " %.4f", c.m[i]);
+				fprintf(f, "]");
+			}
+			fprintf(f, "\n");
+			fclose(f);
+		}
+	}
+	static std::vector<int> lastCodes;
+	// After settling, an easing that creeps on (too slowly to count as
+	// moving) can still land on a view: that is looked up too.
+	const bool landed = gRotSettled && !gGesture.active && !codes.empty() && codes != lastCodes;
 	if (changed) {
 		gRotChangedAt = now;
 		gRotSettled = false;
-	} else if (!gRotSettled && !gGesture.active && now - gRotChangedAt >= 200) {
+	} else if (landed || (!gRotSettled && !gGesture.active && now - gRotChangedAt >= 200)) {
 		gRotSettled = true;
+		lastCodes = codes;
 		const int result = ViewTickCodes(codes);
 		for (RotCand& c : gRotCands)
 			memcpy(c.settled, c.m, sizeof(c.m));
