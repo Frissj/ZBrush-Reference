@@ -340,6 +340,30 @@ static DWORD gOverlayThreadId = 0;
 static const UINT WM_RS_REDRAW = WM_APP + 1;
 static const UINT WM_RS_CLOSE = WM_APP + 2;
 
+// Switches the calling thread to physical pixels while it lives. Under
+// Windows display scaling ZBrush's own threads see scaled coordinates, which
+// do not match a screen capture or the layered window's placement. Needs
+// Windows 10 1607 or later; does nothing on older systems.
+struct PhysicalPixels {
+	typedef DPI_AWARENESS_CONTEXT (WINAPI *SetContext)(DPI_AWARENESS_CONTEXT);
+	SetContext set = nullptr;
+	DPI_AWARENESS_CONTEXT old = nullptr;
+	PhysicalPixels()
+	{
+		set = reinterpret_cast<SetContext>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetThreadDpiAwarenessContext"));
+		if (set) {
+			old = set(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+			if (!old)
+				old = set(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+		}
+	}
+	~PhysicalPixels()
+	{
+		if (set && old)
+			set(old);
+	}
+};
+
 static BOOL CALLBACK FindZBrushWindow(HWND wnd, LPARAM param)
 {
 	DWORD pid = 0;
@@ -439,6 +463,8 @@ static LRESULT CALLBACK OverlayProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static DWORD WINAPI OverlayThread(LPVOID ready)
 {
+	// The overlay window is placed in physical pixels, like the calibration.
+	PhysicalPixels physical;
 	StartGdiplus();
 	WNDCLASSW wc = {};
 	wc.lpfnWndProc = OverlayProc;
@@ -776,6 +802,7 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 		return -1;
 	if (!EnsureOverlay())
 		return -2;
+	PhysicalPixels physical;
 	Rgb frame;
 	if (!LoadRgb(DllFolder() + L"frame0.png", frame))
 		return -3;
