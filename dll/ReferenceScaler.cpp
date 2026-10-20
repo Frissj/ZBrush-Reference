@@ -129,7 +129,7 @@ ZFUNC RSLog(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 56;
+static const int kDllBuild = 57;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -535,6 +535,25 @@ static NavModel gNav;
 static double gLastErrorPos = 0, gLastErrorScale = 1;
 static int gLastKind = kKindNone;
 static bool gMemLocked = false;  // ZBrush's values are read from memory (see MemReport)
+
+// Stacks of this DLL's own threads hold copies of the values too.
+static uintptr_t gOwnStacks[2][2] = {{0, 0}, {0, 0}};
+
+static void NoteOwnStack(int slot)
+{
+	const NT_TIB* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+	gOwnStacks[slot][0] = reinterpret_cast<uintptr_t>(tib->StackLimit) & ~static_cast<uintptr_t>(0xfffff);
+	gOwnStacks[slot][1] = reinterpret_cast<uintptr_t>(tib->StackBase);
+}
+
+static bool OwnThreadStack(uintptr_t lo, uintptr_t hi)
+{
+	for (auto& r : gOwnStacks)
+		if (r[1] && r[0] < hi && lo < r[1])
+			return true;
+	return false;
+}
+
 static Gesture gPending;      // last finished navigation drag, until Live reports
 static int gPendingCount = 0; // navigation drags since Live last reported
 static int gStaleSets = 0;    // reports ignored as not including the drag yet
@@ -842,6 +861,7 @@ ZFUNC RSTestInput(char* text, double, char*, int, char*, int, char**)
 // system's input.
 static DWORD WINAPI HookThread(LPVOID)
 {
+	NoteOwnStack(1);
 	PhysicalPixels physical;
 	gKeyHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyHook, GetModuleHandleW(nullptr), 0);
 	gMouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0);
@@ -1334,12 +1354,16 @@ static void MemScan(double sx, double px, double py)
 			(mbi.Type == MEM_PRIVATE || mbi.Type == MEM_IMAGE) && mbi.RegionSize <= (512u << 20) &&
 			// Not this DLL's own copies of the values, nor the calling thread's
 			// stack (it holds the values being reported right now).
-			mbi.AllocationBase != self && !(stackLow < next && base < stackHigh)) {
+			mbi.AllocationBase != self && !(stackLow < next && base < stackHigh) &&
+			!OwnThreadStack(base, next)) {
 			for (uintptr_t chunk = base; chunk < next; chunk += buf.size()) {
 				const size_t len = next - chunk < buf.size() ? next - chunk : buf.size();
 				SIZE_T got = 0;
 				if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(chunk), buf.data(), len, &got))
 					continue;
+				const uintptr_t bufLo = reinterpret_cast<uintptr_t>(buf.data()), bufHi = bufLo + buf.size();
+				if (chunk < bufHi && bufLo < chunk + got)
+					continue;  // the scan's own copy of memory
 				for (size_t i = 0; i + 4 <= got; i += 4) {
 					float f;
 					memcpy(&f, &buf[i], 4);
@@ -1430,6 +1454,54 @@ static void MemWeedOut(MemTrack& tr)
 		tr.cands.swap(keep);
 }
 
+// ZBrush keeps a view's values together: y right after x, the scale close
+// by. Locations that fit that pattern are the real ones; stray copies (freed
+// memory, temporaries) almost never do.
+struct MemTriplet {
+	MemCand s, x, y;
+	DWORD changedAt;
+};
+static std::vector<MemTriplet> gTriplets;
+
+static void BuildTriplets()
+{
+	gTriplets.clear();
+	for (const MemCand& x : gMemX.cands)
+		for (const MemCand& y : gMemY.cands) {
+			if (y.isDouble != x.isDouble || y.addr != x.addr + (x.isDouble ? 8 : 4))
+				continue;
+			for (const MemCand& sc : gMemScale.cands)
+				if (sc.isDouble == x.isDouble && (sc.addr > x.addr ? sc.addr - x.addr : x.addr - sc.addr) <= 1024)
+					gTriplets.push_back({sc, x, y, 0});
+		}
+}
+
+// Reads the most recently changed triplet. Returns false if none can be read.
+static bool TripletValues(double& sx, double& px, double& py)
+{
+	const DWORD now = GetTickCount();
+	MemTriplet* best = nullptr;
+	for (MemTriplet& t : gTriplets) {
+		double a, b, c;
+		if (!MemRead(t.s, a) || !MemRead(t.x, b) || !MemRead(t.y, c))
+			continue;
+		if (a != t.s.last || b != t.x.last || c != t.y.last) {
+			t.s.last = a;
+			t.x.last = b;
+			t.y.last = c;
+			t.changedAt = now;
+		}
+		if (!best || static_cast<int>(t.changedAt - best->changedAt) > 0)
+			best = &t;
+	}
+	if (!best)
+		return false;
+	sx = best->s.last;
+	px = best->x.last;
+	py = best->y.last;
+	return true;
+}
+
 // Feeds a report of exact values to the search. Caller holds the lock.
 static void MemReport(double sx, double px, double py)
 {
@@ -1454,6 +1526,8 @@ static void MemReport(double sx, double px, double py)
 			MemScan(sx, px, py);  // lost them (or too many): start over
 	}
 	gMemLocked = MemTrackReady(gMemScale) && MemTrackReady(gMemX) && MemTrackReady(gMemY);
+	if (gMemLocked)
+		BuildTriplets();
 	gMemWatchUntil = GetTickCount() + 1000;
 	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
 		fprintf(f, "%lu memory %d candidates %zu %zu %zu narrowed %d %d %d locked %d\n", GetTickCount(),
@@ -1476,12 +1550,14 @@ static void MemFollow()
 		MemWeedOut(gMemScale);
 		MemWeedOut(gMemX);
 		MemWeedOut(gMemY);
+		BuildTriplets();
 	}
 	const bool rotating = gGesture.active && gGesture.mode == kDragNone && gGesture.right;
 	OverlayState& st = gOverlay;
 	double sx = st.ratio * gAnchorScale, px = st.px, py = st.py;
-	if (MemValue(gMemScale, sx) && MemValue(gMemX, px) && MemValue(gMemY, py) &&
-		sx > 0 && sx < 1e7 && fabs(px) < 1e6 && fabs(py) < 1e6) {
+	const bool read = !gTriplets.empty() ? TripletValues(sx, px, py) :
+		MemValue(gMemScale, sx) && MemValue(gMemX, px) && MemValue(gMemY, py);
+	if (read && sx > 0 && sx < 1e7 && fabs(px) < 1e6 && fabs(py) < 1e6) {
 		if (rotating) {
 			holding = true;
 		} else {
@@ -1588,6 +1664,7 @@ static LRESULT CALLBACK OverlayProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 static DWORD WINAPI OverlayThread(LPVOID ready)
 {
 	// The overlay window is placed in physical pixels, like the calibration.
+	NoteOwnStack(0);
 	PhysicalPixels physical;
 	StartGdiplus();
 	WNDCLASSW wc = {};
@@ -1629,13 +1706,18 @@ static DWORD WINAPI OverlayThread(LPVOID ready)
 	}
 }
 
-// Starts the overlay thread once and keeps the DLL loaded for it.
-static bool EnsureOverlay()
+static void EnsureLock()
 {
 	if (!gOverlayLockReady) {
 		InitializeCriticalSection(&gOverlayLock);
 		gOverlayLockReady = true;
 	}
+}
+
+// Starts the overlay thread once and keeps the DLL loaded for it.
+static bool EnsureOverlay()
+{
+	EnsureLock();
 	if (gOverlayWnd)
 		return true;
 	HMODULE self = nullptr;
@@ -2016,7 +2098,8 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 // finished drag was (0 nothing, 1 move, 2 scale, 3 rotate, 4 sculpt), then
 // clears it; "20" capture method (1 desktop duplication, 0 BitBlt); "21"
 // overlay frames per second; "22" 1 if ZBrush's values are read from
-// memory, "23" to "25" memory candidates left for scale, x and y.
+// memory, "23" to "25" memory candidates left for scale, x and y, "26" how
+// many of them sit together the way ZBrush stores a view.
 ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 {
 	const int which = text ? atoi(text) : -1;
@@ -2050,6 +2133,7 @@ ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 	case 23: return static_cast<float>(gMemScale.cands.size());
 	case 24: return static_cast<float>(gMemX.cands.size());
 	case 25: return static_cast<float>(gMemY.cands.size());
+	case 26: return static_cast<float>(gTriplets.size());
 	case 18: return static_cast<float>(gGesture.mode + 10 * gGesture.scaleSegments + 100 * gGesture.active);
 	}
 	return -1;
@@ -2108,6 +2192,35 @@ ZFUNC RSOverlaySet(char* text, double, char*, int, char*, int, char**)
 	LeaveCriticalSection(&gOverlayLock);
 	PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
 	return 1;
+}
+
+// text: "start|next|last scale x y anchorScale": the
+// Overlay button sets a few test views with TransformSet and reports each
+// one's exact values. "start" scans ZBrush's memory for them, "next" keeps
+// the locations that changed to match, so the camera is found within one
+// button press. Returns 1 when locked, 0 if not (yet), -1 bad arguments.
+ZFUNC RSMemProbe(char* text, double, char*, int, char*, int, char**)
+{
+	char mode[16] = {0};
+	double sx, px, py, anchor;
+	if (!text || sscanf(text, "%15s %lf %lf %lf %lf", mode, &sx, &px, &py, &anchor) != 5 || sx <= 0 || anchor <= 0)
+		return -1;
+	EnsureLock();
+	EnterCriticalSection(&gOverlayLock);
+	gAnchorScale = anchor;
+	if (strcmp(mode, "start") == 0) {
+		gMemLocked = false;
+		gMemScanned = false;
+	}
+	gMemDisagree = 0;
+	MemReport(sx, px, py);
+	// The test views change the values without a mouse drag; that must not
+	// count against the right locations. After the last report ("last"),
+	// locations that still change on their own are weeded out as usual.
+	gMemWatchUntil = strcmp(mode, "last") == 0 ? GetTickCount() + 1500 : GetTickCount();
+	const bool locked = gMemLocked;
+	LeaveCriticalSection(&gOverlayLock);
+	return locked ? 1 : 0;
 }
 
 // Clears the rotation offset (the view is back at the anchored rotation).
