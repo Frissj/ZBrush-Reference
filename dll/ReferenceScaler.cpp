@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
+#include <cmath>
 
 #define ZFUNC extern "C" __declspec(dllexport) float
 
@@ -130,6 +132,12 @@ ZFUNC RSSetImage(char* text, double, char*, int, char*, int, char**)
 	return 1;
 }
 
+// Layout of the last rendered frame, "ratio px py anchorX anchorY".
+static std::wstring LayoutPath()
+{
+	return DllFolder() + L"frame_layout.txt";
+}
+
 // text: "docW docH ratio px py anchorX anchorY frameName"
 // The image's base layout is fitted to the document, centred, keeping its
 // aspect ratio. That layout is scaled by ratio about the anchored model
@@ -172,6 +180,11 @@ ZFUNC RSRender(char* text, double, char*, int, char*, int, char**)
 	const bool absolute = name.size() > 2 && name[1] == L':';
 	if (!WritePng(absolute ? name : DllFolder() + name, frame))
 		return -4;
+	// The overlay starts from this layout (see RSOverlayStart).
+	if (FILE* f = _wfopen(LayoutPath().c_str(), L"wb")) {
+		fprintf(f, "%.6f %.6f %.6f %.6f %.6f\n", ratio, px, py, ax, ay);
+		fclose(f);
+	}
 	return 1;
 }
 
@@ -410,28 +423,317 @@ static bool EnsureOverlay()
 	return gOverlayWnd != nullptr;
 }
 
-// text: "screenX screenY pixelsPerDoc docW docH alpha" — where document pixel
-// (0, 0) is on screen, how many screen pixels one document pixel covers, the
-// document size, and opacity 0-255. Shows the overlay. Returns 1, -1 for bad
-// arguments, -2 if the window could not be created.
+// ---------------------------------------------------------------------------
+// Canvas calibration: finds where the document is on screen by matching the
+// last rendered frame (frame0.png, which is what the canvas shows behind the
+// model) against a capture of ZBrush's window. This needs no knowledge of
+// ZBrush's layout, canvas zoom or Windows display scaling.
+// ---------------------------------------------------------------------------
+
+struct Rgb {
+	std::vector<unsigned char> px;  // B, G, R per pixel
+	int w = 0, h = 0;
+	const unsigned char* at(int x, int y) const { return &px[(static_cast<size_t>(y) * w + x) * 3]; }
+};
+
+static bool LoadRgb(const std::wstring& path, Rgb& out)
+{
+	StartGdiplus();
+	Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromFile(path.c_str());
+	bool ok = false;
+	if (bmp && bmp->GetLastStatus() == Gdiplus::Ok && bmp->GetWidth() > 0) {
+		Gdiplus::Rect r(0, 0, bmp->GetWidth(), bmp->GetHeight());
+		Gdiplus::BitmapData data;
+		if (bmp->LockBits(&r, Gdiplus::ImageLockModeRead, PixelFormat24bppRGB, &data) == Gdiplus::Ok) {
+			out.w = r.Width;
+			out.h = r.Height;
+			out.px.resize(static_cast<size_t>(out.w) * out.h * 3);
+			for (int y = 0; y < out.h; ++y)
+				memcpy(&out.px[static_cast<size_t>(y) * out.w * 3], static_cast<BYTE*>(data.Scan0) + y * data.Stride, out.w * 3);
+			bmp->UnlockBits(&data);
+			ok = true;
+		}
+	}
+	delete bmp;
+	return ok;
+}
+
+static bool CaptureScreen(const RECT& r, Rgb& out)
+{
+	const int w = r.right - r.left, h = r.bottom - r.top;
+	if (w < 16 || h < 16)
+		return false;
+	BITMAPINFO bi = {};
+	bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+	bi.bmiHeader.biWidth = w;
+	bi.bmiHeader.biHeight = -h;
+	bi.bmiHeader.biPlanes = 1;
+	bi.bmiHeader.biBitCount = 32;
+	bi.bmiHeader.biCompression = BI_RGB;
+	void* bits = nullptr;
+	HDC screen = GetDC(nullptr);
+	HDC mem = CreateCompatibleDC(screen);
+	HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+	HGDIOBJ old = SelectObject(mem, dib);
+	const bool ok = BitBlt(mem, 0, 0, w, h, screen, r.left, r.top, SRCCOPY) != 0;
+	GdiFlush();
+	if (ok) {
+		out.w = w;
+		out.h = h;
+		out.px.resize(static_cast<size_t>(w) * h * 3);
+		const unsigned char* src = static_cast<const unsigned char*>(bits);
+		for (size_t i = 0, n = static_cast<size_t>(w) * h; i < n; ++i) {
+			out.px[i * 3] = src[i * 4];
+			out.px[i * 3 + 1] = src[i * 4 + 1];
+			out.px[i * 3 + 2] = src[i * 4 + 2];
+		}
+	}
+	SelectObject(mem, old);
+	DeleteObject(dib);
+	DeleteDC(mem);
+	ReleaseDC(nullptr, screen);
+	return ok;
+}
+
+// Box-averages img into blocks of size d.
+static Rgb Shrink(const Rgb& img, int d)
+{
+	Rgb out;
+	out.w = img.w / d;
+	out.h = img.h / d;
+	out.px.resize(static_cast<size_t>(out.w) * out.h * 3);
+	for (int y = 0; y < out.h; ++y)
+		for (int x = 0; x < out.w; ++x)
+			for (int c = 0; c < 3; ++c) {
+				int sum = 0;
+				for (int j = 0; j < d; ++j)
+					for (int i = 0; i < d; ++i)
+						sum += img.at(x * d + i, y * d + j)[c];
+				out.px[(static_cast<size_t>(y) * out.w + x) * 3 + c] = static_cast<unsigned char>(sum / (d * d));
+			}
+	return out;
+}
+
+// Average colour of the frame over a square of the given radius around (x, y).
+static void FrameColor(const Rgb& f, double x, double y, double radius, int out[3])
+{
+	const int r = static_cast<int>(radius);
+	const int cx = static_cast<int>(x), cy = static_cast<int>(y);
+	int sum[3] = {0, 0, 0}, n = 0;
+	for (int j = cy - r; j <= cy + r; ++j) {
+		if (j < 0 || j >= f.h)
+			continue;
+		for (int i = cx - r; i <= cx + r; ++i) {
+			if (i < 0 || i >= f.w)
+				continue;
+			const unsigned char* p = f.at(i, j);
+			sum[0] += p[0];
+			sum[1] += p[1];
+			sum[2] += p[2];
+			++n;
+		}
+	}
+	for (int c = 0; c < 3; ++c)
+		out[c] = n ? sum[c] / n : 0;
+}
+
+struct Sample {
+	double fx, fy;  // frame position (pixel centre)
+};
+
+// Counts samples whose colour on the screen image matches the frame, for
+// the document placed at (ox, oy) in img pixels with k img pixels per
+// document pixel. Stops early once it cannot beat `beat`.
+static int Score(const Rgb& img, const std::vector<Sample>& samples, const std::vector<int>& colors,
+	double ox, double oy, double k, int tolerance, int beat)
+{
+	int score = 0;
+	const int n = static_cast<int>(samples.size());
+	for (int i = 0; i < n; ++i) {
+		if (score + (n - i) <= beat)
+			return 0;
+		const int x = static_cast<int>(floor(ox + k * samples[i].fx));
+		const int y = static_cast<int>(floor(oy + k * samples[i].fy));
+		if (x < 0 || y < 0 || x >= img.w || y >= img.h)
+			continue;
+		const unsigned char* p = img.at(x, y);
+		const int* c = &colors[i * 3];
+		if (abs(p[0] - c[0]) + abs(p[1] - c[1]) + abs(p[2] - c[2]) < tolerance)
+			++score;
+	}
+	return score;
+}
+
+static void SampleColors(const Rgb& frame, const std::vector<Sample>& samples, double radius, std::vector<int>& colors)
+{
+	colors.resize(samples.size() * 3);
+	for (size_t i = 0; i < samples.size(); ++i)
+		FrameColor(frame, samples[i].fx, samples[i].fy, radius, &colors[i * 3]);
+}
+
+struct Calibration {
+	double screenX = 0, screenY = 0, pixelsPerDoc = 0;
+	double percent = 0;  // share of sample points that matched
+};
+static Calibration gCalibration;
+
+// Finds the frame in the screen capture. Returns false if no placement
+// matches at least a third of the sample points.
+static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
+{
+	// Sample points on a grid, skipping near-black frame pixels (outside the
+	// image) unless the image covers too little of the frame.
+	std::vector<Sample> all, picked;
+	const int grid = 40;
+	for (int j = 0; j < grid; ++j)
+		for (int i = 0; i < grid; ++i) {
+			Sample s = {(i + 0.5) * frame.w / grid, (j + 0.5) * frame.h / grid};
+			all.push_back(s);
+			int c[3];
+			FrameColor(frame, s.fx, s.fy, 1, c);
+			if (c[0] + c[1] + c[2] > 30)
+				picked.push_back(s);
+		}
+	const std::vector<Sample>& samples = picked.size() >= 100 ? picked : all;
+
+	// Coarse search on the capture shrunk by d, over scales 0.25 to 4.
+	const int d = 8;
+	const Rgb small = Shrink(screen, d);
+	std::vector<Sample> coarse;
+	for (size_t i = 0; i < samples.size(); i += 3)
+		coarse.push_back(samples[i]);
+	std::vector<int> colors;
+	int best = 0;
+	double bestK = 0, bestX = 0, bestY = 0;
+	for (double k = 0.25; k <= 4.0; k *= 1.03) {
+		const double ks = k / d;  // small-image pixels per document pixel
+		SampleColors(frame, coarse, 0.5 / ks, colors);
+		const double tw = ks * frame.w, th = ks * frame.h;
+		for (double oy = -th * 0.25; oy <= small.h - th * 0.75; oy += 1)
+			for (double ox = -tw * 0.25; ox <= small.w - tw * 0.75; ox += 1) {
+				const int s = Score(small, coarse, colors, ox, oy, ks, 60, best);
+				if (s > best) {
+					best = s;
+					bestK = k;
+					bestX = ox * d;
+					bestY = oy * d;
+				}
+			}
+	}
+	if (best == 0)
+		return false;
+
+	// Refine at full resolution: scale within 4% in 0.5% steps, then 0.1%.
+	struct Pass { double scaleRange, scaleStep; int offRange, offStep; };
+	const Pass passes[] = {{0.045, 0.005, 2 * d + 4, 2}, {0.006, 0.001, 3, 1}};
+	for (const Pass& pass : passes) {
+		const double k0 = bestK, x0 = bestX, y0 = bestY;
+		best = -1;
+		for (double f = 1 - pass.scaleRange; f <= 1 + pass.scaleRange + 1e-9; f += pass.scaleStep) {
+			const double k = k0 * f;
+			SampleColors(frame, samples, 0.5 / k, colors);
+			// Keep the document centre fixed while trying scales.
+			const double cx = x0 + (k0 - k) * frame.w * 0.5, cy = y0 + (k0 - k) * frame.h * 0.5;
+			for (int dy = -pass.offRange; dy <= pass.offRange; dy += pass.offStep)
+				for (int dx = -pass.offRange; dx <= pass.offRange; dx += pass.offStep) {
+					const int s = Score(screen, samples, colors, floor(cx) + dx, floor(cy) + dy, k, 45, best);
+					if (s > best) {
+						best = s;
+						bestK = k;
+						bestX = floor(cx) + dx;
+						bestY = floor(cy) + dy;
+					}
+				}
+		}
+	}
+	out.pixelsPerDoc = bestK;
+	out.screenX = bestX;
+	out.screenY = bestY;
+	out.percent = 100.0 * best / samples.size();
+	return out.percent >= 33;
+}
+
+// text: "docW docH alpha" — the document size and opacity 0-255. Hides the
+// overlay, captures ZBrush's window, finds the canvas by matching
+// frame0.png against it, then shows the overlay there with that frame's
+// layout. Returns the share of
+// sample points that matched (33-100), or -1 bad arguments, -2 the window
+// could not be created, -3 frame0.png missing (show the image first), -4 the
+// screen could not be captured, -5 the frame was not found on screen
+// (RSOverlayInfo 3 gives the best match).
 ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 {
-	double sx, sy, k, dw, dh, a;
-	if (!text || sscanf(text, "%lf %lf %lf %lf %lf %lf", &sx, &sy, &k, &dw, &dh, &a) != 6 || k <= 0 || dw < 1 || dh < 1)
+	double dw, dh, a;
+	if (!text || sscanf(text, "%lf %lf %lf", &dw, &dh, &a) != 3 || dw < 1 || dh < 1)
 		return -1;
 	if (!EnsureOverlay())
 		return -2;
+	Rgb frame;
+	if (!LoadRgb(DllFolder() + L"frame0.png", frame))
+		return -3;
+
 	EnterCriticalSection(&gOverlayLock);
-	gOverlay.screenX = sx;
-	gOverlay.screenY = sy;
-	gOverlay.pixelsPerDoc = k;
+	gOverlay.visible = false;
+	LeaveCriticalSection(&gOverlayLock);
+	SendMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	Sleep(150);
+
+	HWND zbrush = nullptr;
+	EnumWindows(FindZBrushWindow, reinterpret_cast<LPARAM>(&zbrush));
+	RECT r;
+	if (!zbrush || !GetWindowRect(zbrush, &r))
+		GetWindowRect(GetDesktopWindow(), &r);
+	Rgb screen;
+	if (!CaptureScreen(r, screen))
+		return -4;
+	Calibration cal;
+	const bool found = Calibrate(frame, screen, cal);
+	cal.screenX += r.left;
+	cal.screenY += r.top;
+	// The frame's size in document pixels can differ from docW if ZBrush
+	// reports the document size differently; scale to the frame.
+	cal.pixelsPerDoc *= frame.w / dw;
+	gCalibration = cal;
+	if (!found)
+		return -5;
+
+	EnterCriticalSection(&gOverlayLock);
+	gOverlay.screenX = cal.screenX;
+	gOverlay.screenY = cal.screenY;
+	gOverlay.pixelsPerDoc = cal.pixelsPerDoc;
 	gOverlay.docW = dw;
 	gOverlay.docH = dh;
 	gOverlay.alpha = a < 0 ? 0 : a > 255 ? 255 : static_cast<int>(a);
+	if (FILE* f = _wfopen(LayoutPath().c_str(), L"rb")) {
+		double r, px, py, ax, ay;
+		if (fscanf(f, "%lf %lf %lf %lf %lf", &r, &px, &py, &ax, &ay) == 5 && r > 0) {
+			gOverlay.ratio = r;
+			gOverlay.px = px;
+			gOverlay.py = py;
+			gOverlay.ax = ax;
+			gOverlay.ay = ay;
+		}
+		fclose(f);
+	}
 	gOverlay.visible = true;
 	LeaveCriticalSection(&gOverlayLock);
 	PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
-	return 1;
+	return static_cast<float>(floor(cal.percent));
+}
+
+// text: "0" screen X of the document's top-left corner, "1" screen Y, "2"
+// screen pixels per document pixel (x1000), "3" percent matched, from the
+// last RSOverlayStart.
+ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
+{
+	const int which = text ? atoi(text) : -1;
+	switch (which) {
+	case 0: return static_cast<float>(gCalibration.screenX);
+	case 1: return static_cast<float>(gCalibration.screenY);
+	case 2: return static_cast<float>(floor(gCalibration.pixelsPerDoc * 1000 + 0.5));
+	case 3: return static_cast<float>(floor(gCalibration.percent));
+	}
+	return -1;
 }
 
 // text: "ratio px py anchorX anchorY", as for RSRender. Returns 1, -1 for bad
