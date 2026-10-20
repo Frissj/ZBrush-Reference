@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 79;
+static const int kDllBuild = 80;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -697,6 +697,7 @@ static bool ZBrushInFront()
 // does not see them): drag inside it to move it, drag a corner (or drag with
 // the right button) to scale it about its centre.
 static volatile bool gAdjust = false;
+static volatile bool gAdjustEscape = false;  // Esc pressed: the overlay turns Adjust Image off
 static bool AdjustMouse(WPARAM wp, POINT pt);
 
 static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
@@ -889,6 +890,7 @@ static LRESULT CALLBACK KeyHook(int code, WPARAM wp, LPARAM lp)
 		switch (k->vkCode) {
 		case VK_MENU: case VK_LMENU: case VK_RMENU: gAltDown = down; break;
 		case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: gCtrlDown = down; break;
+		case VK_ESCAPE: if (down && gAdjust) gAdjustEscape = true; break;
 		}
 	}
 	return CallNextHookEx(gKeyHook, code, wp, lp);
@@ -908,8 +910,8 @@ ZFUNC RSTestInput(char* text, double, char*, int, char*, int, char**)
 	MSLLHOOKSTRUCT m = {};
 	m.pt.x = x;
 	m.pt.y = y;
-	MouseHook(HC_ACTION, kinds[e], reinterpret_cast<LPARAM>(&m));
-	return 1;
+	// 2 when the hook kept the event from ZBrush.
+	return MouseHook(HC_ACTION, kinds[e], reinterpret_cast<LPARAM>(&m)) == 1 ? 2 : 1;
 }
 #endif
 
@@ -1079,7 +1081,13 @@ static bool AdjustMouse(WPARAM wp, POINT pt)
 			return false;
 		x0 += st.screenX;
 		y0 += st.screenY;
-		gAdjustDown = pt;
+		// Only where the reference shows (the canvas background): clicks on
+		// the model, or on ZBrush's popups and menus over the canvas, go to
+		// ZBrush.
+		const int kx = static_cast<int>(pt.x - st.screenX), ky = static_cast<int>(pt.y - st.screenY);
+		if (kx < 0 || ky < 0 || kx >= gKeyW || ky >= gKeyH || gKeyShare.size() != static_cast<size_t>(gKeyW) * gKeyH ||
+			gKeyShare[static_cast<size_t>(ky) * gKeyW + kx] < 128)
+			return false;
 		gAdjustSX0 = st.imgSX;
 		gAdjustSY0 = st.imgSY;
 		gAdjustX0 = st.imgX;
@@ -1091,6 +1099,10 @@ static bool AdjustMouse(WPARAM wp, POINT pt)
 		const int sideX = fabs(pt.x - hx0) < r ? -1 : fabs(pt.x - hx1) < r ? 1 : 0;
 		const int sideY = fabs(pt.y - hy0) < r ? -1 : fabs(pt.y - hy1) < r ? 1 : 0;
 		const bool withinX = pt.x > hx0 - r && pt.x < hx1 + r, withinY = pt.y > hy0 - r && pt.y < hy1 + r;
+		const bool inside = pt.x >= x0 && pt.x < x0 + w && pt.y >= y0 && pt.y < y0 + h;
+		if (!(sideX && withinY) && !(sideY && withinX) && !inside)
+			return false;  // off the image: ZBrush gets the click
+		gAdjustDown = pt;
 		gAdjustSideX = sideX;
 		gAdjustSideY = sideY;
 		if (wp == WM_RBUTTONDOWN)
@@ -1618,6 +1630,56 @@ static void RefreshUiRects()
 	}
 }
 
+// ZBrush's menus and popups may be drawn inside its own window, over the
+// canvas, where no window list shows them. ZBrush's cursor tells: over the
+// canvas it is the canvas cursor (learned as the one most seen over the
+// canvas outside the panel); over a menu or popup it is another. While the
+// cursor is over the panel and is not the canvas cursor, the panel steps
+// aside and ZBrush shows. Changes are logged.
+static bool gPanelAside = false;
+
+static bool UpdatePanelAside(const OverlayState& st)
+{
+	const bool before = gPanelAside;
+	gPanelAside = false;
+	if (gMode != 1 || !st.visible)
+		return before != gPanelAside;
+	CURSORINFO ci = {sizeof(ci)};
+	if (!GetCursorInfo(&ci))
+		return before != gPanelAside;
+	const HCURSOR cur = (ci.flags & CURSOR_SHOWING) ? ci.hCursor : nullptr;
+	const int w = static_cast<int>(st.docW * st.pixelsPerDoc + 0.5), h = static_cast<int>(st.docH * st.pixelsPerDoc + 0.5);
+	int px, py, pw, ph;
+	PanelRect(w, h, px, py, pw, ph);
+	const int x = static_cast<int>(ci.ptScreenPos.x - st.screenX), y = static_cast<int>(ci.ptScreenPos.y - st.screenY);
+	const bool onCanvas = x >= 0 && y >= 0 && x < w && y < h;
+	const bool onPanel = onCanvas && x >= px && x < px + pw && y >= py && y < py + ph;
+	static std::vector<std::pair<HCURSOR, int>> seen;
+	static HCURSOR canvas = nullptr, logged = reinterpret_cast<HCURSOR>(-1);
+	if (onCanvas && !onPanel && ZBrushInFront()) {
+		bool found = false;
+		for (auto& c : seen)
+			if (c.first == cur) { ++c.second; found = true; }
+		if (!found)
+			seen.push_back({cur, 1});
+		int best = 0;
+		for (const auto& c : seen)
+			if (c.second > best) { best = c.second; canvas = c.first; }
+	}
+	if (onPanel && canvas && cur != canvas)
+		gPanelAside = true;
+	if (cur != logged && onCanvas) {
+		logged = cur;
+		if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			fprintf(f, "%lu cursor %p (arrow %p, canvas %p) at %d %d, on panel %d, panel aside %d\n", GetTickCount(),
+				static_cast<void*>(cur), static_cast<void*>(LoadCursor(nullptr, IDC_ARROW)), static_cast<void*>(canvas), x, y,
+				onPanel ? 1 : 0, gPanelAside ? 1 : 0);
+			fclose(f);
+		}
+	}
+	return before != gPanelAside;
+}
+
 // Builds the opaque output from gCapture: each pixel's share of magenta is
 // replaced by the reference (gRefLayer, black where there is none).
 static void Composite(HWND wnd, const OverlayState& st)
@@ -1656,7 +1718,7 @@ static void Composite(HWND wnd, const OverlayState& st)
 	}
 	gMagentaShare = n ? 100.0 * magenta / n : 0;
 	gModelPixels = static_cast<double>(model);
-	if (gMode == 1) {
+	if (gMode == 1 && !gPanelAside) {
 		// PureRef: the panel is shown over the model, but not over ZBrush's
 		// popups and menus.
 		int px, py, pw, ph;
@@ -3343,6 +3405,17 @@ static bool OverlayStep(HWND wnd)
 	MemFollow();
 	RotFollow();
 	RefreshUiRects();
+	if (gAdjustEscape) {
+		EnterCriticalSection(&gOverlayLock);
+		gAdjustEscape = false;
+		if (gAdjust) {
+			SaveAdjustToView();
+			gAdjust = false;
+			gAdjustDrag = 0;
+			gRedrawPending = true;
+		}
+		LeaveCriticalSection(&gOverlayLock);
+	}
 	EnterCriticalSection(&gOverlayLock);
 	const OverlayState st = gOverlay;
 	const bool redraw = gRedrawPending;
@@ -3380,7 +3453,8 @@ static bool OverlayStep(HWND wnd)
 			Present(wnd, st, gRefLayer, static_cast<BYTE>(255));
 		return false;
 	}
-	if (Capture(st) || layoutChanged) {
+	const bool aside = UpdatePanelAside(st);
+	if (Capture(st) || layoutChanged || aside) {
 		Composite(wnd, st);
 		gLastFrameAt = GetTickCount();
 		++fpsFrames;
@@ -4123,11 +4197,13 @@ ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 }
 
 // text: "1" turns Adjust Image on, "0" off (keeping the image's size and
-// place for the showing view). Returns 1, 0 if no image is showing, -1 if
-// the overlay is not on.
+// place for the showing view), "2" only checks whether it could go on.
+// Returns 1, 0 if no image is showing, -1 if the overlay is not on, -2 in
+// PureRef.
 ZFUNC RSAdjust(char* text, double, char*, int, char*, int, char**)
 {
-	const bool on = text && atoi(text) == 1;
+	const int req = text ? atoi(text) : 0;
+	const bool on = req == 1 || req == 2;
 	if (!gOverlayWnd || !gOverlay.visible) {
 		gAdjust = false;
 		return -1;
@@ -4139,6 +4215,8 @@ ZFUNC RSAdjust(char* text, double, char*, int, char*, int, char**)
 		result = -2;
 	} else if (on && (gActiveView < 0 || gImgW <= 0)) {
 		result = 0;
+	} else if (req == 2) {
+		result = 1;
 	} else {
 		if (!on && gAdjust)
 			SaveAdjustToView();
