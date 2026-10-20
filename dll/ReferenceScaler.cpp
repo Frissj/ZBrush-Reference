@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 67;
+static const int kDllBuild = 68;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1577,6 +1577,11 @@ struct MemTriplet {
 	DWORD changedAt;
 	int dragFrames;  // frames in which it changed while the mouse was dragging
 	int posFrames;   // ... of which its position changed
+	// Frames of a rotation drag in which its position changed at the same
+	// scale. Rotating never changes ZBrush's position (nav_log: rotation
+	// drags end at the x, y they started at), so such a copy is something
+	// else that happens to equal it in the front view.
+	int rotFrames;
 };
 static int gTripletInUse = -1;
 static std::vector<MemTriplet> gTriplets;
@@ -1591,16 +1596,19 @@ static void BuildTriplets()
 				continue;
 			for (const MemCand& sc : gMemScale.cands)
 				if (sc.isDouble == x.isDouble && (sc.addr > x.addr ? sc.addr - x.addr : x.addr - sc.addr) <= 1024)
-					gTriplets.push_back({sc, x, y, 0, 0, 0});
+					gTriplets.push_back({sc, x, y, 0, 0, 0, 0});
 		}
 }
 
-// Reads the live triplet: the one that has changed in the most frames
-// while the mouse was dragging (copies that only update now and then never
-// win), the most recently changed one until a drag has shown which. Switches
-// and sudden jumps are logged.
-static bool TripletValues(double& sx, double& px, double& py, bool dragging)
+// Reads the live triplet: of the copies that stay put while rotating, the
+// one that has changed in the most frames of pan and zoom drags (copies that
+// only update now and then never win), the most recently changed one until a
+// drag has shown which. Only pans and zooms count: a rotation changes other
+// values, which must not win the next pan. Switches and sudden jumps are
+// logged. mode: the drag's DragMode, or -1 when the mouse is not dragging.
+static bool TripletValues(double& sx, double& px, double& py, int mode)
 {
+	const bool dragging = mode == kDragMove || mode == kDragScale;
 	const DWORD now = GetTickCount();
 	int best = -1;
 	for (size_t i = 0; i < gTriplets.size(); ++i) {
@@ -1613,6 +1621,13 @@ static bool TripletValues(double& sx, double& px, double& py, bool dragging)
 		if (a == floor(a) && b == floor(b) && c == floor(c))
 			continue;
 		if (a != t.s.last || b != t.x.last || c != t.y.last) {
+			if (mode == kDragNone && a == t.s.last && (b != t.x.last || c != t.y.last) && t.rotFrames++ == 0) {
+				if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+					fprintf(f, "%lu triplet %zu moves when rotating: not the camera (x %.3f y %.3f, was %.3f %.3f)\n",
+						now, i, b, c, t.x.last, t.y.last);
+					fclose(f);
+				}
+			}
 			if (dragging) {
 				++t.dragFrames;
 				if (b != t.x.last || c != t.y.last)
@@ -1630,7 +1645,8 @@ static bool TripletValues(double& sx, double& px, double& py, bool dragging)
 		// Prefer the copy whose position follows drags (some copies only
 		// ever update the scale), then the busiest, then the latest.
 		const MemTriplet& o = gTriplets[best];
-		if (t.posFrames != o.posFrames ? t.posFrames > o.posFrames :
+		if ((t.rotFrames == 0) != (o.rotFrames == 0) ? t.rotFrames == 0 :
+				t.posFrames != o.posFrames ? t.posFrames > o.posFrames :
 				t.dragFrames != o.dragFrames ? t.dragFrames > o.dragFrames : static_cast<int>(t.changedAt - o.changedAt) > 0)
 			best = static_cast<int>(i);
 	}
@@ -1641,7 +1657,8 @@ static bool TripletValues(double& sx, double& px, double& py, bool dragging)
 		const MemTriplet& cand = gTriplets[best];
 		double a, b, c;
 		const bool curReadable = MemRead(cur.s, a) && MemRead(cur.x, b) && MemRead(cur.y, c);
-		if (curReadable && cand.posFrames <= cur.posFrames * 3 / 2 + 10 && !(cur.dragFrames == 0 && cand.dragFrames > 0))
+		if (curReadable && !(cur.rotFrames > 0 && cand.rotFrames == 0) &&
+				cand.posFrames <= cur.posFrames * 3 / 2 + 10 && !(cur.dragFrames == 0 && cand.dragFrames > 0))
 			best = gTripletInUse;
 	}
 	if (best < 0)
@@ -1731,7 +1748,7 @@ static void MemFollow()
 	const bool rotating = gGesture.active && gGesture.mode == kDragNone;
 	OverlayState& st = gOverlay;
 	double sx = st.ratio * gAnchorScale, px = st.px, py = st.py;
-	const bool read = !gTriplets.empty() ? TripletValues(sx, px, py, gGesture.active) :
+	const bool read = !gTriplets.empty() ? TripletValues(sx, px, py, gGesture.active ? gGesture.mode : -1) :
 		MemValue(gMemScale, sx) && MemValue(gMemX, px) && MemValue(gMemY, py);
 	if (read && sx > 0 && sx < 1e7 && fabs(px) < 1e6 && fabs(py) < 1e6) {
 		const double r = sx / gAnchorScale;
