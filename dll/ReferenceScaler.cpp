@@ -446,9 +446,341 @@ static int gKeyState = 0;     // 1 keying, 0 no capture exclusion, -1 exclusion 
 static int gFeedbackFrames = 0;
 static const UINT_PTR kTickTimer = 1;
 
+// Stage 3 (live navigation): ZScript cannot run while the mouse is dragging,
+// so the DLL predicts ZBrush's camera from the mouse. A low-level mouse hook
+// classifies each drag that starts over the canvas the way ZBrush does:
+//   left drag on the model                  sculpting, ignored
+//   left drag on the background, Alt held   move
+//   ... Alt released during the drag        scale
+//   right drag, Alt held                    move
+//   right drag, Ctrl held                   scale
+//   anything else                           rotate, ignored for now
+// Move shifts the model by panGain document pixels per document pixel of
+// mouse travel. Scale multiplies its size by exp(scaleY * dy + scaleX * dx)
+// for mouse travel (dx, dy) in screen pixels, about a pivot. The gains and
+// which pivot ZBrush uses are learned: after each drag, Live passes the exact
+// values from TransformGet to RSOverlaySet, which compares them with the
+// prediction (see Learn). What has been learned is kept in nav_model.txt.
+
+enum Pivot { kPivotDocCentre, kPivotCursor, kPivotModel, kPivotLearned, kPivotCount };
+
+struct NavModel {
+	double panGain = 1;
+	double scaleY = -0.005, scaleX = 0;
+	// Least-squares sums for log(scale) = scaleY * dy + scaleX * dx.
+	double syy = 0, sxx = 0, sxy = 0, sly = 0, slx = 0;
+	double pivotError[kPivotCount] = {0, 0, 0, 0};
+	int pivotSamples = 0;
+	double learnedX = 0, learnedY = 0;  // mean observed pivot, document pixels
+	int moves = 0, scales = 0;
+	int pivot() const
+	{
+		int best = kPivotModel;
+		for (int i = 0; i < kPivotCount; ++i)
+			if (pivotSamples > 0 && pivotError[i] < pivotError[best])
+				best = i;
+		return best;
+	}
+};
+
+enum DragMode { kDragNone, kDragMove, kDragScale, kDragIgnore };
+
+struct Gesture {
+	bool active = false;
+	bool done = false;         // released, waiting for Live's exact values
+	bool classify = false;     // overlay thread checks if it started on the model
+	bool right = false;
+	bool altSeen = false;
+	POINT down = {0, 0}, last = {0, 0};
+	int mode = kDragNone;
+	double ratio0 = 1, px0 = 0, py0 = 0;  // exact layout when the drag started
+	// The current move or scale segment: layout when it began, mouse travel
+	// since, and for scaling the document position where it began.
+	double baseRatio = 1, basePx = 0, basePy = 0;
+	double segX = 0, segY = 0;
+	double cursorX = 0, cursorY = 0;
+	// Totals for learning.
+	double moveX = 0, moveY = 0;          // screen pixels moved while moving
+	double scaleDx = 0, scaleDy = 0;      // screen pixels moved while scaling
+	int scaleSegments = 0;
+	bool movedAfterScale = false;
+	double scaleBasePx = 0, scaleBasePy = 0, scaleCursorX = 0, scaleCursorY = 0;  // first scale segment
+};
+
+static NavModel gNav;
+static double gLastErrorPos = 0, gLastErrorScale = 1;
+static Gesture gGesture;
+static HHOOK gMouseHook = nullptr, gKeyHook = nullptr;
+static int gHookEvents = 0;
+static volatile bool gAltDown = false, gCtrlDown = false;
+static std::vector<unsigned char> gKeyShare;  // per pixel, 0-255 share of magenta
+static int gKeyW = 0, gKeyH = 0;
+
+static std::wstring NavPath()
+{
+	return DllFolder() + L"nav_model.txt";
+}
+
+static void SaveNav()
+{
+	FILE* f = _wfopen(NavPath().c_str(), L"wb");
+	if (!f)
+		return;
+	const NavModel& n = gNav;
+	fprintf(f, "%.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d %.9g %.9g %d %d\n",
+		n.panGain, n.scaleY, n.scaleX, n.syy, n.sxx, n.sxy, n.sly, n.slx,
+		n.pivotError[0], n.pivotError[1], n.pivotError[2], n.pivotError[3], n.pivotSamples,
+		n.learnedX, n.learnedY, n.moves, n.scales);
+	fclose(f);
+}
+
+static void LoadNav()
+{
+	FILE* f = _wfopen(NavPath().c_str(), L"rb");
+	if (!f)
+		return;
+	NavModel n;
+	if (fscanf(f, "%lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %d %lf %lf %d %d",
+			&n.panGain, &n.scaleY, &n.scaleX, &n.syy, &n.sxx, &n.sxy, &n.sly, &n.slx,
+			&n.pivotError[0], &n.pivotError[1], &n.pivotError[2], &n.pivotError[3], &n.pivotSamples,
+			&n.learnedX, &n.learnedY, &n.moves, &n.scales) == 17)
+		gNav = n;
+	fclose(f);
+}
+
+// The pivot for a scale segment, in document pixels, for a model at
+// (px, py) when the segment began and a cursor at (cx, cy).
+static void PivotFor(int pivot, const OverlayState& st, double px, double py, double cursorX, double cursorY,
+	double& outX, double& outY)
+{
+	switch (pivot) {
+	case kPivotDocCentre: outX = st.docW * 0.5; outY = st.docH * 0.5; break;
+	case kPivotCursor: outX = cursorX; outY = cursorY; break;
+	case kPivotLearned: outX = gNav.learnedX; outY = gNav.learnedY; break;
+	default: outX = px; outY = py; break;
+	}
+}
+
+// Sets the overlay's layout to the prediction for the current segment.
+// Caller holds the lock.
+static void Predict()
+{
+	const Gesture& g = gGesture;
+	OverlayState& st = gOverlay;
+	if (g.mode == kDragMove) {
+		st.ratio = g.baseRatio;
+		st.px = g.basePx + gNav.panGain * g.segX / st.pixelsPerDoc;
+		st.py = g.basePy + gNav.panGain * g.segY / st.pixelsPerDoc;
+	} else if (g.mode == kDragScale) {
+		const double s = exp(gNav.scaleY * g.segY + gNav.scaleX * g.segX);
+		double cx, cy;
+		PivotFor(gNav.pivot(), st, g.basePx, g.basePy, g.cursorX, g.cursorY, cx, cy);
+		st.ratio = g.baseRatio * s;
+		st.px = cx + s * (g.basePx - cx);
+		st.py = cy + s * (g.basePy - cy);
+	}
+}
+
+static bool CursorOverOverlay(POINT pt, const OverlayState& st)
+{
+	return st.visible && pt.x >= st.screenX && pt.y >= st.screenY &&
+		pt.x < st.screenX + st.docW * st.pixelsPerDoc && pt.y < st.screenY + st.docH * st.pixelsPerDoc;
+}
+
+static bool ZBrushInFront()
+{
+	DWORD pid = 0;
+	GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+	return pid == GetCurrentProcessId();
+}
+
+static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
+{
+	if (code != HC_ACTION)
+		return CallNextHookEx(gMouseHook, code, wp, lp);
+	const MSLLHOOKSTRUCT* m = reinterpret_cast<const MSLLHOOKSTRUCT*>(lp);
+	++gHookEvents;
+	const bool alt = gAltDown, ctrl = gCtrlDown;
+	EnterCriticalSection(&gOverlayLock);
+	Gesture& g = gGesture;
+	switch (wp) {
+	case WM_LBUTTONDOWN:
+	case WM_RBUTTONDOWN:
+		if (!g.active && gKeyState == 1 && ZBrushInFront() && CursorOverOverlay(m->pt, gOverlay)) {
+			g = Gesture();
+			g.active = true;
+			g.right = wp == WM_RBUTTONDOWN;
+			g.classify = !g.right;
+			g.down = g.last = m->pt;
+			g.ratio0 = g.baseRatio = gOverlay.ratio;
+			g.px0 = g.basePx = gOverlay.px;
+			g.py0 = g.basePy = gOverlay.py;
+		}
+		break;
+	case WM_MOUSEMOVE:
+		if (g.active && g.mode != kDragIgnore) {
+			const double dx = m->pt.x - g.last.x, dy = m->pt.y - g.last.y;
+			g.last = m->pt;
+			if (alt)
+				g.altSeen = true;
+			int mode;
+			if (alt)
+				mode = kDragMove;
+			else if ((g.right && ctrl) || g.altSeen)
+				mode = kDragScale;
+			else
+				mode = kDragNone;  // rotation
+			if (mode != g.mode) {
+				// A new segment starts from the layout predicted so far.
+				g.mode = mode;
+				g.baseRatio = gOverlay.ratio;
+				g.basePx = gOverlay.px;
+				g.basePy = gOverlay.py;
+				g.segX = g.segY = 0;
+				g.cursorX = (m->pt.x - gOverlay.screenX) / gOverlay.pixelsPerDoc;
+				g.cursorY = (m->pt.y - gOverlay.screenY) / gOverlay.pixelsPerDoc;
+				if (mode == kDragScale && ++g.scaleSegments == 1) {
+					g.scaleBasePx = g.basePx;
+					g.scaleBasePy = g.basePy;
+					g.scaleCursorX = g.cursorX;
+					g.scaleCursorY = g.cursorY;
+				}
+			}
+			g.segX += dx;
+			g.segY += dy;
+			if (mode == kDragMove) {
+				g.moveX += dx;
+				g.moveY += dy;
+				if (g.scaleSegments > 0 && (dx != 0 || dy != 0))
+					g.movedAfterScale = true;
+			} else if (mode == kDragScale) {
+				g.scaleDx += dx;
+				g.scaleDy += dy;
+			}
+			Predict();
+		}
+		break;
+	case WM_LBUTTONUP:
+	case WM_RBUTTONUP:
+		if (g.active) {
+			g.active = false;
+			g.done = g.mode != kDragIgnore && (g.moveX != 0 || g.moveY != 0 || g.scaleSegments > 0);
+		}
+		break;
+	}
+	LeaveCriticalSection(&gOverlayLock);
+	return CallNextHookEx(gMouseHook, code, wp, lp);
+}
+
+// Called by RSOverlaySet with Live's exact values after a drag: compares
+// them with what the drag predicted and updates the navigation model.
+// Caller holds the lock.
+static void Learn(double ratio, double px, double py)
+{
+	Gesture& g = gGesture;
+	if (!g.done)
+		return;
+	g.done = false;
+	const double k = gOverlay.pixelsPerDoc;
+	const double s = ratio / g.ratio0;
+	if (g.scaleSegments == 0) {
+		// Move only: gain along the direction moved.
+		const double mx = g.moveX / k, my = g.moveY / k, len2 = mx * mx + my * my;
+		if (len2 * k * k > 400 && fabs(s - 1) < 0.01) {
+			const double gain = ((px - g.px0) * mx + (py - g.py0) * my) / len2;
+			if (fabs(gain) > 0.05 && fabs(gain) < 20) {
+				++gNav.moves;
+				const double w = gNav.moves < 5 ? 1.0 / gNav.moves : 0.2;
+				gNav.panGain += w * (gain - gNav.panGain);
+			}
+		}
+	} else if (g.scaleSegments == 1 && s > 0.01 && s < 100 && fabs(g.scaleDx) + fabs(g.scaleDy) > 20) {
+		// Scale gain: least squares with a weak prior keeping scaleX near 0.
+		const double l = log(s);
+		gNav.syy += g.scaleDy * g.scaleDy;
+		gNav.sxx += g.scaleDx * g.scaleDx;
+		gNav.sxy += g.scaleDx * g.scaleDy;
+		gNav.sly += l * g.scaleDy;
+		gNav.slx += l * g.scaleDx;
+		const double ridge = 100;
+		const double a = gNav.syy + 1e-6, b = gNav.sxy, d = gNav.sxx + ridge;
+		const double det = a * d - b * b;
+		if (det > 0) {
+			gNav.scaleY = (gNav.sly * d - gNav.slx * b) / det;
+			gNav.scaleX = (gNav.slx * a - gNav.sly * b) / det;
+		}
+		++gNav.scales;
+		// Pivot: the fixed point of the observed scale, from where the model
+		// was when scaling began. Only from drags with no move after it.
+		if (fabs(s - 1) > 0.03 && !g.movedAfterScale) {
+			const double bx = g.scaleBasePx, by = g.scaleBasePy;
+			for (int i = 0; i < kPivotCount; ++i) {
+				double hx, hy;
+				PivotFor(i, gOverlay, bx, by, g.scaleCursorX, g.scaleCursorY, hx, hy);
+				// Error of the position this pivot would have predicted (the
+				// learned point as it stood before this drag).
+				const double ex = hx + s * (bx - hx) - px, ey = hy + s * (by - hy) - py;
+				gNav.pivotError[i] += sqrt(ex * ex + ey * ey);
+			}
+			const double cx = (px - s * bx) / (1 - s), cy = (py - s * by) / (1 - s);
+			gNav.learnedX += (cx - gNav.learnedX) / (gNav.pivotSamples + 1);
+			gNav.learnedY += (cy - gNav.learnedY) / (gNav.pivotSamples + 1);
+			++gNav.pivotSamples;
+		}
+	}
+	SaveNav();
+}
+
+// Tracks Alt and Ctrl as the mouse hook sees events, in order.
+static LRESULT CALLBACK KeyHook(int code, WPARAM wp, LPARAM lp)
+{
+	if (code == HC_ACTION) {
+		const KBDLLHOOKSTRUCT* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
+		const bool down = wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN;
+		switch (k->vkCode) {
+		case VK_MENU: case VK_LMENU: case VK_RMENU: gAltDown = down; break;
+		case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: gCtrlDown = down; break;
+		}
+	}
+	return CallNextHookEx(gKeyHook, code, wp, lp);
+}
+
+#ifdef RS_TEST_HIDE_CAPTURE
+// Test builds: text "event x y alt ctrl" feeds one input event to the hooks
+// (event 0 move, 1 left down, 2 left up, 3 right down, 4 right up).
+ZFUNC RSTestInput(char* text, double, char*, int, char*, int, char**)
+{
+	int e, x, y, alt, ctrl;
+	if (!text || sscanf(text, "%d %d %d %d %d", &e, &x, &y, &alt, &ctrl) != 5)
+		return -1;
+	gAltDown = alt != 0;
+	gCtrlDown = ctrl != 0;
+	static const WPARAM kinds[] = {WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP};
+	MSLLHOOKSTRUCT m = {};
+	m.pt.x = x;
+	m.pt.y = y;
+	MouseHook(HC_ACTION, kinds[e], reinterpret_cast<LPARAM>(&m));
+	return 1;
+}
+#endif
+
+// The hooks run on their own thread so the overlay's redraws never delay the
+// system's input.
+static DWORD WINAPI HookThread(LPVOID)
+{
+	PhysicalPixels physical;
+	gKeyHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyHook, GetModuleHandleW(nullptr), 0);
+	gMouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0);
+	MSG msg;
+	while (GetMessageW(&msg, nullptr, 0, 0) > 0)
+		DispatchMessageW(&msg);
+	return 0;
+}
+
 // Draws the reference for the current state into gRefLayer (premultiplied,
-// transparent outside the image). Returns false if there is nothing to show.
-static bool BuildRefLayer(const OverlayState& st)
+// transparent outside the image). fast uses plain bilinear filtering, for
+// redraws on every tick of a drag. Returns false if there is nothing to show.
+static bool BuildRefLayer(const OverlayState& st, bool fast = false)
 {
 	if (!st.visible || !LoadSavedImage() || st.docW < 1 || st.docH < 1)
 		return false;
@@ -459,7 +791,7 @@ static bool BuildRefLayer(const OverlayState& st)
 	Gdiplus::Bitmap target(w, h, w * 4, PixelFormat32bppPARGB, gRefLayer.bits);
 	Gdiplus::Graphics g(&target);
 	g.Clear(Gdiplus::Color(0, 0, 0, 0));
-	g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+	g.SetInterpolationMode(fast ? Gdiplus::InterpolationModeBilinear : Gdiplus::InterpolationModeHighQualityBilinear);
 	g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
 	const double imgW = gImage->GetWidth(), imgH = gImage->GetHeight();
 	const double fit = (st.docW / imgW < st.docH / imgH) ? st.docW / imgW : st.docH / imgH;
@@ -484,6 +816,10 @@ static void Present(HWND wnd, const OverlayState& st, Buffer32& buf, BYTE alpha)
 		ShowWindow(wnd, SW_SHOWNOACTIVATE);
 }
 
+// Below this share of magenta (out of 255) a pixel counts as model. ZBrush
+// tints some model pixels slightly towards the background colour.
+static const int kModelBelow = 70;
+
 // Captures the screen under the overlay and composites the reference into
 // the magenta parts. opacity 0-255 scales the reference (black behind it).
 static void Composite(HWND wnd, const OverlayState& st)
@@ -499,12 +835,16 @@ static void Composite(HWND wnd, const OverlayState& st)
 	ReleaseDC(nullptr, screen);
 	GdiFlush();
 
+	const size_t n = static_cast<size_t>(w) * h;
+	gKeyShare.resize(n);
+	gKeyW = w;
+	gKeyH = h;
 	const int op = st.alpha;
 	const unsigned char* cap = gCapture.bits;
 	const unsigned char* ref = gRefLayer.bits;
 	unsigned char* out = gOutput.bits;
 	size_t opaque = 0, echoed = 0;
-	for (size_t i = 0, n = static_cast<size_t>(w) * h; i < n; ++i, cap += 4, ref += 4, out += 4) {
+	for (size_t i = 0; i < n; ++i, cap += 4, ref += 4, out += 4) {
 		const int b = cap[0], g = cap[1], r = cap[2];
 		// The overlay's last output showing up in the capture means it is
 		// not excluded from capture.
@@ -513,19 +853,19 @@ static void Composite(HWND wnd, const OverlayState& st)
 			if (out[0] == b && out[1] == g && out[2] == r)
 				++echoed;
 		}
-		// Share of magenta in this pixel, 0-256: blending any grey with
-		// magenta (255, 0, 255) by t raises R and B above G by t * 255.
-		const int m = r < b ? r : b;
-		int t = m > g ? ((m - g) << 8) / 255 : 0;
-		if (t < 26) {
+		// Share of magenta: blending any grey with magenta (255, 0, 255) by t
+		// raises R and B above G by t * 255.
+		const int mn = r < b ? r : b;
+		int t = mn > g ? mn - g : 0;
+		gKeyShare[i] = static_cast<unsigned char>(t);
+		if (t < kModelBelow) {
 			out[0] = out[1] = out[2] = out[3] = 0;
 			continue;
 		}
-		if (t > 230)
-			t = 256;
-		// Replace that share of magenta (255, 0, 255) with the reference.
+		// Replace that share of magenta with the reference.
+		t = t > 230 ? 256 : (t << 8) / 255;
 		const int rb = ref[0] * op / 255, rg = ref[1] * op / 255, rr = ref[2] * op / 255;
-		int ob = b + (t * (rb - 255) >> 8), og = g + (t * rg >> 8), orr = r + (t * (rr - 255) >> 8);
+		const int ob = b + (t * (rb - 255) >> 8), og = g + (t * rg >> 8), orr = r + (t * (rr - 255) >> 8);
 		out[0] = static_cast<unsigned char>(ob < 0 ? 0 : ob > 255 ? 255 : ob);
 		out[1] = static_cast<unsigned char>(og < 0 ? 0 : og > 255 ? 255 : og);
 		out[2] = static_cast<unsigned char>(orr < 0 ? 0 : orr > 255 ? 255 : orr);
@@ -540,13 +880,34 @@ static void Composite(HWND wnd, const OverlayState& st)
 	Present(wnd, st, gOutput, 255);
 }
 
+// A left drag that starts on the model is sculpting, not navigation. Decided
+// from the last capture, on the overlay thread that owns it.
+static void ClassifyGesture()
+{
+	EnterCriticalSection(&gOverlayLock);
+	Gesture& g = gGesture;
+	if (g.classify) {
+		g.classify = false;
+		const int x = static_cast<int>(g.down.x - gOverlay.screenX), y = static_cast<int>(g.down.y - gOverlay.screenY);
+		if (x >= 0 && y >= 0 && x < gKeyW && y < gKeyH && gKeyShare[static_cast<size_t>(y) * gKeyW + x] < kModelBelow) {
+			// Undo anything predicted before the drag was classified.
+			g.mode = kDragIgnore;
+			g.done = false;
+			gOverlay.ratio = g.ratio0;
+			gOverlay.px = g.px0;
+			gOverlay.py = g.py0;
+		}
+	}
+	LeaveCriticalSection(&gOverlayLock);
+}
+
 // Rebuilds the reference layer after a state change, then draws.
 static void OverlayRedraw(HWND wnd)
 {
 	EnterCriticalSection(&gOverlayLock);
 	const OverlayState st = gOverlay;
-	const bool show = BuildRefLayer(st);
 	LeaveCriticalSection(&gOverlayLock);
+	const bool show = BuildRefLayer(st);
 	if (!show) {
 		ShowWindow(wnd, SW_HIDE);
 		return;
@@ -557,16 +918,25 @@ static void OverlayRedraw(HWND wnd)
 		Present(wnd, st, gRefLayer, static_cast<BYTE>(st.alpha));
 }
 
-// Timer tick: while keying, recomposite with a fresh capture.
+// Timer tick: while keying, follows any drag prediction and recomposites
+// with a fresh capture.
 static void OverlayTick(HWND wnd)
 {
+	static double lastRatio = 0, lastPx = 0, lastPy = 0;
 	if (gKeyState != 1)
 		return;
+	ClassifyGesture();
 	EnterCriticalSection(&gOverlayLock);
 	const OverlayState st = gOverlay;
 	LeaveCriticalSection(&gOverlayLock);
 	if (!st.visible || !gOutput.dc)
 		return;
+	if (st.ratio != lastRatio || st.px != lastPx || st.py != lastPy) {
+		lastRatio = st.ratio;
+		lastPx = st.px;
+		lastPy = st.py;
+		BuildRefLayer(st, true);
+	}
 	Composite(wnd, st);
 	if (gKeyState != 1)
 		OverlayRedraw(wnd);
@@ -618,8 +988,11 @@ static DWORD WINAPI OverlayThread(LPVOID ready)
 #else
 	gKeyState = gOverlayWnd && SetWindowDisplayAffinity(gOverlayWnd, 0x11) ? 1 : 0;
 #endif
-	if (gOverlayWnd)
+	if (gOverlayWnd) {
+		LoadNav();
 		SetTimer(gOverlayWnd, kTickTimer, 40, nullptr);
+		CloseHandle(CreateThread(nullptr, 0, HookThread, nullptr, 0, nullptr));
+	}
 	SetEvent(static_cast<HANDLE>(ready));
 	MSG msg;
 	while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -1006,7 +1379,14 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 // screen pixels per document pixel (x1000), "3" match strength, from the
 // last RSOverlayStart; "4" 1 if the overlay is showing, else 0; "5" 1 if the
 // model is keyed in front (capture exclusion works), 0 if Windows has no
-// capture exclusion, -1 if it did not work.
+// capture exclusion, -1 if it did not work. Navigation model: "6" pan gain,
+// "7" and "8" scale per 1000 px of vertical and horizontal travel, "9" pivot
+// (0 document centre, 1 cursor, 2 model centre, 3 learned point), "10" and
+// "11" moves and scales learned from, "12" the last drag's predicted position
+// error in document pixels, "13" its predicted / exact scale. "14" to "16"
+// the overlay's current ratio, x and y (including any drag prediction). "17"
+// mouse events seen, "18" the last drag's mode (0 rotate, 1 move, 2 scale,
+// 3 sculpt) + 10 x scale segments + 100 while dragging.
 ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 {
 	const int which = text ? atoi(text) : -1;
@@ -1017,12 +1397,27 @@ ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 	case 3: return static_cast<float>(floor(gCalibration.percent));
 	case 4: return gOverlayWnd && gOverlay.visible ? 1 : 0;
 	case 5: return static_cast<float>(gKeyState);
+	case 6: return static_cast<float>(gNav.panGain);
+	case 7: return static_cast<float>(gNav.scaleY * 1000);
+	case 8: return static_cast<float>(gNav.scaleX * 1000);
+	case 9: return static_cast<float>(gNav.pivot());
+	case 10: return static_cast<float>(gNav.moves);
+	case 11: return static_cast<float>(gNav.scales);
+	case 12: return static_cast<float>(gLastErrorPos);
+	case 13: return static_cast<float>(gLastErrorScale);
+	case 14: return static_cast<float>(gOverlay.ratio);
+	case 15: return static_cast<float>(gOverlay.px);
+	case 16: return static_cast<float>(gOverlay.py);
+	case 17: return static_cast<float>(gHookEvents);
+	case 18: return static_cast<float>(gGesture.mode + 10 * gGesture.scaleSegments + 100 * gGesture.active);
 	}
 	return -1;
 }
 
-// text: "ratio px py anchorX anchorY", as for RSRender. Returns 1, -1 for bad
-// arguments, -2 if the overlay is not running.
+// text: "ratio px py anchorX anchorY", as for RSRender. Also how the
+// navigation model learns: values set right after a drag are the exact
+// result of that drag. Returns 1, -1 for bad arguments, -2 if the overlay is
+// not running.
 ZFUNC RSOverlaySet(char* text, double, char*, int, char*, int, char**)
 {
 	double r, px, py, ax, ay;
@@ -1031,6 +1426,12 @@ ZFUNC RSOverlaySet(char* text, double, char*, int, char*, int, char**)
 	if (!gOverlayWnd)
 		return -2;
 	EnterCriticalSection(&gOverlayLock);
+	if (gGesture.done) {
+		// How far the drag prediction was from the exact values.
+		gLastErrorPos = sqrt((gOverlay.px - px) * (gOverlay.px - px) + (gOverlay.py - py) * (gOverlay.py - py));
+		gLastErrorScale = gOverlay.ratio / r;
+	}
+	Learn(r, px, py);
 	gOverlay.ratio = r;
 	gOverlay.px = px;
 	gOverlay.py = py;
