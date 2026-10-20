@@ -167,7 +167,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 60;
+static const int kDllBuild = 61;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1560,28 +1560,35 @@ static void MemWeedOut(MemTrack& tr)
 struct MemTriplet {
 	MemCand s, x, y;
 	DWORD changedAt;
+	int dragFrames;  // frames in which it changed while the mouse was dragging
 };
+static int gTripletInUse = -1;
 static std::vector<MemTriplet> gTriplets;
 
 static void BuildTriplets()
 {
 	gTriplets.clear();
+	gTripletInUse = -1;
 	for (const MemCand& x : gMemX.cands)
 		for (const MemCand& y : gMemY.cands) {
 			if (y.isDouble != x.isDouble || y.addr != x.addr + (x.isDouble ? 8 : 4))
 				continue;
 			for (const MemCand& sc : gMemScale.cands)
 				if (sc.isDouble == x.isDouble && (sc.addr > x.addr ? sc.addr - x.addr : x.addr - sc.addr) <= 1024)
-					gTriplets.push_back({sc, x, y, 0});
+					gTriplets.push_back({sc, x, y, 0, 0});
 		}
 }
 
-// Reads the most recently changed triplet. Returns false if none can be read.
-static bool TripletValues(double& sx, double& px, double& py)
+// Reads the live triplet: the one that has changed in the most frames
+// while the mouse was dragging (copies that only update now and then never
+// win), the most recently changed one until a drag has shown which. Switches
+// and sudden jumps are logged.
+static bool TripletValues(double& sx, double& px, double& py, bool dragging)
 {
 	const DWORD now = GetTickCount();
-	MemTriplet* best = nullptr;
-	for (MemTriplet& t : gTriplets) {
+	int best = -1;
+	for (size_t i = 0; i < gTriplets.size(); ++i) {
+		MemTriplet& t = gTriplets[i];
 		double a, b, c;
 		if (!MemRead(t.s, a) || !MemRead(t.x, b) || !MemRead(t.y, c))
 			continue;
@@ -1590,15 +1597,32 @@ static bool TripletValues(double& sx, double& px, double& py)
 			t.x.last = b;
 			t.y.last = c;
 			t.changedAt = now;
+			if (dragging)
+				++t.dragFrames;
 		}
-		if (!best || static_cast<int>(t.changedAt - best->changedAt) > 0)
-			best = &t;
+		if (best < 0) {
+			best = static_cast<int>(i);
+			continue;
+		}
+		const MemTriplet& o = gTriplets[best];
+		if (t.dragFrames > o.dragFrames || (t.dragFrames == o.dragFrames && static_cast<int>(t.changedAt - o.changedAt) > 0))
+			best = static_cast<int>(i);
 	}
-	if (!best)
+	if (best < 0)
 		return false;
-	sx = best->s.last;
-	px = best->x.last;
-	py = best->y.last;
+	const MemTriplet& t = gTriplets[best];
+	const bool jump = sx > 0 && (fabs(t.s.last / sx - 1) > 0.3 || fabs(t.x.last - px) > 200 || fabs(t.y.last - py) > 200);
+	if (best != gTripletInUse || jump) {
+		if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			fprintf(f, "%lu read triplet %d of %zu (drag frames %d)%s: scale %.4f x %.3f y %.3f, was %.4f %.3f %.3f\n",
+				now, best, gTriplets.size(), t.dragFrames, jump ? " JUMP" : "", t.s.last, t.x.last, t.y.last, sx, px, py);
+			fclose(f);
+		}
+		gTripletInUse = best;
+	}
+	sx = t.s.last;
+	px = t.x.last;
+	py = t.y.last;
 	return true;
 }
 
@@ -1654,7 +1678,7 @@ static void MemFollow()
 	const bool rotating = gGesture.active && gGesture.mode == kDragNone;
 	OverlayState& st = gOverlay;
 	double sx = st.ratio * gAnchorScale, px = st.px, py = st.py;
-	const bool read = !gTriplets.empty() ? TripletValues(sx, px, py) :
+	const bool read = !gTriplets.empty() ? TripletValues(sx, px, py, gGesture.active) :
 		MemValue(gMemScale, sx) && MemValue(gMemX, px) && MemValue(gMemY, py);
 	if (read && sx > 0 && sx < 1e7 && fabs(px) < 1e6 && fabs(py) < 1e6) {
 		const double r = sx / gAnchorScale;
@@ -2319,6 +2343,31 @@ ZFUNC RSMemProbe(char* text, double, char*, int, char*, int, char**)
 	const bool locked = gMemLocked;
 	LeaveCriticalSection(&gOverlayLock);
 	return locked ? 1 : 0;
+}
+
+// Saves what the overlay last captured (snap_capture.png, the canvas as
+// ZBrush drew it) and what it showed (snap_overlay.png) next to the DLL.
+// Returns 1, or 0 if the overlay has not drawn anything yet.
+ZFUNC RSSnapshot(char*, double, char*, int, char*, int, char**)
+{
+	if (!gOverlayLockReady || !gCapture.bits || !gOutput.bits)
+		return 0;
+	StartGdiplus();
+	EnterCriticalSection(&gOverlayLock);
+	Rgb cap, out;
+	cap.w = out.w = gCapture.w;
+	cap.h = out.h = gCapture.h;
+	cap.px.resize(static_cast<size_t>(cap.w) * cap.h * 3);
+	out.px.resize(cap.px.size());
+	for (size_t i = 0, n = static_cast<size_t>(cap.w) * cap.h; i < n; ++i)
+		for (int c = 0; c < 3; ++c) {
+			cap.px[i * 3 + c] = gCapture.bits[i * 4 + c];
+			out.px[i * 3 + c] = gOutput.bits[i * 4 + c];
+		}
+	LeaveCriticalSection(&gOverlayLock);
+	SaveRgb(DllFolder() + L"snap_capture.png", cap);
+	SaveRgb(DllFolder() + L"snap_overlay.png", out);
+	return 1;
 }
 
 // Clears the rotation offset (the view is back at the anchored rotation).
