@@ -18,6 +18,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <cmath>
 
 #define ZFUNC extern "C" __declspec(dllexport) float
@@ -129,7 +130,7 @@ ZFUNC RSLog(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 57;
+static const int kDllBuild = 58;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1319,14 +1320,21 @@ static bool MemRead(const MemCand& c, double& v)
 	return v == v;  // not NaN
 }
 
-// The script passes values with about three decimals.
+// The script passes values rounded to two or three decimals.
 static bool MemMatch(double v, double target)
 {
-	return fabs(v - target) <= 0.0011 + fabs(target) * 2e-6;
+	return fabs(v - target) <= 0.0051 + fabs(target) * 1e-5;
 }
 
+// Last scan: MB scanned, x matches, x-y pairs, scales near pairs, ms.
+static double gScanStats[5] = {0, 0, 0, 0, 0};
+
+// Scans for x with y right after it (as float or double pairs), then for the
+// scale within 1 KB of each pair. Scanning for the scale on its own finds too
+// many matches when it is a common number such as 1.
 static void MemScan(double sx, double px, double py)
 {
+	const DWORD t0 = GetTickCount();
 	MemTrack* tracks[3] = {&gMemScale, &gMemX, &gMemY};
 	const double targets[3] = {sx, px, py};
 	for (int t = 0; t < 3; ++t) {
@@ -1335,7 +1343,7 @@ static void MemScan(double sx, double px, double py)
 		tracks[t]->narrowings = 0;
 		tracks[t]->tooMany = false;
 	}
-	const size_t kMaxCands = 4000000;
+	const size_t kMaxPairs = 200000;
 	HMODULE self = nullptr;
 	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 		reinterpret_cast<LPCWSTR>(&MemScan), &self);
@@ -1343,6 +1351,8 @@ static void MemScan(double sx, double px, double py)
 	const uintptr_t stackLow = reinterpret_cast<uintptr_t>(tib->StackLimit) & ~static_cast<uintptr_t>(0xfffff);
 	const uintptr_t stackHigh = reinterpret_cast<uintptr_t>(tib->StackBase);
 	std::vector<unsigned char> buf(1 << 22);
+	const uintptr_t bufLo = reinterpret_cast<uintptr_t>(buf.data()), bufHi = bufLo + buf.size();
+	size_t scanned = 0, rawX = 0, rawY = 0;
 	MEMORY_BASIC_INFORMATION mbi;
 	uintptr_t addr = 0;
 	while (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == sizeof(mbi)) {
@@ -1351,48 +1361,96 @@ static void MemScan(double sx, double px, double py)
 		const DWORD prot = mbi.Protect & 0xff;
 		const bool writable = prot == PAGE_READWRITE || prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READWRITE;
 		if (mbi.State == MEM_COMMIT && writable && !(mbi.Protect & PAGE_GUARD) &&
-			(mbi.Type == MEM_PRIVATE || mbi.Type == MEM_IMAGE) && mbi.RegionSize <= (512u << 20) &&
+			(mbi.Type == MEM_PRIVATE || mbi.Type == MEM_IMAGE) &&
 			// Not this DLL's own copies of the values, nor the calling thread's
 			// stack (it holds the values being reported right now).
 			mbi.AllocationBase != self && !(stackLow < next && base < stackHigh) &&
 			!OwnThreadStack(base, next)) {
-			for (uintptr_t chunk = base; chunk < next; chunk += buf.size()) {
+			// Chunks overlap by 8 bytes so a pair across a boundary is found.
+			for (uintptr_t chunk = base; chunk < next; chunk += buf.size() - 8) {
 				const size_t len = next - chunk < buf.size() ? next - chunk : buf.size();
 				SIZE_T got = 0;
+				if (chunk < bufHi && bufLo < chunk + len)
+					continue;  // the scan's own copy of memory
 				if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(chunk), buf.data(), len, &got))
 					continue;
-				const uintptr_t bufLo = reinterpret_cast<uintptr_t>(buf.data()), bufHi = bufLo + buf.size();
-				if (chunk < bufHi && bufLo < chunk + got)
-					continue;  // the scan's own copy of memory
-				for (size_t i = 0; i + 4 <= got; i += 4) {
-					float f;
+				scanned += got;
+				for (size_t i = 0; i + 8 <= got; i += 4) {
+					float f, g;
 					memcpy(&f, &buf[i], 4);
-					const double v = f;
-					double d = 0;
-					const bool haveD = (i % 8 == 0) && i + 8 <= got;
-					if (haveD)
-						memcpy(&d, &buf[i], 8);
-					for (int t = 0; t < 3; ++t) {
-						MemTrack& tr = *tracks[t];
-						if (tr.tooMany)
-							continue;
-						if (MemMatch(v, targets[t]))
-							tr.cands.push_back({chunk + i, false, v, 0});
-						if (haveD && MemMatch(d, targets[t]))
-							tr.cands.push_back({chunk + i, true, d, 0});
-						if (tr.cands.size() > kMaxCands) {
-							tr.tooMany = true;
-							tr.cands.clear();
+					memcpy(&g, &buf[i + 4], 4);
+					if (MemMatch(f, px)) {
+						++rawX;
+						if (MemMatch(g, py) && gMemX.cands.size() < kMaxPairs) {
+							gMemX.cands.push_back({chunk + i, false, f, 0});
+							gMemY.cands.push_back({chunk + i + 4, false, g, 0});
 						}
 					}
+					if (MemMatch(f, py))
+						++rawY;
+					if (i % 8 == 0 && i + 16 <= got) {
+						double d, e;
+						memcpy(&d, &buf[i], 8);
+						memcpy(&e, &buf[i + 8], 8);
+						if (MemMatch(d, px)) {
+							++rawX;
+							if (MemMatch(e, py) && gMemX.cands.size() < kMaxPairs) {
+								gMemX.cands.push_back({chunk + i, true, d, 0});
+								gMemY.cands.push_back({chunk + i + 8, true, e, 0});
+							}
+						}
+						if (MemMatch(d, py))
+							++rawY;
+					}
 				}
+				if (len < buf.size())
+					break;
 			}
 		}
 		if (next <= addr)
 			break;
 		addr = next;
 	}
+	// The scale near each pair, of the same type.
+	std::vector<unsigned char> win(2048 + 16);
+	for (const MemCand& x : gMemX.cands) {
+		const uintptr_t lo = x.addr > 1024 ? x.addr - 1024 : 0;
+		SIZE_T got = 0;
+		if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(lo), win.data(), win.size(), &got))
+			continue;
+		const size_t step = x.isDouble ? 8 : 4;
+		for (size_t i = (x.addr - lo) % step; i + step <= got; i += step) {
+			double v;
+			if (x.isDouble) {
+				memcpy(&v, &win[i], 8);
+			} else {
+				float f;
+				memcpy(&f, &win[i], 4);
+				v = f;
+			}
+			if (MemMatch(v, sx) && lo + i != x.addr) {
+				gMemScale.cands.push_back({lo + i, x.isDouble, v, 0});
+				if (gMemScale.cands.size() > kMaxPairs * 4)
+					break;
+			}
+		}
+	}
+	// One scale location can be near several pairs.
+	std::sort(gMemScale.cands.begin(), gMemScale.cands.end(),
+		[](const MemCand& a, const MemCand& b) { return a.addr < b.addr || (a.addr == b.addr && a.isDouble < b.isDouble); });
+	gMemScale.cands.erase(std::unique(gMemScale.cands.begin(), gMemScale.cands.end(),
+		[](const MemCand& a, const MemCand& b) { return a.addr == b.addr && a.isDouble == b.isDouble; }), gMemScale.cands.end());
 	gMemScanned = true;
+	gScanStats[0] = static_cast<double>(scanned >> 20);
+	gScanStats[1] = static_cast<double>(rawX);
+	gScanStats[2] = static_cast<double>(gMemX.cands.size());
+	gScanStats[3] = static_cast<double>(gMemScale.cands.size());
+	gScanStats[4] = static_cast<double>(GetTickCount() - t0);
+	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu scan for scale %.4f x %.4f y %.4f: %zu MB in %lu ms, x matches %zu, y matches %zu, pairs %zu, scales near %zu\n",
+			GetTickCount(), sx, px, py, scanned >> 20, GetTickCount() - t0, rawX, rawY, gMemX.cands.size(), gMemScale.cands.size());
+		fclose(f);
+	}
 }
 
 // Keeps the candidates that now hold target. Returns false if none are left.
@@ -2099,7 +2157,8 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 // clears it; "20" capture method (1 desktop duplication, 0 BitBlt); "21"
 // overlay frames per second; "22" 1 if ZBrush's values are read from
 // memory, "23" to "25" memory candidates left for scale, x and y, "26" how
-// many of them sit together the way ZBrush stores a view.
+// many of them sit together the way ZBrush stores a view; "27" to "31" the
+// last scan's MB scanned, x matches, x-y pairs, scales near pairs and ms.
 ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 {
 	const int which = text ? atoi(text) : -1;
@@ -2134,6 +2193,7 @@ ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 	case 24: return static_cast<float>(gMemX.cands.size());
 	case 25: return static_cast<float>(gMemY.cands.size());
 	case 26: return static_cast<float>(gTriplets.size());
+	case 27: case 28: case 29: case 30: case 31: return static_cast<float>(gScanStats[which - 27]);
 	case 18: return static_cast<float>(gGesture.mode + 10 * gGesture.scaleSegments + 100 * gGesture.active);
 	}
 	return -1;
