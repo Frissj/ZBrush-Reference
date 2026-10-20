@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 84;
+static const int kDllBuild = 85;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1238,8 +1238,8 @@ static const double kPanelShare = 0.35;  // of the canvas width
 static int gViewX0 = 0, gViewY0 = 0, gViewX1 = 0, gViewY1 = 0;
 static bool gRedrawPending = false;
 // ZBrush's view gizmo (the head and axes) in the viewport's top right
-// corner, which a panel on the right starts below: its bottom in overlay
-// pixels, 0 until seen.
+// corner, which outlines leave out: its bottom in overlay pixels, 0 until
+// seen.
 static int gGizmoBottom = 0;
 
 static void ViewportRect(int w, int h, int& x0, int& y0, int& x1, int& y1)
@@ -1263,8 +1263,8 @@ static void PanelRect(int w, int h, int& x0, int& y0, int& pw, int& ph)
 	ViewportRect(w, h, vx0, vy0, vx1, vy1);
 	pw = static_cast<int>((vx1 - vx0) * kPanelShare + 0.5);
 	x0 = gPanelLeft ? vx0 : vx1 - pw;
-	y0 = !gPanelLeft && gGizmoBottom > vy0 && gGizmoBottom < vy1 - 50 ? gGizmoBottom : vy0;
-	ph = vy1 - y0;
+	y0 = vy0;
+	ph = vy1 - vy0;
 }
 
 // Layout and image of a view slot for the panel, from the current camera.
@@ -1671,12 +1671,10 @@ static void RefreshUiRects()
 	}
 }
 
-// ZBrush's menus and popups may be drawn inside its own window, over the
-// canvas, where no window list shows them. ZBrush's cursor tells: over the
-// canvas it is the canvas cursor (learned as the one most seen over the
-// canvas outside the panel); over a menu or popup it is another. While the
-// cursor is over the panel and is not the canvas cursor, the panel steps
-// aside and ZBrush shows. Changes are logged.
+// While the cursor is over the panel, the panel steps aside and ZBrush
+// shows under it (its view gizmo, menus drawn inside its window). Cursor
+// changes are logged (the canvas cursor is the one most seen over the
+// canvas outside the panel).
 static bool gPanelAside = false;
 
 static bool UpdatePanelAside(const OverlayState& st)
@@ -1707,7 +1705,9 @@ static bool UpdatePanelAside(const OverlayState& st)
 		for (const auto& c : seen)
 			if (c.second > best) { best = c.second; canvas = c.first; }
 	}
-	if (onPanel && canvas && cur != canvas)
+	// Over the panel, ZBrush shows (the view gizmo, menus): the panel is
+	// see-through until the cursor leaves it.
+	if (onPanel)
 		gPanelAside = true;
 	if (cur != logged && onCanvas) {
 		logged = cur;
@@ -1807,9 +1807,6 @@ static void Composite(HWND wnd, const OverlayState& st)
 			}
 			if (next != gGizmoBottom) {
 				gGizmoBottom = next;
-				EnterCriticalSection(&gOverlayLock);
-				gRedrawPending = true;
-				LeaveCriticalSection(&gOverlayLock);
 				if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
 					fprintf(f, "%lu view gizmo down to %d (corner %d %d to %d %d)\n", GetTickCount(), gGizmoBottom, cx0, cy0, cx1, cy1);
 					fclose(f);
