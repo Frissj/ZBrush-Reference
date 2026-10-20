@@ -130,7 +130,7 @@ ZFUNC RSLog(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 58;
+static const int kDllBuild = 59;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1146,6 +1146,7 @@ struct Duplicator {
 };
 
 static Duplicator gDup;
+static double gMagentaShare = 0;  // percent of the overlay that was key colour
 static int gCaptureMethod = 0;  // 1 desktop duplication, 0 BitBlt
 static double gFps = 0;
 
@@ -1202,6 +1203,7 @@ static void Composite(HWND wnd, const OverlayState& st)
 	const unsigned char* cap = gCapture.bits;
 	const unsigned char* ref = gRefLayer.bits;
 	unsigned char* out = gOutput.bits;
+	size_t magenta = 0;
 	for (size_t i = 0; i < n; ++i, cap += 4, ref += 4, out += 4) {
 		const int b = cap[0], g = cap[1], r = cap[2];
 		// Share of magenta: blending any grey with magenta (255, 0, 255) by t
@@ -1216,12 +1218,15 @@ static void Composite(HWND wnd, const OverlayState& st)
 			out[2] = static_cast<unsigned char>(r);
 			continue;
 		}
+		if (t > 200)
+			++magenta;
 		t = t > 230 ? 256 : (t << 8) / 255;
 		const int ob = b + (t * (ref[0] - 255) >> 8), og = g + (t * ref[1] >> 8), orr = r + (t * (ref[2] - 255) >> 8);
 		out[0] = static_cast<unsigned char>(ob < 0 ? 0 : ob > 255 ? 255 : ob);
 		out[1] = static_cast<unsigned char>(og < 0 ? 0 : og > 255 ? 255 : og);
 		out[2] = static_cast<unsigned char>(orr < 0 ? 0 : orr > 255 ? 255 : orr);
 	}
+	gMagentaShare = n ? 100.0 * magenta / n : 0;
 	Present(wnd, st, gOutput, 255);
 }
 
@@ -1595,12 +1600,11 @@ static void MemReport(double sx, double px, double py)
 	}
 }
 
-// Each frame while locked: the layout from ZBrush's own values. Rotation
-// drags must not move the reference, so while one is on the layout is held,
-// and whatever it moved the model goes into the offset when it ends.
+// Each frame while locked: the layout from ZBrush's own values. A rotation
+// drag must not move the reference, so whatever the model's position changes
+// by during frames of a rotation goes into the offset (the image stays put).
 static void MemFollow()
 {
-	static bool holding = false;
 	if (!gMemLocked || gAnchorScale <= 0)
 		return;
 	EnterCriticalSection(&gOverlayLock);
@@ -1610,25 +1614,20 @@ static void MemFollow()
 		MemWeedOut(gMemY);
 		BuildTriplets();
 	}
-	const bool rotating = gGesture.active && gGesture.mode == kDragNone && gGesture.right;
+	const bool rotating = gGesture.active && gGesture.mode == kDragNone;
 	OverlayState& st = gOverlay;
 	double sx = st.ratio * gAnchorScale, px = st.px, py = st.py;
 	const bool read = !gTriplets.empty() ? TripletValues(sx, px, py) :
 		MemValue(gMemScale, sx) && MemValue(gMemX, px) && MemValue(gMemY, py);
 	if (read && sx > 0 && sx < 1e7 && fabs(px) < 1e6 && fabs(py) < 1e6) {
+		const double r = sx / gAnchorScale;
 		if (rotating) {
-			holding = true;
-		} else {
-			if (holding) {
-				holding = false;
-				const double r = sx / gAnchorScale;
-				st.offX += (px - st.px) / r;
-				st.offY += (py - st.py) / r;
-			}
-			st.ratio = sx / gAnchorScale;
-			st.px = px;
-			st.py = py;
+			st.offX += (px - st.px) / r;
+			st.offY += (py - st.py) / r;
 		}
+		st.ratio = r;
+		st.px = px;
+		st.py = py;
 	}
 	LeaveCriticalSection(&gOverlayLock);
 }
@@ -2158,7 +2157,8 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 // overlay frames per second; "22" 1 if ZBrush's values are read from
 // memory, "23" to "25" memory candidates left for scale, x and y, "26" how
 // many of them sit together the way ZBrush stores a view; "27" to "31" the
-// last scan's MB scanned, x matches, x-y pairs, scales near pairs and ms.
+// last scan's MB scanned, x matches, x-y pairs, scales near pairs and ms;
+// "32" percent of the overlay showing the key colour in the last frame.
 ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 {
 	const int which = text ? atoi(text) : -1;
@@ -2193,6 +2193,7 @@ ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 	case 24: return static_cast<float>(gMemX.cands.size());
 	case 25: return static_cast<float>(gMemY.cands.size());
 	case 26: return static_cast<float>(gTriplets.size());
+	case 32: return static_cast<float>(floor(gMagentaShare + 0.5));
 	case 27: case 28: case 29: case 30: case 31: return static_cast<float>(gScanStats[which - 27]);
 	case 18: return static_cast<float>(gGesture.mode + 10 * gGesture.scaleSegments + 100 * gGesture.active);
 	}
