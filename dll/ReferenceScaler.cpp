@@ -115,9 +115,21 @@ static bool WritePng(const std::wstring& path, Gdiplus::Bitmap& frame)
 	return saved;
 }
 
+// text: a line for nav_log.txt (the script logs each Live check). Returns 1.
+ZFUNC RSLog(char* text, double, char*, int, char*, int, char**)
+{
+	if (!text)
+		return -1;
+	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu %s\n", GetTickCount(), text);
+		fclose(f);
+	}
+	return 1;
+}
+
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 54;
+static const int kDllBuild = 56;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -335,6 +347,9 @@ struct OverlayState {
 	double pixelsPerDoc = 1;          // screen pixels per document pixel
 	double docW = 0, docH = 0;
 	double ratio = 1, px = 0, py = 0, ax = 0, ay = 0;
+	// Rotation offset, in anchored document pixels: how far rotating has
+	// moved the model away from the reference. Added to the anchor.
+	double offX = 0, offY = 0;
 	int alpha = 128;
 	bool visible = false;
 };
@@ -471,7 +486,7 @@ enum Pivot { kPivotDocCentre, kPivotCursor, kPivotModel, kPivotLearned, kPivotCo
 
 struct NavModel {
 	double panGain = 1;
-	double scaleY = -0.005, scaleX = 0;
+	double scaleY = 0, scaleX = 0;
 	// Least-squares sums for log(scale) = scaleY * dy + scaleX * dx.
 	double syy = 0, sxx = 0, sxy = 0, sly = 0, slx = 0;
 	double pivotError[kPivotCount] = {0, 0, 0, 0};
@@ -519,6 +534,7 @@ struct Gesture {
 static NavModel gNav;
 static double gLastErrorPos = 0, gLastErrorScale = 1;
 static int gLastKind = kKindNone;
+static bool gMemLocked = false;  // ZBrush's values are read from memory (see MemReport)
 static Gesture gPending;      // last finished navigation drag, until Live reports
 static int gPendingCount = 0; // navigation drags since Live last reported
 static int gStaleSets = 0;    // reports ignored as not including the drag yet
@@ -578,6 +594,8 @@ static void PivotFor(int pivot, const OverlayState& st, double px, double py, do
 // Caller holds the lock.
 static void Predict()
 {
+	if (gMemLocked)
+		return;  // ZBrush's own values are read every frame instead
 	const Gesture& g = gGesture;
 	OverlayState& st = gOverlay;
 	if (g.mode == kDragMove) {
@@ -585,6 +603,10 @@ static void Predict()
 		st.px = g.basePx + gNav.panGain * g.segX / st.pixelsPerDoc;
 		st.py = g.basePy + gNav.panGain * g.segY / st.pixelsPerDoc;
 	} else if (g.mode == kDragScale) {
+		// Until real zooms have been learned from, the reference waits for
+		// Live instead of guessing (a wrong guess zooms the wrong way).
+		if (gNav.scales < 2)
+			return;
 		const double s = exp(gNav.scaleY * g.segY + gNav.scaleX * g.segX);
 		double cx, cy;
 		PivotFor(gNav.pivot(), st, g.basePx, g.basePy, g.cursorX, g.cursorY, cx, cy);
@@ -691,7 +713,7 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 				gStaleSets = 0;
 			}
 			if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
-				fprintf(f, "drag kind %d right %d alt %d scaleSegs %d move %.0f %.0f scale %.0f %.0f predicted %.5f %.2f %.2f\n",
+				fprintf(f, "%lu drag kind %d right %d alt %d scaleSegs %d move %.0f %.0f scale %.0f %.0f predicted %.5f %.2f %.2f\n", GetTickCount(),
 					g.kind, g.right, g.altSeen, g.scaleSegments, g.moveX, g.moveY, g.scaleDx, g.scaleDy,
 					gOverlay.ratio, gOverlay.px, gOverlay.py);
 				fclose(f);
@@ -718,13 +740,22 @@ static void Learn(double ratio, double px, double py)
 	const double s = ratio / g.ratio0;
 	// Every drag is logged, so ZBrush's behaviour can be checked.
 	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
-		fprintf(f, "exact kind %d right %d alt %d scaleSegs %d move %.0f %.0f scale %.0f %.0f afterScaleMove %d "
-			"start %.5f %.2f %.2f predicted %.5f %.2f %.2f exact %.5f %.2f %.2f k %.4f\n",
+		fprintf(f, "%lu exact kind %d right %d alt %d scaleSegs %d move %.0f %.0f scale %.0f %.0f afterScaleMove %d "
+			"start %.5f %.2f %.2f predicted %.5f %.2f %.2f exact %.5f %.2f %.2f k %.4f\n", GetTickCount(),
 			g.kind, g.right, g.altSeen, g.scaleSegments, g.moveX, g.moveY, g.scaleDx, g.scaleDy, g.movedAfterScale,
 			g.ratio0, g.px0, g.py0, gOverlay.ratio, gOverlay.px, gOverlay.py, ratio, px, py, k);
 		fclose(f);
 	}
-	if (g.kind == kKindRotate || !single)
+	if (g.kind == kKindRotate) {
+		// Whatever rotating moved the model goes into the offset, so the
+		// reference stays put (with ZBrush's memory read, OverlayStep does it).
+		if (single && !gMemLocked) {
+			gOverlay.offX += (px - g.px0) / ratio;
+			gOverlay.offY += (py - g.py0) / ratio;
+		}
+		return;
+	}
+	if (!single)
 		return;
 	if (g.scaleSegments == 0) {
 		// Move only: gain along the direction moved.
@@ -738,7 +769,7 @@ static void Learn(double ratio, double px, double py)
 			}
 		}
 	} else if (g.scaleSegments == 1 && s > 0.01 && s < 100 && fabs(g.scaleDx) + fabs(g.scaleDy) > 20) {
-		// Scale gain: least squares with a weak prior keeping scaleX near 0.
+		// Scale gain: least squares, with a weak prior towards no scaling.
 		const double l = log(s);
 		gNav.syy += g.scaleDy * g.scaleDy;
 		gNav.sxx += g.scaleDx * g.scaleDx;
@@ -746,7 +777,7 @@ static void Learn(double ratio, double px, double py)
 		gNav.sly += l * g.scaleDy;
 		gNav.slx += l * g.scaleDx;
 		const double ridge = 100;
-		const double a = gNav.syy + 1e-6, b = gNav.sxy, d = gNav.sxx + ridge;
+		const double a = gNav.syy + ridge, b = gNav.sxy, d = gNav.sxx + ridge;
 		const double det = a * d - b * b;
 		if (det > 0) {
 			gNav.scaleY = (gNav.sly * d - gNav.slx * b) / det;
@@ -888,7 +919,7 @@ static bool BuildRefLayer(const OverlayState& st)
 	const double baseW = imgW * fit, baseH = imgH * fit;
 	const double baseX = (st.docW - baseW) * 0.5, baseY = (st.docH - baseH) * 0.5;
 	const double k = st.pixelsPerDoc;
-	const double x0 = (st.px + st.ratio * (baseX - st.ax)) * k, y0 = (st.py + st.ratio * (baseY - st.ay)) * k;
+	const double x0 = (st.px + st.ratio * (baseX - st.ax - st.offX)) * k, y0 = (st.py + st.ratio * (baseY - st.ay - st.offY)) * k;
 	const double dispW = baseW * st.ratio * k, dispH = baseH * st.ratio * k;
 
 	// Smallest level still at least as large as the image on screen.
@@ -1219,6 +1250,255 @@ static void ClassifyGesture()
 	LeaveCriticalSection(&gOverlayLock);
 }
 
+// Reading ZBrush's camera from its memory. The DLL runs inside ZBrush, so
+// once it knows where ZBrush keeps the model's scale and position it can
+// read them every frame, exactly, during drags. To find them: the first
+// report of exact values from Live (RSOverlaySet) scans ZBrush's writable
+// memory for floats and doubles equal to each value; each later report with
+// changed values keeps only the locations that changed to match. When few
+// are left for all three values, they are read every frame. Nothing is
+// written. If the locations stop matching a report, the search starts over.
+
+struct MemCand {
+	uintptr_t addr;
+	bool isDouble;
+	double last;      // value when last read
+	DWORD changedAt;  // when it last changed
+};
+
+struct MemTrack {
+	std::vector<MemCand> cands;
+	double target = 0;
+	int narrowings = 0;   // reports with a changed value that it survived
+	bool tooMany = false;
+};
+
+static MemTrack gMemScale, gMemX, gMemY;
+static bool gMemScanned = false;
+static double gAnchorScale = 0;  // TransformGet scale at ratio 1
+// For a second after each report, a location whose value changes while no
+// mouse button is down is not ZBrush's camera (a temporary or stack copy).
+static DWORD gMemWatchUntil = 0;
+static int gMemDisagree = 0;
+
+
+static bool MemRead(const MemCand& c, double& v)
+{
+	SIZE_T got = 0;
+	if (c.isDouble) {
+		double d;
+		if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(c.addr), &d, 8, &got) || got != 8)
+			return false;
+		v = d;
+	} else {
+		float f;
+		if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(c.addr), &f, 4, &got) || got != 4)
+			return false;
+		v = f;
+	}
+	return v == v;  // not NaN
+}
+
+// The script passes values with about three decimals.
+static bool MemMatch(double v, double target)
+{
+	return fabs(v - target) <= 0.0011 + fabs(target) * 2e-6;
+}
+
+static void MemScan(double sx, double px, double py)
+{
+	MemTrack* tracks[3] = {&gMemScale, &gMemX, &gMemY};
+	const double targets[3] = {sx, px, py};
+	for (int t = 0; t < 3; ++t) {
+		tracks[t]->cands.clear();
+		tracks[t]->target = targets[t];
+		tracks[t]->narrowings = 0;
+		tracks[t]->tooMany = false;
+	}
+	const size_t kMaxCands = 4000000;
+	HMODULE self = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		reinterpret_cast<LPCWSTR>(&MemScan), &self);
+	const NT_TIB* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+	const uintptr_t stackLow = reinterpret_cast<uintptr_t>(tib->StackLimit) & ~static_cast<uintptr_t>(0xfffff);
+	const uintptr_t stackHigh = reinterpret_cast<uintptr_t>(tib->StackBase);
+	std::vector<unsigned char> buf(1 << 22);
+	MEMORY_BASIC_INFORMATION mbi;
+	uintptr_t addr = 0;
+	while (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == sizeof(mbi)) {
+		const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+		const uintptr_t next = base + mbi.RegionSize;
+		const DWORD prot = mbi.Protect & 0xff;
+		const bool writable = prot == PAGE_READWRITE || prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READWRITE;
+		if (mbi.State == MEM_COMMIT && writable && !(mbi.Protect & PAGE_GUARD) &&
+			(mbi.Type == MEM_PRIVATE || mbi.Type == MEM_IMAGE) && mbi.RegionSize <= (512u << 20) &&
+			// Not this DLL's own copies of the values, nor the calling thread's
+			// stack (it holds the values being reported right now).
+			mbi.AllocationBase != self && !(stackLow < next && base < stackHigh)) {
+			for (uintptr_t chunk = base; chunk < next; chunk += buf.size()) {
+				const size_t len = next - chunk < buf.size() ? next - chunk : buf.size();
+				SIZE_T got = 0;
+				if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(chunk), buf.data(), len, &got))
+					continue;
+				for (size_t i = 0; i + 4 <= got; i += 4) {
+					float f;
+					memcpy(&f, &buf[i], 4);
+					const double v = f;
+					double d = 0;
+					const bool haveD = (i % 8 == 0) && i + 8 <= got;
+					if (haveD)
+						memcpy(&d, &buf[i], 8);
+					for (int t = 0; t < 3; ++t) {
+						MemTrack& tr = *tracks[t];
+						if (tr.tooMany)
+							continue;
+						if (MemMatch(v, targets[t]))
+							tr.cands.push_back({chunk + i, false, v, 0});
+						if (haveD && MemMatch(d, targets[t]))
+							tr.cands.push_back({chunk + i, true, d, 0});
+						if (tr.cands.size() > kMaxCands) {
+							tr.tooMany = true;
+							tr.cands.clear();
+						}
+					}
+				}
+			}
+		}
+		if (next <= addr)
+			break;
+		addr = next;
+	}
+	gMemScanned = true;
+}
+
+// Keeps the candidates that now hold target. Returns false if none are left.
+static bool MemNarrow(MemTrack& tr, double target)
+{
+	const bool changed = !MemMatch(tr.target, target);
+	std::vector<MemCand> keep;
+	for (const MemCand& c : tr.cands) {
+		double v;
+		if (MemRead(c, v) && MemMatch(v, target)) {
+			keep.push_back(c);
+			keep.back().last = v;
+		}
+	}
+	tr.cands.swap(keep);
+	if (changed && !tr.cands.empty())
+		++tr.narrowings;
+	tr.target = target;
+	return !tr.cands.empty() && !tr.tooMany;
+}
+
+static bool MemTrackReady(const MemTrack& tr)
+{
+	return tr.narrowings >= 2 && !tr.cands.empty() && tr.cands.size() <= 64;
+}
+
+// Reads one value. Of several candidates the one that changed most recently
+// is the live one (others are copies made at other times, such as the
+// script's own variables).
+static bool MemValue(MemTrack& tr, double& out)
+{
+	const DWORD now = GetTickCount();
+	const MemCand* best = nullptr;
+	for (MemCand& c : tr.cands) {
+		double v;
+		if (!MemRead(c, v))
+			continue;
+		if (v != c.last) {
+			c.last = v;
+			c.changedAt = now;
+		}
+		if (!best || static_cast<int>(c.changedAt - best->changedAt) > 0)
+			best = &c;
+	}
+	if (best)
+		out = best->last;
+	return best != nullptr;
+}
+
+static void MemWeedOut(MemTrack& tr)
+{
+	std::vector<MemCand> keep;
+	for (const MemCand& c : tr.cands) {
+		double v;
+		if (MemRead(c, v) && MemMatch(v, tr.target))
+			keep.push_back(c);
+	}
+	if (!keep.empty())
+		tr.cands.swap(keep);
+}
+
+// Feeds a report of exact values to the search. Caller holds the lock.
+static void MemReport(double sx, double px, double py)
+{
+	if (sx <= 0)
+		return;
+	if (gMemLocked) {
+		// ZBrush can report old values for a while after a drag; while the
+		// live locations disagree with a report, it is not used to narrow
+		// them, unless that keeps happening.
+		double ms = sx, mx = px, my = py;
+		const bool agree = MemValue(gMemScale, ms) && MemValue(gMemX, mx) && MemValue(gMemY, my) &&
+			MemMatch(ms, sx) && MemMatch(mx, px) && MemMatch(my, py);
+		if (!agree && ++gMemDisagree < 4)
+			return;
+	}
+	gMemDisagree = 0;
+	if (!gMemScanned) {
+		MemScan(sx, px, py);
+	} else {
+		const bool ok = MemNarrow(gMemScale, sx) & MemNarrow(gMemX, px) & MemNarrow(gMemY, py);
+		if (!ok)
+			MemScan(sx, px, py);  // lost them (or too many): start over
+	}
+	gMemLocked = MemTrackReady(gMemScale) && MemTrackReady(gMemX) && MemTrackReady(gMemY);
+	gMemWatchUntil = GetTickCount() + 1000;
+	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu memory %d candidates %zu %zu %zu narrowed %d %d %d locked %d\n", GetTickCount(),
+			gMemScanned, gMemScale.cands.size(), gMemX.cands.size(), gMemY.cands.size(),
+			gMemScale.narrowings, gMemX.narrowings, gMemY.narrowings, gMemLocked);
+		fclose(f);
+	}
+}
+
+// Each frame while locked: the layout from ZBrush's own values. Rotation
+// drags must not move the reference, so while one is on the layout is held,
+// and whatever it moved the model goes into the offset when it ends.
+static void MemFollow()
+{
+	static bool holding = false;
+	if (!gMemLocked || gAnchorScale <= 0)
+		return;
+	EnterCriticalSection(&gOverlayLock);
+	if (!gGesture.active && static_cast<int>(gMemWatchUntil - GetTickCount()) > 0) {
+		MemWeedOut(gMemScale);
+		MemWeedOut(gMemX);
+		MemWeedOut(gMemY);
+	}
+	const bool rotating = gGesture.active && gGesture.mode == kDragNone && gGesture.right;
+	OverlayState& st = gOverlay;
+	double sx = st.ratio * gAnchorScale, px = st.px, py = st.py;
+	if (MemValue(gMemScale, sx) && MemValue(gMemX, px) && MemValue(gMemY, py) &&
+		sx > 0 && sx < 1e7 && fabs(px) < 1e6 && fabs(py) < 1e6) {
+		if (rotating) {
+			holding = true;
+		} else {
+			if (holding) {
+				holding = false;
+				const double r = sx / gAnchorScale;
+				st.offX += (px - st.px) / r;
+				st.offY += (py - st.py) / r;
+			}
+			st.ratio = sx / gAnchorScale;
+			st.px = px;
+			st.py = py;
+		}
+	}
+	LeaveCriticalSection(&gOverlayLock);
+}
+
 static bool gRedrawPending = false;
 
 // One pass of the overlay loop: rebuilds the reference if its layout
@@ -1230,6 +1510,7 @@ static bool OverlayStep(HWND wnd)
 	static DWORD fpsStart = 0;
 	static int fpsFrames = 0;
 	ClassifyGesture();
+	MemFollow();
 	EnterCriticalSection(&gOverlayLock);
 	const OverlayState st = gOverlay;
 	const bool redraw = gRedrawPending;
@@ -1242,7 +1523,7 @@ static bool OverlayStep(HWND wnd)
 		return false;
 	}
 	const bool layoutChanged = redraw || st.ratio != shown.ratio || st.px != shown.px || st.py != shown.py ||
-		st.ax != shown.ax || st.ay != shown.ay || st.alpha != shown.alpha || st.screenX != shown.screenX ||
+		st.ax != shown.ax || st.ay != shown.ay || st.offX != shown.offX || st.offY != shown.offY || st.alpha != shown.alpha || st.screenX != shown.screenX ||
 		st.screenY != shown.screenY || st.pixelsPerDoc != shown.pixelsPerDoc;
 	if (layoutChanged) {
 		if (st.screenX != shown.screenX || st.screenY != shown.screenY || st.pixelsPerDoc != shown.pixelsPerDoc) {
@@ -1734,7 +2015,8 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 // 3 sculpt) + 10 x scale segments + 100 while dragging. "19" what the last
 // finished drag was (0 nothing, 1 move, 2 scale, 3 rotate, 4 sculpt), then
 // clears it; "20" capture method (1 desktop duplication, 0 BitBlt); "21"
-// overlay frames per second.
+// overlay frames per second; "22" 1 if ZBrush's values are read from
+// memory, "23" to "25" memory candidates left for scale, x and y.
 ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 {
 	const int which = text ? atoi(text) : -1;
@@ -1764,33 +2046,39 @@ ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 	}
 	case 20: return static_cast<float>(gCaptureMethod);
 	case 21: return static_cast<float>(floor(gFps + 0.5));
+	case 22: return gMemLocked ? 1 : 0;
+	case 23: return static_cast<float>(gMemScale.cands.size());
+	case 24: return static_cast<float>(gMemX.cands.size());
+	case 25: return static_cast<float>(gMemY.cands.size());
 	case 18: return static_cast<float>(gGesture.mode + 10 * gGesture.scaleSegments + 100 * gGesture.active);
 	}
 	return -1;
 }
 
-// text: "ratio px py anchorX anchorY", as for RSRender. Also how the
+// text: "ratio px py anchorX anchorY [scale]", as for RSRender, plus the
+// model scale from TransformGet, which finds ZBrush's values in memory (see
+// MemReport). Also how the
 // navigation model learns: values set right after a drag are the exact
 // result of that drag. Returns 1, -1 for bad arguments, -2 if the overlay is
 // not running, 3 if not applied because a drag is in progress or the values
 // do not include the last drag yet (call again).
 ZFUNC RSOverlaySet(char* text, double, char*, int, char*, int, char**)
 {
-	double r, px, py, ax, ay;
-	if (!text || sscanf(text, "%lf %lf %lf %lf %lf", &r, &px, &py, &ax, &ay) != 5 || r <= 0)
+	double r, px, py, ax, ay, sx = 0;
+	if (!text || sscanf(text, "%lf %lf %lf %lf %lf %lf", &r, &px, &py, &ax, &ay, &sx) < 5 || r <= 0)
 		return -1;
 	if (!gOverlayWnd)
 		return -2;
 	EnterCriticalSection(&gOverlayLock);
 	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
-		fprintf(f, "set %.5f %.2f %.2f dragging %d unreported %d shown %.5f %.2f %.2f\n",
+		fprintf(f, "%lu set %.5f %.2f %.2f dragging %d unreported %d shown %.5f %.2f %.2f\n", GetTickCount(),
 			r, px, py, gGesture.active, gPending.done ? gPendingCount : 0, gOverlay.ratio, gOverlay.px, gOverlay.py);
 		fclose(f);
 	}
 	// ZBrush can report the values from before a drag for a while after it.
 	// Values still equal to the drag's start, while the prediction moved,
 	// are not applied (the script retries); after a few tries they are.
-	if (gGesture.active || (gPending.done && gStaleSets < 4 &&
+	if (gGesture.active || (!gMemLocked && gPending.done && gStaleSets < 4 &&
 			fabs(px - gPending.px0) < 0.3 && fabs(py - gPending.py0) < 0.3 && fabs(r / gPending.ratio0 - 1) < 0.001 &&
 			(fabs(gOverlay.px - px) > 2 || fabs(gOverlay.py - py) > 2 || fabs(gOverlay.ratio / r - 1) > 0.01))) {
 		if (!gGesture.active)
@@ -1804,14 +2092,35 @@ ZFUNC RSOverlaySet(char* text, double, char*, int, char*, int, char**)
 		gLastErrorScale = gOverlay.ratio / r;
 	}
 	Learn(r, px, py);
-	gOverlay.ratio = r;
-	gOverlay.px = px;
-	gOverlay.py = py;
+	if (sx > 0) {
+		gAnchorScale = sx / r;
+		MemReport(sx, px, py);
+	}
+	// While ZBrush's values are read from memory those are the truth (a
+	// report may be older than them).
+	if (!gMemLocked || sx <= 0) {
+		gOverlay.ratio = r;
+		gOverlay.px = px;
+		gOverlay.py = py;
+	}
 	gOverlay.ax = ax;
 	gOverlay.ay = ay;
 	LeaveCriticalSection(&gOverlayLock);
 	PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
 	return 1;
+}
+
+// Clears the rotation offset (the view is back at the anchored rotation).
+// Returns 1 if there was one, else 0.
+ZFUNC RSOverlayResetOffset(char*, double, char*, int, char*, int, char**)
+{
+	if (!gOverlayLockReady)
+		return 0;
+	EnterCriticalSection(&gOverlayLock);
+	const bool had = gOverlay.offX != 0 || gOverlay.offY != 0;
+	gOverlay.offX = gOverlay.offY = 0;
+	LeaveCriticalSection(&gOverlayLock);
+	return had ? 1 : 0;
 }
 
 // Hides the overlay. Returns 1.
