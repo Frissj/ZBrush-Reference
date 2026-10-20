@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 70;
+static const int kDllBuild = 71;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -392,9 +392,9 @@ struct OverlayState {
 	// Rotation offset, in anchored document pixels: how far rotating has
 	// moved the model away from the reference. Added to the anchor.
 	double offX = 0, offY = 0;
-	// The image's own adjustment (Adjust Image): scale about its centre and
-	// shift, in anchored document pixels.
-	double imgS = 1, imgX = 0, imgY = 0;
+	// The image's own adjustment (Adjust Image): width and height scale, and
+	// its centre's shift in anchored document pixels.
+	double imgSX = 1, imgSY = 1, imgX = 0, imgY = 0;
 	int alpha = 128;
 	bool visible = false;
 };
@@ -936,27 +936,42 @@ struct Level {
 static std::vector<Level> gLevels;
 static std::wstring gLevelsFor;
 
+// The image the overlay shows: the showing view's (empty: none). Kept
+// apart from the canvas-fill reference so the overlay shows only view images.
+static std::string gOverlayPath;
+
 static void BuildLevels()
 {
-	if (!LoadSavedImage()) {
+	if (gOverlayPath.empty()) {
 		gLevels.clear();
 		gLevelsFor.clear();
 		return;
 	}
-	if (gLevelsFor == gImagePath)
+	const std::wstring path = Widen(gOverlayPath.c_str());
+	if (gLevelsFor == path)
 		return;
 	gLevels.clear();
+	gLevelsFor.clear();
+	StartGdiplus();
+	Gdiplus::Bitmap* image = Gdiplus::Bitmap::FromFile(path.c_str());
+	if (!image || image->GetLastStatus() != Gdiplus::Ok || image->GetWidth() == 0) {
+		delete image;
+		return;
+	}
 	Level top;
-	top.w = gImage->GetWidth();
-	top.h = gImage->GetHeight();
+	top.w = image->GetWidth();
+	top.h = image->GetHeight();
 	top.px.resize(static_cast<size_t>(top.w) * top.h);
 	Gdiplus::Rect r(0, 0, top.w, top.h);
 	Gdiplus::BitmapData data;
-	if (gImage->LockBits(&r, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &data) != Gdiplus::Ok)
+	if (image->LockBits(&r, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &data) != Gdiplus::Ok) {
+		delete image;
 		return;
+	}
 	for (int y = 0; y < top.h; ++y)
 		memcpy(&top.px[static_cast<size_t>(y) * top.w], static_cast<BYTE*>(data.Scan0) + y * data.Stride, top.w * 4);
-	gImage->UnlockBits(&data);
+	image->UnlockBits(&data);
+	delete image;
 	gLevels.push_back(std::move(top));
 	while (gLevels.back().w > 16 && gLevels.back().h > 16) {
 		const Level& a = gLevels.back();
@@ -976,7 +991,7 @@ static void BuildLevels()
 			}
 		gLevels.push_back(std::move(b));
 	}
-	gLevelsFor = gImagePath;
+	gLevelsFor = path;
 }
 
 static int gImgW = 0, gImgH = 0;  // the shown image's size (0: none)
@@ -991,7 +1006,7 @@ static bool ImageRect(const OverlayState& st, double& x0, double& y0, double& w,
 		return false;
 	const double imgW = gImgW, imgH = gImgH;
 	const double fit = (st.docW / imgW < st.docH / imgH) ? st.docW / imgW : st.docH / imgH;
-	const double baseW = imgW * fit * st.imgS, baseH = imgH * fit * st.imgS;
+	const double baseW = imgW * fit * st.imgSX, baseH = imgH * fit * st.imgSY;
 	const double cx = st.docW * 0.5 + st.imgX, cy = st.docH * 0.5 + st.imgY;
 	const double k = st.pixelsPerDoc;
 	x0 = (st.px + st.ratio * (cx - baseW * 0.5 - st.ax - st.offX)) * k;
@@ -1003,9 +1018,24 @@ static bool ImageRect(const OverlayState& st, double& x0, double& y0, double& w,
 
 static void SaveAdjustToView();
 
-static int gAdjustDrag = 0;  // 0 none, 1 moving, 2 scaling by corner, 3 scaling by right drag
+// 0 none, 1 moving, 2 a corner (keeps the aspect, the opposite corner
+// stays), 3 right drag (scales about the centre), 4 a left or right edge,
+// 5 the top or bottom edge (the opposite edge stays).
+static int gAdjustDrag = 0;
+static int gAdjustSideX = 0, gAdjustSideY = 0;
 static POINT gAdjustDown;
-static double gAdjustS0 = 1, gAdjustX0 = 0, gAdjustY0 = 0, gAdjustCx = 0, gAdjustCy = 0;
+static double gAdjustSX0 = 1, gAdjustSY0 = 1, gAdjustX0 = 0, gAdjustY0 = 0;
+
+// The image fitted to the document, before Adjust Image, in document pixels.
+static bool FitSize(const OverlayState& st, double& w, double& h)
+{
+	if (gImgW <= 0 || gImgH <= 0 || st.docW < 1 || st.docH < 1)
+		return false;
+	const double fit = (st.docW / gImgW < st.docH / gImgH) ? st.docW / gImgW : st.docH / gImgH;
+	w = gImgW * fit;
+	h = gImgH * fit;
+	return true;
+}
 
 // Handles a mouse event in Adjust Image mode. Caller holds the lock.
 // Returns true if ZBrush must not see it.
@@ -1022,39 +1052,66 @@ static bool AdjustMouse(WPARAM wp, POINT pt)
 		x0 += st.screenX;
 		y0 += st.screenY;
 		gAdjustDown = pt;
-		gAdjustS0 = st.imgS;
+		gAdjustSX0 = st.imgSX;
+		gAdjustSY0 = st.imgSY;
 		gAdjustX0 = st.imgX;
 		gAdjustY0 = st.imgY;
-		gAdjustCx = x0 + w * 0.5;
-		gAdjustCy = y0 + h * 0.5;
-		// Corner handles stay on the canvas when the image is larger.
-		const double r = 14, right = st.screenX + st.docW * k - 1, bottom = st.screenY + st.docH * k - 1;
+		// Handles stay on the canvas when the image is larger.
+		const double r = 12, right = st.screenX + st.docW * k - 1, bottom = st.screenY + st.docH * k - 1;
 		const double hx0 = std::max(x0, st.screenX), hx1 = std::min(x0 + w, right);
 		const double hy0 = std::max(y0, st.screenY), hy1 = std::min(y0 + h, bottom);
-		const bool nearX = fabs(pt.x - hx0) < r || fabs(pt.x - hx1) < r;
-		const bool nearY = fabs(pt.y - hy0) < r || fabs(pt.y - hy1) < r;
-		gAdjustDrag = wp == WM_RBUTTONDOWN ? 3 : nearX && nearY ? 2 : 1;
+		const int sideX = fabs(pt.x - hx0) < r ? -1 : fabs(pt.x - hx1) < r ? 1 : 0;
+		const int sideY = fabs(pt.y - hy0) < r ? -1 : fabs(pt.y - hy1) < r ? 1 : 0;
+		const bool withinX = pt.x > hx0 - r && pt.x < hx1 + r, withinY = pt.y > hy0 - r && pt.y < hy1 + r;
+		gAdjustSideX = sideX;
+		gAdjustSideY = sideY;
+		if (wp == WM_RBUTTONDOWN)
+			gAdjustDrag = 3;
+		else if (sideX && sideY)
+			gAdjustDrag = 2;
+		else if (sideX && withinY)
+			gAdjustDrag = 4;
+		else if (sideY && withinX)
+			gAdjustDrag = 5;
+		else
+			gAdjustDrag = 1;
 		return true;
 	}
 	case WM_MOUSEMOVE: {
-		if (!gAdjustDrag || st.ratio <= 0 || k <= 0)
+		double bw, bh;
+		if (!gAdjustDrag || st.ratio <= 0 || k <= 0 || !FitSize(st, bw, bh))
 			return false;
-		const double dx = pt.x - gAdjustDown.x, dy = pt.y - gAdjustDown.y;
+		// The drag in anchored document pixels.
+		const double du = (pt.x - gAdjustDown.x) / (k * st.ratio), dv = (pt.y - gAdjustDown.y) / (k * st.ratio);
+		const double w0 = bw * gAdjustSX0, h0 = bh * gAdjustSY0;
+		double w = w0, h = h0, cx = gAdjustX0, cy = gAdjustY0;
+		const double minSize = 4 / (k * st.ratio);
 		if (gAdjustDrag == 1) {
-			st.imgX = gAdjustX0 + dx / (k * st.ratio);
-			st.imgY = gAdjustY0 + dy / (k * st.ratio);
+			cx += du;
+			cy += dv;
 		} else if (gAdjustDrag == 2) {
-			const double d0 = hypot(gAdjustDown.x - gAdjustCx, gAdjustDown.y - gAdjustCy);
-			const double d = hypot(pt.x - gAdjustCx, pt.y - gAdjustCy);
-			if (d0 > 5)
-				st.imgS = gAdjustS0 * (d < 5 ? 5 : d) / d0;
+			double f = 0.5 * ((w0 + gAdjustSideX * du) / w0 + (h0 + gAdjustSideY * dv) / h0);
+			if (f * w0 < minSize || f * h0 < minSize)
+				f = std::max(minSize / w0, minSize / h0);
+			w = w0 * f;
+			h = h0 * f;
+			cx += gAdjustSideX * (w - w0) * 0.5;
+			cy += gAdjustSideY * (h - h0) * 0.5;
+		} else if (gAdjustDrag == 3) {
+			const double f = exp(((pt.x - gAdjustDown.x) - (pt.y - gAdjustDown.y)) / 400.0);
+			w = w0 * f;
+			h = h0 * f;
+		} else if (gAdjustDrag == 4) {
+			w = std::max(minSize, w0 + gAdjustSideX * du);
+			cx += gAdjustSideX * (w - w0) * 0.5;
 		} else {
-			st.imgS = gAdjustS0 * exp((dx - dy) / 400.0);
+			h = std::max(minSize, h0 + gAdjustSideY * dv);
+			cy += gAdjustSideY * (h - h0) * 0.5;
 		}
-		if (st.imgS < 0.01)
-			st.imgS = 0.01;
-		if (st.imgS > 100)
-			st.imgS = 100;
+		st.imgSX = std::min(100.0, w / bw);
+		st.imgSY = std::min(100.0, h / bh);
+		st.imgX = cx;
+		st.imgY = cy;
 		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
 		return false;  // the cursor still moves
 	}
@@ -1101,6 +1158,12 @@ static void DrawGizmo(const OverlayState& st, Buffer32& b)
 	for (int i = 0; i < 2; ++i)
 		for (int j = 0; j < 2; ++j)
 			FillBox(b, xs[i] - c, ys[j] - c, xs[i] + c, ys[j] + c, orange);
+	// Edge handles (pull one side), at the middle of each visible edge.
+	const int mx = (xs[0] + xs[1]) / 2, my = (ys[0] + ys[1]) / 2, e = 5;
+	FillBox(b, xs[0] - e, my - 2 * e, xs[0] + e, my + 2 * e, orange);
+	FillBox(b, xs[1] - e, my - 2 * e, xs[1] + e, my + 2 * e, orange);
+	FillBox(b, mx - 2 * e, ys[0] - e, mx + 2 * e, ys[0] + e, orange);
+	FillBox(b, mx - 2 * e, ys[1] - e, mx + 2 * e, ys[1] + e, orange);
 	const int cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
 	FillBox(b, cx - 10, cy - 1, cx + 10, cy + 1, orange);
 	FillBox(b, cx - 1, cy - 10, cx + 1, cy + 10, orange);
@@ -1924,7 +1987,10 @@ static const int kViewSlots = 7, kDefaultView = 6;
 struct View {
 	bool used = false;
 	double rx = 0, ry = 0, rz = 0, scale = 0, ax = 0, ay = 0;
-	double imgS = 1, imgX = 0, imgY = 0;  // Adjust Image
+	double imgSX = 1, imgSY = 1, imgX = 0, imgY = 0;  // Adjust Image
+	// The view's rotation matrix as read from ZBrush's memory, each entry
+	// rounded to -1, 0 or 1 and packed (see RotCode), or -1 if not known.
+	int code = -1;
 	std::string path;
 	// Silhouette in image space: 0 not seen, 1 background, 2 model.
 	std::vector<unsigned char> mask;
@@ -1961,8 +2027,8 @@ static void SaveViews()
 		return;
 	for (int i = 0; i < kViewSlots; ++i) {
 		const View& v = gViews[i];
-		fprintf(f, "%d %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f|%s\n", v.used ? 1 : 0, v.rx, v.ry, v.rz, v.scale, v.ax, v.ay,
-			v.imgS, v.imgX, v.imgY, v.path.c_str());
+		fprintf(f, "%d %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %d|%s\n", v.used ? 1 : 0, v.rx, v.ry, v.rz, v.scale,
+			v.ax, v.ay, v.imgSX, v.imgSY, v.imgX, v.imgY, v.code, v.path.c_str());
 	}
 	fclose(f);
 }
@@ -2007,13 +2073,14 @@ static void LoadViews()
 		for (int i = 0; i < kViewSlots && fgets(line, sizeof(line), f); ++i) {
 			View& v = gViews[i];
 			int used = 0;
-			const int got = sscanf(line, "%d %lf %lf %lf %lf %lf %lf %lf %lf %lf", &used, &v.rx, &v.ry, &v.rz, &v.scale,
-				&v.ax, &v.ay, &v.imgS, &v.imgX, &v.imgY);
+			const int got = sscanf(line, "%d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %d", &used, &v.rx, &v.ry, &v.rz, &v.scale,
+				&v.ax, &v.ay, &v.imgSX, &v.imgSY, &v.imgX, &v.imgY, &v.code);
 			if (got < 7)
 				continue;
-			if (got < 10 || v.imgS <= 0) {
-				v.imgS = 1;
+			if (got < 12 || v.imgSX <= 0 || v.imgSY <= 0) {
+				v.imgSX = v.imgSY = 1;
 				v.imgX = v.imgY = 0;
+				v.code = -1;
 			}
 			v.used = used != 0;
 			const char* bar = strchr(line, '|');
@@ -2084,14 +2151,10 @@ static bool AnyViewImage()
 static int MatchView(double rx, double ry, double rz)
 {
 	LoadViews();
-	if (AnyViewImage()) {
-		for (int i = 0; i < kDefaultView; ++i)
-			if (gViews[i].used && SameRotation(gViews[i], rx, ry, rz))
-				return i;
-		return -1;
-	}
-	const View& d = gViews[kDefaultView];
-	return d.used && SameRotation(d, rx, ry, rz) ? kDefaultView : -1;
+	for (int i = 0; i < kDefaultView; ++i)
+		if (gViews[i].used && SameRotation(gViews[i], rx, ry, rz))
+			return i;
+	return -1;
 }
 
 static void WriteReferencePath(const std::string& path)
@@ -2129,8 +2192,9 @@ static void QueueViewJob(int job, int slot)
 static void ActivateView(int slot)
 {
 	View& v = gViews[slot];
-	if (slot != gActiveView || gImagePath.empty()) {
-		WriteReferencePath(v.path);
+	if (slot != gActiveView || gOverlayPath != v.path) {
+		gOverlayPath = v.path;
+		WriteReferencePath(v.path);  // for the canvas fill (Overlay Off)
 		gRedrawPending = true;
 	}
 	gActiveView = slot;
@@ -2138,7 +2202,8 @@ static void ActivateView(int slot)
 	gAnchorScale = v.scale;
 	gOverlay.ax = v.ax;
 	gOverlay.ay = v.ay;
-	gOverlay.imgS = v.imgS;
+	gOverlay.imgSX = v.imgSX;
+	gOverlay.imgSY = v.imgSY;
 	gOverlay.imgX = v.imgX;
 	gOverlay.imgY = v.imgY;
 	gOverlay.offX = gOverlay.offY = 0;
@@ -2153,7 +2218,8 @@ static void SaveAdjustToView()
 	if (gActiveView < 0 || gActiveView >= kViewSlots)
 		return;
 	View& v = gViews[gActiveView];
-	v.imgS = gOverlay.imgS;
+	v.imgSX = gOverlay.imgSX;
+	v.imgSY = gOverlay.imgSY;
 	v.imgX = gOverlay.imgX;
 	v.imgY = gOverlay.imgY;
 	SaveViews();
@@ -2167,8 +2233,8 @@ static void BlankView()
 	gActiveView = -2;
 	gViewAway = true;
 	gViewJob = 0;
-	WriteReferencePath(std::string());
-	gOverlay.imgS = 1;
+	gOverlayPath.clear();
+	gOverlay.imgSX = gOverlay.imgSY = 1;
 	gOverlay.imgX = gOverlay.imgY = 0;
 	gOverlay.offX = gOverlay.offY = 0;
 	gRedrawPending = true;
@@ -2355,54 +2421,84 @@ static void WaitViewRecord()
 // ---------------------------------------------------------------------------
 // ZBrush's rotation, read from memory like the zoom and pan, so the DLL
 // sees snaps to a view itself (ZScript's Live loop does not keep running).
-// The Overlay press sets two rotated test views and back (RSRotProbe); the
-// three angles as TransformGet reports them are searched for side by side,
-// as floats or doubles, in degrees or radians.
+// The angles TransformGet reports are not stored as such (build 70's search
+// for them found nothing that followed), so this looks for the rotation
+// matrix instead, which needs no knowledge of ZBrush's angle convention: at
+// the Overlay press's first rotated test view, every 3 x 3 block of floats
+// or doubles (rows 3 or 4 values apart) that is a rotation (orthonormal) and
+// not axis-aligned; at the next test views, those still rotations that
+// changed. A snapped view's matrix has only -1, 0 and 1 in it, which also
+// identifies the view (RotCode).
 // ---------------------------------------------------------------------------
 struct RotCand {
 	uintptr_t addr;
 	bool isDouble;
-	double unit;  // 1 for degrees, pi / 180 for radians
-	double last[3];
+	int stride;  // values from one row to the next
+	double m[9];
 	DWORD changedAt;
 };
 static std::vector<RotCand> gRotCands;
 static int gRotNarrowings = 0;
 static bool gRotLocked = false;
-static double gRotNow[3] = {0, 0, 0};
+static double gRotNow[9];
 static DWORD gRotChangedAt = 0;
 static bool gRotSettled = true;
 
-static bool RotMatch(double v, double deg, double unit)
+static bool IsRotation(const double* m)
 {
-	const double t = deg * unit;
-	return fabs(v - t) <= (0.0051 + fabs(deg) * 1e-5) * unit + 1e-6;
-}
-
-static bool RotRead(const RotCand& c, double out[3])
-{
-	unsigned char b[24];
-	const size_t n = c.isDouble ? 24 : 12;
-	SIZE_T got = 0;
-	if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(c.addr), b, n, &got) || got != n)
-		return false;
-	for (int i = 0; i < 3; ++i) {
-		double v;
-		if (c.isDouble) {
-			memcpy(&v, b + i * 8, 8);
-		} else {
-			float f;
-			memcpy(&f, b + i * 4, 4);
-			v = f;
+	for (int i = 0; i < 3; ++i)
+		for (int j = i; j < 3; ++j) {
+			const double d = m[i * 3] * m[j * 3] + m[i * 3 + 1] * m[j * 3 + 1] + m[i * 3 + 2] * m[j * 3 + 2];
+			if (fabs(d - (i == j ? 1 : 0)) > 2e-3)
+				return false;
 		}
-		if (v != v)
-			return false;
-		out[i] = v / c.unit;
-	}
 	return true;
 }
 
-static void RotScan(const double r[3])
+// The view's code: each entry rounded to -1, 0 or 1, packed base 3, or -1
+// if the matrix is not axis-aligned (not a snapped view).
+static int RotCode(const double* m)
+{
+	int code = 0;
+	for (int i = 8; i >= 0; --i) {
+		const double r = floor(m[i] + 0.5);
+		if (fabs(m[i] - r) > 2e-3 || r < -1 || r > 1)
+			return -1;
+		code = code * 3 + static_cast<int>(r) + 1;
+	}
+	return code;
+}
+
+static void RotFromBytes(const unsigned char* b, bool isDouble, int stride, double* m)
+{
+	for (int r = 0; r < 3; ++r)
+		for (int c = 0; c < 3; ++c) {
+			const size_t at = static_cast<size_t>(r * stride + c);
+			if (isDouble) {
+				memcpy(&m[r * 3 + c], b + at * 8, 8);
+			} else {
+				float f;
+				memcpy(&f, b + at * 4, 4);
+				m[r * 3 + c] = f;
+			}
+		}
+}
+
+static bool RotRead(const RotCand& c, double* m)
+{
+	unsigned char b[11 * 8];
+	const size_t n = static_cast<size_t>(2 * c.stride + 3) * (c.isDouble ? 8 : 4);
+	SIZE_T got = 0;
+	if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(c.addr), b, n, &got) || got != n)
+		return false;
+	RotFromBytes(b, c.isDouble, c.stride, m);
+	for (int i = 0; i < 9; ++i)
+		if (m[i] != m[i])
+			return false;
+	return IsRotation(m);
+}
+
+static void RotScan()
 {
 	gRotCands.clear();
 	gRotNarrowings = 0;
@@ -2415,8 +2511,8 @@ static void RotScan(const double r[3])
 	const uintptr_t stackHigh = reinterpret_cast<uintptr_t>(tib->StackBase);
 	std::vector<unsigned char> buf(1 << 22);
 	const uintptr_t bufLo = reinterpret_cast<uintptr_t>(buf.data()), bufHi = bufLo + buf.size();
-	const double units[2] = {1.0, 3.14159265358979323846 / 180.0};
-	size_t scanned = 0;
+	const size_t overlap = 11 * 8;
+	size_t scanned = 0, rows = 0;
 	MEMORY_BASIC_INFORMATION mbi;
 	uintptr_t addr = 0;
 	while (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == sizeof(mbi)) {
@@ -2427,8 +2523,7 @@ static void RotScan(const double r[3])
 		if (mbi.State == MEM_COMMIT && writable && !(mbi.Protect & PAGE_GUARD) &&
 			(mbi.Type == MEM_PRIVATE || mbi.Type == MEM_IMAGE) && mbi.AllocationBase != self &&
 			!(stackLow < next && base < stackHigh) && !OwnThreadStack(base, next)) {
-			// Chunks overlap by 24 bytes so a triple across a boundary is found.
-			for (uintptr_t chunk = base; chunk < next; chunk += buf.size() - 24) {
+			for (uintptr_t chunk = base; chunk < next; chunk += buf.size() - overlap) {
 				const size_t len = next - chunk < buf.size() ? next - chunk : buf.size();
 				SIZE_T got = 0;
 				if (chunk < bufHi && bufLo < chunk + len)
@@ -2436,19 +2531,39 @@ static void RotScan(const double r[3])
 				if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(chunk), buf.data(), len, &got))
 					continue;
 				scanned += got;
-				for (size_t i = 0; i + 12 <= got; i += 4)
-					for (double u : units) {
-						float f[3];
-						memcpy(f, &buf[i], 12);
-						if (RotMatch(f[0], r[0], u) && RotMatch(f[1], r[1], u) && RotMatch(f[2], r[2], u) && gRotCands.size() < 100000)
-							gRotCands.push_back({chunk + i, false, u, {r[0], r[1], r[2]}, 0});
-						if (i % 8 == 0 && i + 24 <= got) {
-							double d[3];
-							memcpy(d, &buf[i], 24);
-							if (RotMatch(d[0], r[0], u) && RotMatch(d[1], r[1], u) && RotMatch(d[2], r[2], u) && gRotCands.size() < 100000)
-								gRotCands.push_back({chunk + i, true, u, {r[0], r[1], r[2]}, 0});
+				for (size_t i = 0; i + 11 * 4 <= got; i += 4) {
+					for (int isDouble = 0; isDouble < 2; ++isDouble) {
+						const size_t sz = isDouble ? 8 : 4;
+						if (isDouble && (i % 8 != 0 || i + 11 * 8 > got))
+							continue;
+						// Quick test first: the first row is a unit vector.
+						double r0[3];
+						for (int c = 0; c < 3; ++c) {
+							if (isDouble) {
+								memcpy(&r0[c], &buf[i + c * sz], 8);
+							} else {
+								float f;
+								memcpy(&f, &buf[i + c * sz], 4);
+								r0[c] = f;
+							}
+						}
+						const double n0 = r0[0] * r0[0] + r0[1] * r0[1] + r0[2] * r0[2];
+						if (!(fabs(n0 - 1) < 2e-3))
+							continue;
+						++rows;
+						for (int stride = 3; stride <= 4; ++stride) {
+							if (i + static_cast<size_t>(2 * stride + 3) * sz > got)
+								continue;
+							double m[9];
+							RotFromBytes(&buf[i], isDouble != 0, stride, m);
+							if (!IsRotation(m) || RotCode(m) >= 0 || gRotCands.size() >= 200000)
+								continue;
+							RotCand c = {chunk + i, isDouble != 0, stride, {}, 0};
+							memcpy(c.m, m, sizeof(m));
+							gRotCands.push_back(c);
 						}
 					}
+				}
 				if (len < buf.size())
 					break;
 			}
@@ -2458,22 +2573,27 @@ static void RotScan(const double r[3])
 		addr = next;
 	}
 	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
-		fprintf(f, "%lu rotation scan for %.3f %.3f %.3f: %zu MB in %lu ms, %zu found\n", GetTickCount(), r[0], r[1], r[2],
-			scanned >> 20, GetTickCount() - t0, gRotCands.size());
+		fprintf(f, "%lu rotation matrix scan: %zu MB in %lu ms, %zu unit rows, %zu rotations found\n", GetTickCount(),
+			scanned >> 20, GetTickCount() - t0, rows, gRotCands.size());
 		fclose(f);
 	}
 }
 
-static void RotNarrow(const double r[3])
+// Keeps the candidates that are still rotations and changed with the view.
+static void RotNarrow()
 {
 	std::vector<RotCand> keep;
 	for (const RotCand& c : gRotCands) {
-		double v[3];
-		if (RotRead(c, v) && fabs(v[0] - r[0]) < 0.0052 + fabs(r[0]) * 1e-5 && fabs(v[1] - r[1]) < 0.0052 + fabs(r[1]) * 1e-5 &&
-				fabs(v[2] - r[2]) < 0.0052 + fabs(r[2]) * 1e-5) {
-			keep.push_back(c);
-			memcpy(keep.back().last, v, sizeof(v));
-		}
+		double m[9];
+		if (!RotRead(c, m))
+			continue;
+		double change = 0;
+		for (int i = 0; i < 9; ++i)
+			change = std::max(change, fabs(m[i] - c.m[i]));
+		if (change < 0.02)
+			continue;
+		keep.push_back(c);
+		memcpy(keep.back().m, m, sizeof(m));
 	}
 	gRotCands.swap(keep);
 	++gRotNarrowings;
@@ -2481,17 +2601,17 @@ static void RotNarrow(const double r[3])
 
 // The rotation now: of the candidates, the one that changed last. Returns
 // false if none can be read.
-static bool RotValue(double out[3])
+static bool RotValue(double* out)
 {
 	const DWORD now = GetTickCount();
 	int best = -1;
 	for (size_t i = 0; i < gRotCands.size(); ++i) {
 		RotCand& c = gRotCands[i];
-		double v[3];
-		if (!RotRead(c, v))
+		double m[9];
+		if (!RotRead(c, m))
 			continue;
-		if (v[0] != c.last[0] || v[1] != c.last[1] || v[2] != c.last[2]) {
-			memcpy(c.last, v, sizeof(v));
+		if (memcmp(m, c.m, sizeof(m)) != 0) {
+			memcpy(c.m, m, sizeof(m));
 			c.changedAt = now;
 		}
 		if (best < 0 || static_cast<int>(c.changedAt - gRotCands[best].changedAt) > 0)
@@ -2499,32 +2619,42 @@ static bool RotValue(double out[3])
 	}
 	if (best < 0)
 		return false;
-	memcpy(out, gRotCands[best].last, 3 * sizeof(double));
+	memcpy(out, gRotCands[best].m, sizeof(gRotNow));
 	return true;
 }
 
-static int ViewTickLocked(double rx, double ry, double rz);
+// The current view's code, or -1 if not snapped or not known.
+static int CurrentRotCode()
+{
+	double m[9];
+	return gRotLocked && RotValue(m) ? RotCode(m) : -1;
+}
+
+static int ViewTickCode(int code);
 
 // Each overlay frame: when the rotation has changed and then held still for
-// 200 ms (a snap's animation has finished), the view is looked up as Live
-// used to (RSViewTick).
+// 200 ms (a snap's animation has finished), the view is looked up.
 static void RotFollow()
 {
 	if (!gRotLocked)
 		return;
 	EnterCriticalSection(&gOverlayLock);
-	double r[3];
-	if (RotValue(r)) {
+	double m[9];
+	if (RotValue(m)) {
 		const DWORD now = GetTickCount();
-		if (r[0] != gRotNow[0] || r[1] != gRotNow[1] || r[2] != gRotNow[2]) {
-			memcpy(gRotNow, r, sizeof(r));
+		double change = 0;
+		for (int i = 0; i < 9; ++i)
+			change = std::max(change, fabs(m[i] - gRotNow[i]));
+		if (change > 1e-5) {
+			memcpy(gRotNow, m, sizeof(m));
 			gRotChangedAt = now;
 			gRotSettled = false;
 		} else if (!gRotSettled && !gGesture.active && now - gRotChangedAt >= 200) {
 			gRotSettled = true;
-			const int result = ViewTickLocked(r[0], r[1], r[2]);
+			const int code = RotCode(m);
+			const int result = ViewTickCode(code);
 			if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
-				fprintf(f, "%lu rotation settled at %.3f %.3f %.3f: view %d\n", now, r[0], r[1], r[2], result);
+				fprintf(f, "%lu rotation settled, view code %d: result %d\n", now, code, result);
 				fclose(f);
 			}
 		}
@@ -2550,6 +2680,45 @@ static int ViewTickLocked(double rx, double ry, double rz)
 			if (AngleDiff(a, 90 * floor(a / 90 + 0.5)) > 0.5)
 				snapped = false;
 		if (snapped && AnyViewImage() && gActiveView != -2) {
+			BlankView();
+			result = -2;
+		}
+	} else {
+		// A view loaded before its matrix code was known learns it here.
+		if (gViews[slot].code < 0) {
+			const int code = CurrentRotCode();
+			if (code >= 0) {
+				gViews[slot].code = code;
+				SaveViews();
+			}
+		}
+		if (slot != gActiveView || gViewAway) {
+			ActivateView(slot);
+			result = 10 + slot;
+		}
+	}
+	if ((result >= 10 || result == -2) && gOverlayWnd)
+		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	return result;
+}
+
+// The same from the rotation matrix read from memory: code is RotCode of
+// it (-1 when not snapped). Caller holds the lock.
+static int ViewTickCode(int code)
+{
+	LoadViews();
+	if (code < 0) {
+		gViewAway = true;  // turning freely leaves the reference as it is
+		return -1;
+	}
+	int slot = -1;
+	for (int i = 0; i < kDefaultView; ++i)
+		if (gViews[i].used && gViews[i].code == code)
+			slot = i;
+	int result = slot;
+	if (slot < 0) {
+		gViewAway = true;
+		if (gActiveView != -2) {
 			BlankView();
 			result = -2;
 		}
@@ -2586,7 +2755,7 @@ static bool OverlayStep(HWND wnd)
 	}
 	const bool layoutChanged = redraw || st.ratio != shown.ratio || st.px != shown.px || st.py != shown.py ||
 		st.ax != shown.ax || st.ay != shown.ay || st.offX != shown.offX || st.offY != shown.offY ||
-		st.imgS != shown.imgS || st.imgX != shown.imgX || st.imgY != shown.imgY || st.alpha != shown.alpha || st.screenX != shown.screenX ||
+		st.imgSX != shown.imgSX || st.imgSY != shown.imgSY || st.imgX != shown.imgX || st.imgY != shown.imgY || st.alpha != shown.alpha || st.screenX != shown.screenX ||
 		st.screenY != shown.screenY || st.pixelsPerDoc != shown.pixelsPerDoc;
 	if (layoutChanged) {
 		if (st.screenX != shown.screenX || st.screenY != shown.screenY || st.pixelsPerDoc != shown.pixelsPerDoc) {
@@ -3067,6 +3236,9 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 		fclose(f);
 	}
 	gOverlay.visible = true;
+	// Only a view's image is shown, once its view is snapped to.
+	LoadViews();
+	BlankView();
 	LeaveCriticalSection(&gOverlayLock);
 	PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
 	return static_cast<float>(floor(cal.percent));
@@ -3246,13 +3418,15 @@ ZFUNC RSRotProbe(char* text, double, char*, int, char*, int, char**)
 	EnterCriticalSection(&gOverlayLock);
 	if (strcmp(mode, "start") == 0) {
 		gRotLocked = false;
-		RotScan(r);
+		RotScan();
 	} else {
-		RotNarrow(r);
+		RotNarrow();
 	}
 	if (strcmp(mode, "last") == 0) {
 		gRotLocked = !gRotCands.empty() && gRotNarrowings >= 2;
-		memcpy(gRotNow, r, sizeof(r));
+		// The Overlay press looks the current view up itself once its
+		// popups are closed (they would get into the outline match).
+		RotValue(gRotNow);
 		gRotSettled = true;
 	}
 	const size_t n = gRotCands.size();
@@ -3403,6 +3577,9 @@ static void AnchorSlot(int slot, const double* v)
 	w.rx = v[3];
 	w.ry = v[4];
 	w.rz = v[5];
+	const int code = CurrentRotCode();
+	if (code >= 0)
+		w.code = code;
 	w.mask.clear();
 	w.gw = 0;
 	SaveMask(slot);
@@ -3424,7 +3601,8 @@ ZFUNC RSViewImage(char* text, double, char*, int, char*, int, char**)
 	EnterCriticalSection(&gOverlayLock);
 	LoadViews();
 	gViews[gPrepSlot].path = text;
-	gViews[gPrepSlot].imgS = 1;
+	gViews[gPrepSlot].imgSX = gViews[gPrepSlot].imgSY = 1;
+	gViews[gPrepSlot].code = -1;
 	gViews[gPrepSlot].imgX = gViews[gPrepSlot].imgY = 0;
 	AnchorSlot(gPrepSlot, gPrep);
 	gPrepSlot = -1;
