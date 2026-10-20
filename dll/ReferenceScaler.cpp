@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 74;
+static const int kDllBuild = 75;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -2506,8 +2506,42 @@ static bool RotRead(const RotCand& c, double* m)
 	return IsRotation(m);
 }
 
-static void RotScan()
+// The traces (sum of the diagonal) a rotation by these Euler angles can have,
+// for every order of applying them and every sign convention: the trace
+// depends only on the angle turned, so it needs no knowledge of ZBrush's
+// convention, and lets the scan keep only blocks that are this rotation
+// (build 74's scan filled up with other rotations before reaching it).
+static std::vector<double> EulerTraces(const double* deg)
 {
+	std::vector<double> traces;
+	const int orders[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+	for (const auto& o : orders)
+		for (int signs = 0; signs < 8; ++signs) {
+			double m[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+			for (int k = 0; k < 3; ++k) {
+				const int axis = o[k];
+				const double a = deg[axis] * 3.14159265358979323846 / 180 * ((signs >> axis) & 1 ? -1 : 1);
+				const double c = cos(a), sn = sin(a);
+				double r[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+				const int i = (axis + 1) % 3, j = (axis + 2) % 3;
+				r[i * 3 + i] = c;
+				r[i * 3 + j] = -sn;
+				r[j * 3 + i] = sn;
+				r[j * 3 + j] = c;
+				double t[9];
+				for (int y = 0; y < 3; ++y)
+					for (int x = 0; x < 3; ++x)
+						t[y * 3 + x] = r[y * 3] * m[x] + r[y * 3 + 1] * m[3 + x] + r[y * 3 + 2] * m[6 + x];
+				memcpy(m, t, sizeof(m));
+			}
+			traces.push_back(m[0] + m[4] + m[8]);
+		}
+	return traces;
+}
+
+static void RotScan(const double* deg)
+{
+	const std::vector<double> traces = EulerTraces(deg);
 	gRotCands.clear();
 	gRotNarrowings = 0;
 	const DWORD t0 = GetTickCount();
@@ -2566,6 +2600,13 @@ static void RotScan()
 							RotFromBytes(&buf[i], isDouble != 0, stride, m);
 							if (!IsRotation(m) || RotCode(m) >= 0 || gRotCands.size() >= 200000)
 								continue;
+							const double tr = m[0] + m[4] + m[8];
+							bool angle = false;
+							for (double t : traces)
+								if (fabs(tr - t) < 3e-3)
+									angle = true;
+							if (!angle)
+								continue;
 							RotCand c = {chunk + i, isDouble != 0, stride, {}, 0, {}};
 							memcpy(c.m, m, sizeof(m));
 							gRotCands.push_back(c);
@@ -2581,8 +2622,8 @@ static void RotScan()
 		addr = next;
 	}
 	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
-		fprintf(f, "%lu rotation matrix scan: %zu MB in %lu ms, %zu unit rows, %zu rotations found\n", GetTickCount(),
-			scanned >> 20, GetTickCount() - t0, rows, gRotCands.size());
+		fprintf(f, "%lu rotation matrix scan: %zu MB in %lu ms, %zu unit rows, %zu rotations by this angle found%s\n", GetTickCount(),
+			scanned >> 20, GetTickCount() - t0, rows, gRotCands.size(), gRotCands.size() >= 200000 ? " (FULL)" : "");
 		fclose(f);
 	}
 }
@@ -3452,7 +3493,7 @@ ZFUNC RSRotProbe(char* text, double, char*, int, char*, int, char**)
 	EnterCriticalSection(&gOverlayLock);
 	if (strcmp(mode, "start") == 0) {
 		gRotLocked = false;
-		RotScan();
+		RotScan(r);
 	} else {
 		RotNarrow();
 	}
@@ -3669,7 +3710,7 @@ ZFUNC RSViewImage(char* text, double, char*, int, char*, int, char**)
 	w.imgX = w.imgY = 0;
 	// Shown (and the model's outline recorded) now only when snapped to that
 	// view; otherwise kept until it is snapped to.
-	const bool here = !gRotLocked || AtView(CurrentRotCodes(), gPrepSlot);
+	const bool here = gRotLocked && AtView(CurrentRotCodes(), gPrepSlot);
 	float result = 1;
 	if (here) {
 		AnchorSlot(gPrepSlot, gPrep);
