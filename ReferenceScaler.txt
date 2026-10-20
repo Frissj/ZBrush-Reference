@@ -25,7 +25,7 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 25"]
+[VarDef, zrsBuild, "build 26"]
 [VarDef, zrsDll, "ReferenceScaler_Data\ReferenceScaler64.dll"]
 [VarDef, zrsDepth, -1]
 [VarDef, zrsTexBefore, -1]
@@ -101,14 +101,14 @@
 // Works out the ratio and positions from the current model and the anchor
 // sliders, then draws. Leaves a result in zrsMsg.
 [RoutineDef, ZRSUpdate,
-	[If, [IGet, "ZPlugin:Reference Scaler b25:Anchor Scale"] <= 0,
+	[If, [IGet, "ZPlugin:Reference Scaler b26:Anchor Scale"] <= 0,
 		[VarSet, zrsMsg, "Not anchored: press Anchor first."]
 		[VarSet, zrsResult, 0]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b25:Anchor Scale"]]
-		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b25:Anchor X"]]
-		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b25:Anchor Y"]]
+		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b26:Anchor Scale"]]
+		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b26:Anchor X"]]
+		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b26:Anchor Y"]]
 		[RoutineCall, ZRSDraw]
 	]
 ]
@@ -122,7 +122,7 @@
 		[If, zrsLive,
 			[If, [IGet, Transform:Edit],
 				[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b25:Anchor Scale"]]
+				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b26:Anchor Scale"]]
 				[If, ABS(zrsRatio - zrsLastRatio) > 0.002 || ABS(zrsPx - zrsLastPx) > 0.5 || ABS(zrsPy - zrsLastPy) > 0.5,
 					[RoutineCall, ZRSUpdate]
 				]
@@ -148,9 +148,9 @@
 // ---------------------------------------------------------------------------
 // Interface
 // ---------------------------------------------------------------------------
-[ISubPalette, "ZPlugin:Reference Scaler b25"]
+[ISubPalette, "ZPlugin:Reference Scaler b26"]
 
-[IButton, "ZPlugin:Reference Scaler b25:Load Image",
+[IButton, "ZPlugin:Reference Scaler b26:Load Image",
 	"Choose the reference image and draw it behind the model, fitted to the document.",
 	[VarSet, zrsFile, [FileNameAsk, "Image (*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd)|*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd||", , "Choose reference image"]]
 	[If, [StrLength, zrsFile] == 0,
@@ -172,28 +172,28 @@
 	, 0, 1
 ]
 
-[IButton, "ZPlugin:Reference Scaler b25:Anchor",
+[IButton, "ZPlugin:Reference Scaler b26:Anchor",
 	"With the model lined up with the image, press to record this zoom and position as the 1:1 match.",
 	[If, [IGet, Transform:Edit] == 0,
 		[Note, "Put the model in Edit mode first."]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[ISet, "ZPlugin:Reference Scaler b25:Anchor Scale", zrsSx]
-		[ISet, "ZPlugin:Reference Scaler b25:Anchor X", zrsPx]
-		[ISet, "ZPlugin:Reference Scaler b25:Anchor Y", zrsPy]
+		[ISet, "ZPlugin:Reference Scaler b26:Anchor Scale", zrsSx]
+		[ISet, "ZPlugin:Reference Scaler b26:Anchor X", zrsPx]
+		[ISet, "ZPlugin:Reference Scaler b26:Anchor Y", zrsPy]
 		[Note, [StrMerge, "Anchored: model scale ", zrsSx, ", position ", zrsPx, ", ", zrsPy]]
 	]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b25:Sync",
+[IButton, "ZPlugin:Reference Scaler b26:Sync",
 	"Redraw the reference for the current zoom and position once.",
 	[RoutineCall, ZRSUpdate]
 	[Note, [StrMerge, "Sync\n", zrsMsg]]
 	, 0, 0.5
 ]
 
-[ISwitch, "ZPlugin:Reference Scaler b25:Live", 0,
+[ISwitch, "ZPlugin:Reference Scaler b26:Live", 0,
 	"Keep redrawing the reference as the camera zooms and pans.",
 	[VarSet, zrsLive, 1]
 	[RoutineCall, ZRSUpdate]
@@ -204,7 +204,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b25:Reset",
+[IButton, "ZPlugin:Reference Scaler b26:Reset",
 	"Redraw the reference fitted to the document, as Load Image does.",
 	[VarSet, zrsRatio, 1]
 	[VarSet, zrsPx, 0]
@@ -218,7 +218,7 @@
 
 // Step-by-step test of the drawing pipeline: each button does one stage and
 // reports it in its own popup (popups hold about 255 characters).
-[IButton, "ZPlugin:Reference Scaler b25:1 Render",
+[IButton, "ZPlugin:Reference Scaler b26:1 Render",
 	"Test step 1: have the DLL write frame0.png (the image fitted to the document).",
 	[VarSet, zrsArgs, [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " 1 0 0 0 0 frame0.png"]]
 	[VarSet, zrsResult, [FileExecute, zrsDll, "RSRender", zrsArgs]]
@@ -227,7 +227,7 @@
 	, 0, 0.33
 ]
 
-[IButton, "ZPlugin:Reference Scaler b25:2 Import",
+[IButton, "ZPlugin:Reference Scaler b26:2 Import",
 	"Test step 2: import frame0.png into the Texture palette and select it.",
 	[VarSet, zrsFile, [FileNameResolvePath, "ReferenceScaler_Data\frame0.png"]]
 	[RoutineCall, ZRSImport]
@@ -235,7 +235,7 @@
 	, 0, 0.33
 ]
 
-[IButton, "ZPlugin:Reference Scaler b25:3 Fill",
+[IButton, "ZPlugin:Reference Scaler b26:3 Fill",
 	"Test step 3: Color > FillLayer with the current texture, nothing else.",
 	[IPress, Color:FillLayer]
 	[VarSet, zrsTexAfter, -1]
@@ -246,47 +246,58 @@
 	, 0, 0.33
 ]
 
-// Depth tests: the filled image sits at a fixed depth and zooming moves the
-// model in Z, so these move the model 200 units in Z (forward or back) to find
-// which way brings it in front of the image. Reports Z before and after.
-[IButton, "ZPlugin:Reference Scaler b25:5 Model Z-",
-	"Test step 5: move the model forward (Z - 200) without changing anything else.",
-	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[VarSet, zrsBefore, zrsPz]
-	[TransformSet, zrsPx, zrsPy, zrsPz - 200, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[Note, [StrMerge, "5 Model Z-: model Z ", zrsBefore, " -> ", zrsPz, "\nIs the model now in front of the image? Did its size change?"]]
-	, 0, 0.5
+// Depth tests: fill with the current texture under different settings, to
+// find which one puts the image behind the model the way a manual FillLayer
+// did. Undo (Ctrl+Z) between tries.
+[IButton, "ZPlugin:Reference Scaler b26:6 Fill CD Off",
+	"Test step 6: Clear Depth off, then Color > FillLayer.",
+	[If, [IExists, "Texture:Clear Depth"], [ISet, "Texture:Clear Depth", 0]]
+	[IPress, Color:FillLayer]
+	[VarSet, zrsDepth, -1]
+	[If, [IExists, "Texture:Clear Depth"], [VarSet, zrsDepth, [IGet, "Texture:Clear Depth"]]]
+	[Note, [StrMerge, "6 Fill CD Off: Clear Depth is ", zrsDepth, "\nIs the image behind the model? Zoom out: does the model still clip into it?"]]
+	, 0, 0.33
 ]
 
-[IButton, "ZPlugin:Reference Scaler b25:5 Model Z+",
-	"Test step 5: move the model back (Z + 200) without changing anything else.",
-	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[VarSet, zrsBefore, zrsPz]
-	[TransformSet, zrsPx, zrsPy, zrsPz + 200, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[Note, [StrMerge, "5 Model Z+: model Z ", zrsBefore, " -> ", zrsPz, "\nIs the model now in front of the image? Did its size change?"]]
-	, 0, 0.5
+[IButton, "ZPlugin:Reference Scaler b26:6 Fill CD On",
+	"Test step 6: Clear Depth on, then Color > FillLayer.",
+	[If, [IExists, "Texture:Clear Depth"], [ISet, "Texture:Clear Depth", 1]]
+	[IPress, Color:FillLayer]
+	[VarSet, zrsDepth, -1]
+	[If, [IExists, "Texture:Clear Depth"], [VarSet, zrsDepth, [IGet, "Texture:Clear Depth"]]]
+	[Note, [StrMerge, "6 Fill CD On: Clear Depth is ", zrsDepth, "\nIs the image behind the model? Zoom out: does the model still clip into it?"]]
+	, 0, 0.33
 ]
 
-[IButton, "ZPlugin:Reference Scaler b25:About",
+[IButton, "ZPlugin:Reference Scaler b26:6 Clear+Fill",
+	"Test step 6: Layer > Clear, then Clear Depth off and Color > FillLayer.",
+	[If, [IExists, "Layer:Clear"], [IPress, Layer:Clear], [Note, "Layer > Clear not found; filling without clearing."]]
+	[If, [IExists, "Texture:Clear Depth"], [ISet, "Texture:Clear Depth", 0]]
+	[IPress, Color:FillLayer]
+	[VarSet, zrsDepth, -1]
+	[If, [IExists, "Texture:Clear Depth"], [VarSet, zrsDepth, [IGet, "Texture:Clear Depth"]]]
+	[Note, [StrMerge, "6 Clear+Fill: Clear Depth is ", zrsDepth, "\nIs the image behind the model? Zoom out: does the model still clip into it?"]]
+	, 0, 0.33
+]
+
+[IButton, "ZPlugin:Reference Scaler b26:About",
 	"Show which build is running and whether the helper DLL loads.",
 	[Note, [StrMerge, "Reference Scaler ", zrsBuild, "\nDLL: ", [FileNameResolvePath, zrsDll], "\nDLL check: ", [FileExecute, zrsDll, "RSVersion"]]]
 	, 0, 0.5
 ]
 
 // Anchor storage. Set by Anchor; shown so the anchored values are visible.
-[ISlider, "ZPlugin:Reference Scaler b25:Anchor Scale", 0, 0.001, 0, 100000,
+[ISlider, "ZPlugin:Reference Scaler b26:Anchor Scale", 0, 0.001, 0, 100000,
 	"Model scale recorded by Anchor.",
 	, 0, 1
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b25:Anchor X", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b26:Anchor X", 0, 0.001, -100000, 100000,
 	"Model horizontal position recorded by Anchor.",
 	, 0, 0.5
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b25:Anchor Y", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b26:Anchor Y", 0, 0.001, -100000, 100000,
 	"Model vertical position recorded by Anchor.",
 	, 0, 0.5
 ]
