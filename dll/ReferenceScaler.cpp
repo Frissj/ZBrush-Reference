@@ -9,7 +9,10 @@
 // Build (Linux, mingw-w64): see build.sh.
 
 #include <windows.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
 #include <gdiplus.h>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -383,16 +386,17 @@ static BOOL CALLBACK FindZBrushWindow(HWND wnd, LPARAM param)
 }
 
 // Stage 2 (keying): the canvas is filled with the key colour, magenta, so
-// the model is the only thing drawn on it that is not magenta. Every tick the
-// overlay captures the screen under itself (it is excluded from capture with
-// SetWindowDisplayAffinity) and, where it sees magenta, replaces it with the
-// reference. A pixel that is part magenta (model edges, X-ray) has the same
-// share of magenta swapped for the reference. Elsewhere the overlay is fully
-// transparent, so the model and anything ZBrush draws over the canvas show.
+// the model is the only thing drawn on it that is not magenta. The overlay
+// is excluded from screen capture (SetWindowDisplayAffinity), captures the
+// screen under itself every time the desktop changes (DXGI desktop
+// duplication, or BitBlt where that is unavailable), and shows an opaque copy
+// of it with each pixel's share of magenta replaced by the reference: the
+// model, its edges and X-ray come out right, and magenta never reaches the
+// screen. The copy is at most a frame behind what ZBrush drew.
 //
-// If capture exclusion is unavailable (older Windows) or does not work (the
-// capture shows the overlay's own output), it falls back to drawing the
-// reference at a constant opacity over everything, as in stage 1.
+// If capture exclusion is unavailable (older Windows) or does not work (a
+// test at start sees the overlay in its own capture), it falls back to
+// drawing the reference at a constant opacity over everything, as in stage 1.
 
 struct Buffer32 {
 	HDC dc = nullptr;
@@ -443,8 +447,6 @@ struct Buffer32 {
 
 static Buffer32 gRefLayer, gCapture, gOutput;
 static int gKeyState = 0;     // 1 keying, 0 no capture exclusion, -1 exclusion not working
-static int gFeedbackFrames = 0;
-static const UINT_PTR kTickTimer = 1;
 
 // Stage 3 (live navigation): ZScript cannot run while the mouse is dragging,
 // so the DLL predicts ZBrush's camera from the mouse. A low-level mouse hook
@@ -484,6 +486,8 @@ struct NavModel {
 };
 
 enum DragMode { kDragNone, kDragMove, kDragScale, kDragIgnore };
+// What a finished drag was, for Live (RSOverlayInfo 19) and the log.
+enum DragKind { kKindNone, kKindMove, kKindScale, kKindRotate, kKindSculpt };
 
 struct Gesture {
 	bool active = false;
@@ -504,11 +508,14 @@ struct Gesture {
 	double scaleDx = 0, scaleDy = 0;      // screen pixels moved while scaling
 	int scaleSegments = 0;
 	bool movedAfterScale = false;
+	bool rotated = false;
+	int kind = 0;
 	double scaleBasePx = 0, scaleBasePy = 0, scaleCursorX = 0, scaleCursorY = 0;  // first scale segment
 };
 
 static NavModel gNav;
 static double gLastErrorPos = 0, gLastErrorScale = 1;
+static int gLastKind = kKindNone;
 static Gesture gGesture;
 static HHOOK gMouseHook = nullptr, gKeyHook = nullptr;
 static int gHookEvents = 0;
@@ -656,6 +663,8 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 			} else if (mode == kDragScale) {
 				g.scaleDx += dx;
 				g.scaleDy += dy;
+			} else if (dx != 0 || dy != 0) {
+				g.rotated = true;
 			}
 			Predict();
 		}
@@ -664,7 +673,10 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 	case WM_RBUTTONUP:
 		if (g.active) {
 			g.active = false;
-			g.done = g.mode != kDragIgnore && (g.moveX != 0 || g.moveY != 0 || g.scaleSegments > 0);
+			g.kind = g.mode == kDragIgnore ? kKindSculpt : g.scaleSegments > 0 ? kKindScale :
+				(g.moveX != 0 || g.moveY != 0) ? kKindMove : g.rotated ? kKindRotate : kKindNone;
+			gLastKind = g.kind;
+			g.done = g.kind == kKindMove || g.kind == kKindScale || g.kind == kKindRotate;
 		}
 		break;
 	}
@@ -683,6 +695,16 @@ static void Learn(double ratio, double px, double py)
 	g.done = false;
 	const double k = gOverlay.pixelsPerDoc;
 	const double s = ratio / g.ratio0;
+	// Every drag is logged, so ZBrush's behaviour can be checked.
+	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "kind %d right %d alt %d scaleSegs %d move %.0f %.0f scale %.0f %.0f afterScaleMove %d "
+			"start %.5f %.2f %.2f predicted %.5f %.2f %.2f exact %.5f %.2f %.2f k %.4f\n",
+			g.kind, g.right, g.altSeen, g.scaleSegments, g.moveX, g.moveY, g.scaleDx, g.scaleDy, g.movedAfterScale,
+			g.ratio0, g.px0, g.py0, gOverlay.ratio, gOverlay.px, gOverlay.py, ratio, px, py, k);
+		fclose(f);
+	}
+	if (g.kind == kKindRotate)
+		return;
 	if (g.scaleSegments == 0) {
 		// Move only: gain along the direction moved.
 		const double mx = g.moveX / k, my = g.moveY / k, len2 = mx * mx + my * my;
@@ -777,31 +799,137 @@ static DWORD WINAPI HookThread(LPVOID)
 	return 0;
 }
 
-// Draws the reference for the current state into gRefLayer (premultiplied,
-// transparent outside the image). fast uses plain bilinear filtering, for
-// redraws on every tick of a drag. Returns false if there is nothing to show.
-static bool BuildRefLayer(const OverlayState& st, bool fast = false)
+// The reference as mip levels (each half the size of the one before), so it
+// can be resampled for any zoom quickly and without aliasing.
+struct Level {
+	std::vector<uint32_t> px;  // B, G, R, A
+	int w = 0, h = 0;
+};
+static std::vector<Level> gLevels;
+static std::wstring gLevelsFor;
+
+static void BuildLevels()
 {
-	if (!st.visible || !LoadSavedImage() || st.docW < 1 || st.docH < 1)
+	if (!LoadSavedImage() || gLevelsFor == gImagePath)
+		return;
+	gLevels.clear();
+	Level top;
+	top.w = gImage->GetWidth();
+	top.h = gImage->GetHeight();
+	top.px.resize(static_cast<size_t>(top.w) * top.h);
+	Gdiplus::Rect r(0, 0, top.w, top.h);
+	Gdiplus::BitmapData data;
+	if (gImage->LockBits(&r, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &data) != Gdiplus::Ok)
+		return;
+	for (int y = 0; y < top.h; ++y)
+		memcpy(&top.px[static_cast<size_t>(y) * top.w], static_cast<BYTE*>(data.Scan0) + y * data.Stride, top.w * 4);
+	gImage->UnlockBits(&data);
+	gLevels.push_back(std::move(top));
+	while (gLevels.back().w > 16 && gLevels.back().h > 16) {
+		const Level& a = gLevels.back();
+		Level b;
+		b.w = a.w / 2;
+		b.h = a.h / 2;
+		b.px.resize(static_cast<size_t>(b.w) * b.h);
+		for (int y = 0; y < b.h; ++y)
+			for (int x = 0; x < b.w; ++x) {
+				const uint32_t* p = &a.px[static_cast<size_t>(y * 2) * a.w + x * 2];
+				uint32_t out = 0;
+				for (int c = 0; c < 32; c += 8) {
+					const uint32_t sum = ((p[0] >> c) & 255) + ((p[1] >> c) & 255) + ((p[a.w] >> c) & 255) + ((p[a.w + 1] >> c) & 255);
+					out |= ((sum + 2) / 4) << c;
+				}
+				b.px[static_cast<size_t>(y) * b.w + x] = out;
+			}
+		gLevels.push_back(std::move(b));
+	}
+	gLevelsFor = gImagePath;
+}
+
+// Resamples the reference for the current state into gRefLayer (bilinear,
+// premultiplied, scaled by the opacity, transparent outside the image).
+// Returns false if there is nothing to show.
+static bool BuildRefLayer(const OverlayState& st)
+{
+	if (!st.visible || st.docW < 1 || st.docH < 1)
+		return false;
+	BuildLevels();
+	if (gLevels.empty())
 		return false;
 	const int w = static_cast<int>(st.docW * st.pixelsPerDoc + 0.5);
 	const int h = static_cast<int>(st.docH * st.pixelsPerDoc + 0.5);
 	if (!gRefLayer.Resize(w, h) || !gCapture.Resize(w, h) || !gOutput.Resize(w, h))
 		return false;
-	Gdiplus::Bitmap target(w, h, w * 4, PixelFormat32bppPARGB, gRefLayer.bits);
-	Gdiplus::Graphics g(&target);
-	g.Clear(Gdiplus::Color(0, 0, 0, 0));
-	g.SetInterpolationMode(fast ? Gdiplus::InterpolationModeBilinear : Gdiplus::InterpolationModeHighQualityBilinear);
-	g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-	const double imgW = gImage->GetWidth(), imgH = gImage->GetHeight();
+
+	// The image's rectangle on the overlay, as in RSRender.
+	const double imgW = gLevels[0].w, imgH = gLevels[0].h;
 	const double fit = (st.docW / imgW < st.docH / imgH) ? st.docW / imgW : st.docH / imgH;
 	const double baseW = imgW * fit, baseH = imgH * fit;
 	const double baseX = (st.docW - baseW) * 0.5, baseY = (st.docH - baseH) * 0.5;
-	const double x = st.px + st.ratio * (baseX - st.ax);
-	const double y = st.py + st.ratio * (baseY - st.ay);
 	const double k = st.pixelsPerDoc;
-	g.DrawImage(gImage, Gdiplus::RectF(static_cast<Gdiplus::REAL>(x * k), static_cast<Gdiplus::REAL>(y * k),
-		static_cast<Gdiplus::REAL>(baseW * st.ratio * k), static_cast<Gdiplus::REAL>(baseH * st.ratio * k)));
+	const double x0 = (st.px + st.ratio * (baseX - st.ax)) * k, y0 = (st.py + st.ratio * (baseY - st.ay)) * k;
+	const double dispW = baseW * st.ratio * k, dispH = baseH * st.ratio * k;
+
+	// Smallest level still at least as large as the image on screen.
+	size_t li = 0;
+	while (li + 1 < gLevels.size() && gLevels[li + 1].w >= dispW && gLevels[li + 1].h >= dispH)
+		++li;
+	const Level& lv = gLevels[li];
+
+	// Per column and row: the two texels to blend and the weight (0-256) of
+	// the second, or -1 outside the image.
+	std::vector<int> cx(w), cw(w), ry(h), rw(h);
+	for (int x = 0; x < w; ++x) {
+		const double u = (x + 0.5 - x0) / dispW * lv.w - 0.5;
+		if (u < -0.5 || u > lv.w - 0.5) { cx[x] = -1; continue; }
+		const double fu = u < 0 ? 0 : u > lv.w - 1 ? lv.w - 1 : u;
+		cx[x] = static_cast<int>(fu);
+		cw[x] = static_cast<int>((fu - cx[x]) * 256);
+	}
+	for (int y = 0; y < h; ++y) {
+		const double v = (y + 0.5 - y0) / dispH * lv.h - 0.5;
+		if (v < -0.5 || v > lv.h - 0.5) { ry[y] = -1; continue; }
+		const double fv = v < 0 ? 0 : v > lv.h - 1 ? lv.h - 1 : v;
+		ry[y] = static_cast<int>(fv);
+		rw[y] = static_cast<int>((fv - ry[y]) * 256);
+	}
+	const int op = st.alpha;
+	uint32_t* out = reinterpret_cast<uint32_t*>(gRefLayer.bits);
+	for (int y = 0; y < h; ++y) {
+		uint32_t* row = out + static_cast<size_t>(y) * w;
+		if (ry[y] < 0) {
+			memset(row, 0, w * 4);
+			continue;
+		}
+		const uint32_t* r0 = &lv.px[static_cast<size_t>(ry[y]) * lv.w];
+		const uint32_t* r1 = ry[y] + 1 < lv.h ? r0 + lv.w : r0;
+		const int wy = rw[y];
+		for (int x = 0; x < w; ++x) {
+			const int ix = cx[x];
+			if (ix < 0) {
+				row[x] = 0;
+				continue;
+			}
+			const int ix1 = ix + 1 < lv.w ? ix + 1 : ix;
+			const int wx = cw[x];
+			uint32_t result = 0;
+			int alpha = 255;
+			for (int c = 24; c >= 0; c -= 8) {
+				const int a = (r0[ix] >> c) & 255, b = (r0[ix1] >> c) & 255;
+				const int d = (r1[ix] >> c) & 255, e = (r1[ix1] >> c) & 255;
+				const int top = a * 256 + (b - a) * wx, bottom = d * 256 + (e - d) * wx;
+				int v = (top * 256 + (bottom - top) * wy) >> 16;
+				if (c == 24) {
+					alpha = v * op / 255;
+					v = alpha;
+				} else {
+					v = v * alpha / 255;  // premultiply
+				}
+				result |= static_cast<uint32_t>(v) << c;
+			}
+			row[x] = result;
+		}
+	}
 	return true;
 }
 
@@ -816,68 +944,236 @@ static void Present(HWND wnd, const OverlayState& st, Buffer32& buf, BYTE alpha)
 		ShowWindow(wnd, SW_SHOWNOACTIVATE);
 }
 
+// Screen capture with DXGI desktop duplication: frames arrive as soon as the
+// desktop changes and copying them is cheap. Falls back to BitBlt (polled)
+// when it cannot be set up.
+struct Duplicator {
+	ID3D11Device* device = nullptr;
+	ID3D11DeviceContext* context = nullptr;
+	IDXGIOutputDuplication* dup = nullptr;
+	ID3D11Texture2D* staging = nullptr;
+	RECT output = {0, 0, 0, 0};   // the duplicated monitor, screen pixels
+	RECT region = {0, 0, 0, 0};   // what the staging texture holds
+	bool failed = false;
+
+	void Release()
+	{
+		if (staging) staging->Release();
+		if (dup) dup->Release();
+		if (context) context->Release();
+		if (device) device->Release();
+		staging = nullptr;
+		dup = nullptr;
+		context = nullptr;
+		device = nullptr;
+	}
+
+	// Sets up duplication of the monitor containing (x, y).
+	bool Init(int x, int y)
+	{
+		Release();
+		IDXGIFactory1* factory = nullptr;
+		if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))))
+			return false;
+		bool ok = false;
+		IDXGIAdapter1* adapter = nullptr;
+		for (UINT a = 0; !ok && factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; ++a) {
+			IDXGIOutput* out = nullptr;
+			for (UINT o = 0; !ok && adapter->EnumOutputs(o, &out) != DXGI_ERROR_NOT_FOUND; ++o) {
+				DXGI_OUTPUT_DESC desc;
+				out->GetDesc(&desc);
+				const RECT& r = desc.DesktopCoordinates;
+				if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) {
+					IDXGIOutput1* out1 = nullptr;
+					if (SUCCEEDED(D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
+							D3D11_SDK_VERSION, &device, nullptr, &context)) &&
+						SUCCEEDED(out->QueryInterface(__uuidof(IDXGIOutput1), reinterpret_cast<void**>(&out1))) &&
+						SUCCEEDED(out1->DuplicateOutput(device, &dup))) {
+						output = r;
+						ok = true;
+					}
+					if (out1)
+						out1->Release();
+				}
+				out->Release();
+			}
+			adapter->Release();
+		}
+		factory->Release();
+		if (!ok)
+			Release();
+		return ok;
+	}
+
+	// Waits up to timeout ms for a new desktop frame and copies the screen
+	// rectangle (sx, sy, w, h) into dst. Returns 1 for a new frame, 0 if none
+	// came, -1 if duplication failed.
+	int Grab(int sx, int sy, int w, int h, Buffer32& dst, UINT timeout)
+	{
+		if (!dup)
+			return -1;
+		DXGI_OUTDUPL_FRAME_INFO info;
+		IDXGIResource* res = nullptr;
+		HRESULT hr = dup->AcquireNextFrame(timeout, &info, &res);
+		if (hr == DXGI_ERROR_WAIT_TIMEOUT)
+			return 0;
+		if (FAILED(hr)) {
+			// Access lost (mode change, secure desktop): set up again next time.
+			Release();
+			return -1;
+		}
+		ID3D11Texture2D* frame = nullptr;
+		res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&frame));
+		res->Release();
+		// The part of the rectangle on this monitor, in the monitor's pixels.
+		const int left = sx > output.left ? sx : output.left, top = sy > output.top ? sy : output.top;
+		const int right = sx + w < output.right ? sx + w : output.right, bottom = sy + h < output.bottom ? sy + h : output.bottom;
+		int result = 0;
+		if (frame && right > left && bottom > top) {
+			const int cw = right - left, ch = bottom - top;
+			if (!staging || region.right - region.left != cw || region.bottom - region.top != ch) {
+				if (staging)
+					staging->Release();
+				staging = nullptr;
+				D3D11_TEXTURE2D_DESC fd;
+				frame->GetDesc(&fd);
+				D3D11_TEXTURE2D_DESC td = {};
+				td.Width = cw;
+				td.Height = ch;
+				td.MipLevels = 1;
+				td.ArraySize = 1;
+				td.Format = fd.Format;
+				td.SampleDesc.Count = 1;
+				td.Usage = D3D11_USAGE_STAGING;
+				td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+				device->CreateTexture2D(&td, nullptr, &staging);
+			}
+			region = {left, top, right, bottom};
+			if (staging) {
+				D3D11_BOX box = {static_cast<UINT>(left - output.left), static_cast<UINT>(top - output.top), 0,
+					static_cast<UINT>(right - output.left), static_cast<UINT>(bottom - output.top), 1};
+				context->CopySubresourceRegion(staging, 0, 0, 0, 0, frame, 0, &box);
+				D3D11_MAPPED_SUBRESOURCE map;
+				if (SUCCEEDED(context->Map(staging, 0, D3D11_MAP_READ, 0, &map))) {
+					if (cw != w || ch != h)
+						memset(dst.bits, 0, static_cast<size_t>(w) * h * 4);
+					for (int y = 0; y < ch; ++y)
+						memcpy(dst.bits + (static_cast<size_t>(top - sy + y) * w + (left - sx)) * 4,
+							static_cast<BYTE*>(map.pData) + static_cast<size_t>(y) * map.RowPitch, cw * 4);
+					context->Unmap(staging, 0);
+					result = 1;
+				}
+			}
+		}
+		if (frame)
+			frame->Release();
+		dup->ReleaseFrame();
+		return result;
+	}
+};
+
+static Duplicator gDup;
+static int gCaptureMethod = 0;  // 1 desktop duplication, 0 BitBlt
+static double gFps = 0;
+
+// Fills gCapture with the screen under the overlay. Returns true if it may
+// have changed since the last call.
+static bool Capture(const OverlayState& st)
+{
+	const int w = gCapture.w, h = gCapture.h;
+	const int sx = static_cast<int>(st.screenX), sy = static_cast<int>(st.screenY);
+	if (!gDup.dup && !gDup.failed) {
+		if (!gDup.Init(sx + w / 2, sy + h / 2))
+			gDup.failed = true;
+	}
+	if (gDup.dup) {
+		const int got = gDup.Grab(sx, sy, w, h, gCapture, 8);
+		if (got >= 0) {
+			gCaptureMethod = 1;
+			return got == 1;
+		}
+		// Lost: try to set it up again on the next call.
+		return false;
+	}
+	gCaptureMethod = 0;
+#ifdef RS_TEST_HIDE_CAPTURE
+	// Test builds (Wine has no capture exclusion): hide while capturing, and
+	// stay shown long enough between captures for tests to read the screen.
+	Sleep(200);
+	ShowWindow(gOverlayWnd, SW_HIDE);
+	Sleep(60);
+#else
+	Sleep(4);
+#endif
+	HDC screen = GetDC(nullptr);
+	BitBlt(gCapture.dc, 0, 0, w, h, screen, sx, sy, SRCCOPY);
+	ReleaseDC(nullptr, screen);
+	GdiFlush();
+	return true;
+}
+
 // Below this share of magenta (out of 255) a pixel counts as model. ZBrush
 // tints some model pixels slightly towards the background colour.
 static const int kModelBelow = 70;
 
-// Captures the screen under the overlay and composites the reference into
-// the magenta parts. opacity 0-255 scales the reference (black behind it).
+// Builds the opaque output from gCapture: each pixel's share of magenta is
+// replaced by the reference (gRefLayer, black where there is none).
 static void Composite(HWND wnd, const OverlayState& st)
 {
 	const int w = gOutput.w, h = gOutput.h;
-#ifdef RS_TEST_HIDE_CAPTURE
-	// Test builds (Wine has no capture exclusion): hide while capturing.
-	ShowWindow(wnd, SW_HIDE);
-	Sleep(60);
-#endif
-	HDC screen = GetDC(nullptr);
-	BitBlt(gCapture.dc, 0, 0, w, h, screen, static_cast<int>(st.screenX), static_cast<int>(st.screenY), SRCCOPY);
-	ReleaseDC(nullptr, screen);
-	GdiFlush();
-
 	const size_t n = static_cast<size_t>(w) * h;
 	gKeyShare.resize(n);
 	gKeyW = w;
 	gKeyH = h;
-	const int op = st.alpha;
 	const unsigned char* cap = gCapture.bits;
 	const unsigned char* ref = gRefLayer.bits;
 	unsigned char* out = gOutput.bits;
-	size_t opaque = 0, echoed = 0;
 	for (size_t i = 0; i < n; ++i, cap += 4, ref += 4, out += 4) {
 		const int b = cap[0], g = cap[1], r = cap[2];
-		// The overlay's last output showing up in the capture means it is
-		// not excluded from capture.
-		if (out[3] == 255) {
-			++opaque;
-			if (out[0] == b && out[1] == g && out[2] == r)
-				++echoed;
-		}
 		// Share of magenta: blending any grey with magenta (255, 0, 255) by t
 		// raises R and B above G by t * 255.
 		const int mn = r < b ? r : b;
 		int t = mn > g ? mn - g : 0;
 		gKeyShare[i] = static_cast<unsigned char>(t);
+		out[3] = 255;
 		if (t < kModelBelow) {
-			out[0] = out[1] = out[2] = out[3] = 0;
+			out[0] = static_cast<unsigned char>(b);
+			out[1] = static_cast<unsigned char>(g);
+			out[2] = static_cast<unsigned char>(r);
 			continue;
 		}
-		// Replace that share of magenta with the reference.
 		t = t > 230 ? 256 : (t << 8) / 255;
-		const int rb = ref[0] * op / 255, rg = ref[1] * op / 255, rr = ref[2] * op / 255;
-		const int ob = b + (t * (rb - 255) >> 8), og = g + (t * rg >> 8), orr = r + (t * (rr - 255) >> 8);
+		const int ob = b + (t * (ref[0] - 255) >> 8), og = g + (t * ref[1] >> 8), orr = r + (t * (ref[2] - 255) >> 8);
 		out[0] = static_cast<unsigned char>(ob < 0 ? 0 : ob > 255 ? 255 : ob);
 		out[1] = static_cast<unsigned char>(og < 0 ? 0 : og > 255 ? 255 : og);
 		out[2] = static_cast<unsigned char>(orr < 0 ? 0 : orr > 255 ? 255 : orr);
-		out[3] = 255;
-	}
-	if (opaque > 1000 && echoed * 2 > opaque) {
-		if (++gFeedbackFrames >= 3)
-			gKeyState = -1;
-	} else {
-		gFeedbackFrames = 0;
 	}
 	Present(wnd, st, gOutput, 255);
+}
+
+// Checks that the overlay really is left out of screen captures: shows it
+// solid green and looks for green in a BitBlt of the screen under it.
+static bool ExclusionWorks(HWND wnd, const OverlayState& st)
+{
+#ifdef RS_TEST_HIDE_CAPTURE
+	return true;
+#endif
+	const int w = gOutput.w, h = gOutput.h;
+	uint32_t* out = reinterpret_cast<uint32_t*>(gOutput.bits);
+	for (size_t i = 0, n = static_cast<size_t>(w) * h; i < n; ++i)
+		out[i] = 0xff00ff00;
+	Present(wnd, st, gOutput, 255);
+	Sleep(100);
+	HDC screen = GetDC(nullptr);
+	BitBlt(gCapture.dc, 0, 0, w, h, screen, static_cast<int>(st.screenX), static_cast<int>(st.screenY), SRCCOPY);
+	ReleaseDC(nullptr, screen);
+	GdiFlush();
+	const uint32_t* cap = reinterpret_cast<const uint32_t*>(gCapture.bits);
+	size_t green = 0, n = static_cast<size_t>(w) * h;
+	for (size_t i = 0; i < n; i += 7)
+		if ((cap[i] & 0xffffff) == 0x00ff00)
+			++green;
+	return green * 7 < n / 2;
 }
 
 // A left drag that starts on the model is sculpting, not navigation. Decided
@@ -901,56 +1197,75 @@ static void ClassifyGesture()
 	LeaveCriticalSection(&gOverlayLock);
 }
 
-// Rebuilds the reference layer after a state change, then draws.
-static void OverlayRedraw(HWND wnd)
-{
-	EnterCriticalSection(&gOverlayLock);
-	const OverlayState st = gOverlay;
-	LeaveCriticalSection(&gOverlayLock);
-	const bool show = BuildRefLayer(st);
-	if (!show) {
-		ShowWindow(wnd, SW_HIDE);
-		return;
-	}
-	if (gKeyState == 1)
-		Composite(wnd, st);
-	else
-		Present(wnd, st, gRefLayer, static_cast<BYTE>(st.alpha));
-}
+static bool gRedrawPending = false;
 
-// Timer tick: while keying, follows any drag prediction and recomposites
-// with a fresh capture.
-static void OverlayTick(HWND wnd)
+// One pass of the overlay loop: rebuilds the reference if its layout
+// changed, captures, composites and presents. Returns false when idle.
+static bool OverlayStep(HWND wnd)
 {
-	static double lastRatio = 0, lastPx = 0, lastPy = 0;
-	if (gKeyState != 1)
-		return;
+	static OverlayState shown;
+	static bool tested = false;
+	static DWORD fpsStart = 0;
+	static int fpsFrames = 0;
 	ClassifyGesture();
 	EnterCriticalSection(&gOverlayLock);
 	const OverlayState st = gOverlay;
+	const bool redraw = gRedrawPending;
+	gRedrawPending = false;
 	LeaveCriticalSection(&gOverlayLock);
-	if (!st.visible || !gOutput.dc)
-		return;
-	if (st.ratio != lastRatio || st.px != lastPx || st.py != lastPy) {
-		lastRatio = st.ratio;
-		lastPx = st.px;
-		lastPy = st.py;
-		BuildRefLayer(st, true);
+	if (!st.visible) {
+		if (IsWindowVisible(wnd))
+			ShowWindow(wnd, SW_HIDE);
+		tested = false;
+		return false;
 	}
-	Composite(wnd, st);
-	if (gKeyState != 1)
-		OverlayRedraw(wnd);
+	const bool layoutChanged = redraw || st.ratio != shown.ratio || st.px != shown.px || st.py != shown.py ||
+		st.ax != shown.ax || st.ay != shown.ay || st.alpha != shown.alpha || st.screenX != shown.screenX ||
+		st.screenY != shown.screenY || st.pixelsPerDoc != shown.pixelsPerDoc;
+	if (layoutChanged) {
+		if (st.screenX != shown.screenX || st.screenY != shown.screenY || st.pixelsPerDoc != shown.pixelsPerDoc) {
+			// The overlay moved (recalibrated): it may be on another monitor.
+			gDup.Release();
+			gDup.failed = false;
+		}
+		if (!BuildRefLayer(st)) {
+			ShowWindow(wnd, SW_HIDE);
+			return false;
+		}
+		shown = st;
+	}
+	if (gKeyState == 1 && !tested) {
+		tested = true;
+		if (!ExclusionWorks(wnd, st))
+			gKeyState = -1;
+	}
+	if (gKeyState != 1) {
+		if (layoutChanged)
+			Present(wnd, st, gRefLayer, static_cast<BYTE>(255));
+		return false;
+	}
+	if (Capture(st) || layoutChanged) {
+		Composite(wnd, st);
+		++fpsFrames;
+		const DWORD now = GetTickCount();
+		if (now - fpsStart >= 1000) {
+			gFps = fpsFrames * 1000.0 / (now - fpsStart);
+			fpsStart = now;
+			fpsFrames = 0;
+		}
+	}
+	return true;
 }
 
 static LRESULT CALLBACK OverlayProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 {
 	switch (msg) {
 	case WM_RS_REDRAW:
-		OverlayRedraw(wnd);
-		return 0;
-	case WM_TIMER:
-		if (wp == kTickTimer)
-			OverlayTick(wnd);
+		EnterCriticalSection(&gOverlayLock);
+		gRedrawPending = true;
+		LeaveCriticalSection(&gOverlayLock);
+		if (!gOverlay.visible || gKeyState != 1)
+			OverlayStep(wnd);
 		return 0;
 	case WM_RS_CLOSE:
 		DestroyWindow(wnd);
@@ -990,17 +1305,25 @@ static DWORD WINAPI OverlayThread(LPVOID ready)
 #endif
 	if (gOverlayWnd) {
 		LoadNav();
-		SetTimer(gOverlayWnd, kTickTimer, 40, nullptr);
 		CloseHandle(CreateThread(nullptr, 0, HookThread, nullptr, 0, nullptr));
 	}
 	SetEvent(static_cast<HANDLE>(ready));
+	// Messages first, then a frame; frames pace themselves on the desktop
+	// (Capture waits for the next one), and an idle overlay just waits.
+	HWND wnd = gOverlayWnd;
 	MSG msg;
-	while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-		TranslateMessage(&msg);
-		DispatchMessageW(&msg);
+	for (;;) {
+		while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+			if (msg.message == WM_QUIT) {
+				gOverlayThreadId = 0;
+				return 0;
+			}
+			TranslateMessage(&msg);
+			DispatchMessageW(&msg);
+		}
+		if (!gOverlayWnd || !OverlayStep(wnd))
+			MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT);
 	}
-	gOverlayThreadId = 0;
-	return 0;
 }
 
 // Starts the overlay thread once and keeps the DLL loaded for it.
@@ -1386,7 +1709,10 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 // error in document pixels, "13" its predicted / exact scale. "14" to "16"
 // the overlay's current ratio, x and y (including any drag prediction). "17"
 // mouse events seen, "18" the last drag's mode (0 rotate, 1 move, 2 scale,
-// 3 sculpt) + 10 x scale segments + 100 while dragging.
+// 3 sculpt) + 10 x scale segments + 100 while dragging. "19" what the last
+// finished drag was (0 nothing, 1 move, 2 scale, 3 rotate, 4 sculpt), then
+// clears it; "20" capture method (1 desktop duplication, 0 BitBlt); "21"
+// overlay frames per second.
 ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 {
 	const int which = text ? atoi(text) : -1;
@@ -1409,6 +1735,13 @@ ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 	case 15: return static_cast<float>(gOverlay.px);
 	case 16: return static_cast<float>(gOverlay.py);
 	case 17: return static_cast<float>(gHookEvents);
+	case 19: {
+		const int kind = gLastKind;
+		gLastKind = kKindNone;
+		return static_cast<float>(kind);
+	}
+	case 20: return static_cast<float>(gCaptureMethod);
+	case 21: return static_cast<float>(floor(gFps + 0.5));
 	case 18: return static_cast<float>(gGesture.mode + 10 * gGesture.scaleSegments + 100 * gGesture.active);
 	}
 	return -1;
