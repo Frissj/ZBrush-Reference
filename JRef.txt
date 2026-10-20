@@ -1,0 +1,827 @@
+// JRef.txt
+// ZBrush 2023 ZScript plugin: keeps reference images with the model.
+// A click-through overlay window (drawn by JRef_Data\JRef64.dll) shows a
+// reference image per view behind the model (Classic) or in a panel at the
+// side (PureRef), following ZBrush's zoom, pan and view snaps, which the DLL
+// reads from ZBrush's memory.
+//
+// Install: keep the JRef_Data folder next to this file. To load JRef every
+// time ZBrush starts, put the compiled JRef.zsc (ZBrush writes it next to
+// this file when the file is loaded with ZScript > Load) and the JRef_Data
+// folder into ZBrush's ZStartup\ZPlugs64 folder. It appears as the JRef menu.
+//
+// A project's views, outlines and settings live in a JRef folder next to the
+// first image loaded, with copies of the images, so the folder can be taken to
+// another computer and opened with Project > Open Project.
+//
+// ZScript file commands need "!:" in front of an absolute path. Feedback uses
+// [Note, text] popups only.
+
+[IConfig, 2022]
+[IShowActions, 0]
+
+[VarDef, zrsBuild, "build 86"]
+[VarDef, zrsDll, "JRef_Data\JRef64.dll"]
+[VarDef, zrsDllBuild, 86]
+[VarDef, zrsPx, 0]
+[VarDef, zrsPy, 0]
+[VarDef, zrsPz, 0]
+[VarDef, zrsSx, 0]
+[VarDef, zrsSy, 0]
+[VarDef, zrsSz, 0]
+[VarDef, zrsRx, 0]
+[VarDef, zrsRy, 0]
+[VarDef, zrsRz, 0]
+[VarDef, zrsRatio, 1]
+[VarDef, zrsAx, 0]
+[VarDef, zrsAy, 0]
+[VarDef, zrsLastRatio, 0]
+[VarDef, zrsLastPx, 0]
+[VarDef, zrsLastPy, 0]
+[VarDef, zrsResult, 0]
+[VarDef, zrsArgs, ""]
+[VarDef, zrsFile, ""]
+[VarDef, zrsMsg, ""]
+[VarDef, zrsTick, 0]
+[VarDef, zrsOx, 0]
+[VarDef, zrsOy, 0]
+[VarDef, zrsZoom, 1]
+[VarDef, zrsOverlayOn, 0]
+[VarDef, zrsTurn, 0]
+[VarDef, zrsCleared, 0]
+[VarDef, zrsMsg2, ""]
+[VarDef, zrsSetResult, 0]
+[VarDef, zrsAutoAnchored, 0]
+[VarDef, zrsMemFound, 0]
+[VarDef, zrsN, 0]
+[VarDef, zrsMult, 0]
+[VarDef, zrsTry, 0]
+[VarDef, zrsCount, 0]
+[VarDef, zrsBestCount, 0]
+[VarDef, zrsBestZ, 0]
+[VarDef, zrsEditFill, -1]
+[VarDef, zrsEditAfter, -1]
+[VarDef, zrsKx, 0]
+[VarDef, zrsKy, 0]
+[VarDef, zrsKz, 0]
+[VarDef, zrsKsx, 0]
+[VarDef, zrsKsy, 0]
+[VarDef, zrsKsz, 0]
+[VarDef, zrsKrx, 0]
+[VarDef, zrsKry, 0]
+[VarDef, zrsKrz, 0]
+[VarDef, zrsView, -1]
+[VarDef, zrsOk, 0]
+[VarDef, zrsRot, ""]
+[VarDef, zrsL0, ""]
+[VarDef, zrsL1, ""]
+[VarDef, zrsL2, ""]
+[VarDef, zrsL3, ""]
+
+// Sets the variables for the base layout: the image fitted to the document,
+// unscaled (ratio 1, model position = anchor position).
+// Warns if the DLL ZBrush has loaded is not the one this build expects:
+// once the overlay has run, ZBrush keeps the old DLL until it restarts.
+[RoutineDef, ZRSCheckDll,
+	[VarSet, zrsTick, [FileExecute, zrsDll, "RSVersion"]]
+	[If, zrsTick != zrsDllBuild,
+		[Note, [StrMerge, "Wrong helper DLL: it is build ", zrsTick, ", this plugin needs ", zrsDllBuild, ".\nRestart ZBrush, and make sure this file is the DLL being updated:\n", [FileNameResolvePath, zrsDll]]]
+	]
+]
+
+[RoutineDef, ZRSBase,
+	[VarSet, zrsRatio, 1]
+	[VarSet, zrsSx, 0]
+	[VarSet, zrsPx, 0]
+	[VarSet, zrsPy, 0]
+	[VarSet, zrsAx, 0]
+	[VarSet, zrsAy, 0]
+]
+
+// FillLayer drops the model out of Edit mode (it is baked into the canvas and
+// painted over). ZRSRestore puts it back: if Edit is off after the fill, it
+// draws the current tool at the model's saved position with a canvas drag (in
+// Draw mode, which ZBrush returns to when Edit turns off; Transform:Draw is
+// pressed only where that path exists),
+// turns Edit on and restores the transform saved before the fill (zrsK*).
+[RoutineDef, ZRSRestore,
+	[VarSet, zrsEditFill, [IGet, Transform:Edit]]
+	[If, zrsEditFill == 0,
+		[If, [IExists, "Transform:Draw"], [IPress, Transform:Draw]]
+		[CanvasClick, zrsKx, zrsKy, zrsKx + 40, zrsKy + 40]
+		[IPress, Transform:Edit]
+		[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
+	]
+	[VarSet, zrsEditAfter, [IGet, Transform:Edit]]
+]
+
+// Clears the canvas layer, imports the frame at zrsFile, selects it and fills
+// the canvas with it. The fill covers the model until ZRSRestore draws it
+// again. Without the clear, FillLayer keeps the depth of the model it baked
+// into the canvas, and the redrawn model fights with that copy (stripes of
+// fill colour on the model, and clipping when it is smaller than the copy).
+[RoutineDef, ZRSFillOnly,
+	[VarSet, zrsCleared, [IExists, "Layer:Clear"]]
+	[If, zrsCleared, [IPress, "Layer:Clear"]]
+	[FileNameSetNext, [StrMerge, "!:", zrsFile]]
+	[IPress, Texture:Import]
+	[ISet, "Texture:Item Info", [IGetMax, "Texture:Item Info"]]
+	[IPress, Color:FillLayer]
+]
+
+// Fills the canvas with the frame at zrsFile and puts the model back in Edit
+// mode in front of it.
+[RoutineDef, ZRSFill,
+	[TransformGet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
+	[RoutineCall, ZRSFillOnly]
+	[RoutineCall, ZRSRestore]
+]
+
+// Records the current view as the anchor, in the DLL's anchor.txt.
+[RoutineDef, ZRSAnchorNow,
+	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+	[VarSet, zrsArgs, [StrMerge, zrsSx, " ", zrsPx, " ", zrsPy, " ", zrsRx, " ", zrsRy]]
+	[FileExecute, zrsDll, "RSAnchorSave", [StrMerge, zrsArgs, " ", zrsRz]]
+	[FileExecute, zrsDll, "RSOverlayResetOffset"]
+	[VarSet, zrsMsg, [StrMerge, "Anchored: model scale ", zrsSx, ", position ", zrsPx, ", ", zrsPy]]
+]
+
+// Sends the Gamma and Saturation sliders to the DLL (in percent).
+[RoutineDef, ZRSLevels,
+	[VarSet, zrsTick, [IGet, "JRef:Image:Gamma"] * 100 + 0.5]
+	[FileExecute, zrsDll, "RSDisplay", [StrMerge, "gamma ", zrsTick]]
+	[VarSet, zrsTick, [IGet, "JRef:Image:Saturation"] + 0.5]
+	[FileExecute, zrsDll, "RSDisplay", [StrMerge, "sat ", zrsTick]]
+]
+
+// Overlay (stage 1 of the live reference): a click-through window drawn by
+// the DLL over the canvas. The DLL finds the canvas on screen itself, by
+// matching the calibration pattern (which the canvas must be showing) against
+// a capture of ZBrush's window. It starts with the last rendered frame's zoom
+// and position.
+[RoutineDef, ZRSOverlayOn,
+	[IUpdate, 2, 1]
+	[VarSet, zrsArgs, [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " 255"]]
+	[RoutineCall, ZRSLevels]
+	[VarSet, zrsResult, [FileExecute, zrsDll, "RSOverlayStart", zrsArgs]]
+	[VarSet, zrsOx, [FileExecute, zrsDll, "RSOverlayInfo", "0"]]
+	[VarSet, zrsOy, [FileExecute, zrsDll, "RSOverlayInfo", "1"]]
+	[VarSet, zrsZoom, [FileExecute, zrsDll, "RSOverlayInfo", "2"] / 1000]
+	[VarSet, zrsTick, [FileExecute, zrsDll, "RSOverlayInfo", "3"]]
+]
+
+// Sets zrsMsg2 to the name of view zrsTick (slots 0-5).
+[RoutineDef, ZRSViewName,
+	[VarSet, zrsMsg2, "Front"]
+	[If, zrsTick == 1, [VarSet, zrsMsg2, "Back"]]
+	[If, zrsTick == 2, [VarSet, zrsMsg2, "Right"]]
+	[If, zrsTick == 3, [VarSet, zrsMsg2, "Left"]]
+	[If, zrsTick == 4, [VarSet, zrsMsg2, "Top"]]
+	[If, zrsTick == 5, [VarSet, zrsMsg2, "Bottom"]]
+]
+
+// Loads an image for view zrsView (named zrsMsg2). The model must be in
+// Edit mode, the overlay on, and the camera snapped to a view (every angle a
+// multiple of 90) that no other view has taken. The current zoom and
+// position become the view's anchor, and the model's outline is recorded.
+[RoutineDef, ZRSViewLoad,
+	[RoutineCall, ZRSCheckDll]
+	[VarSet, zrsOk, 1]
+	[If, [IGet, Transform:Edit] == 0,
+		[VarSet, zrsOk, 0]
+		[Note, "Put the model in Edit mode first."]
+	]
+	[If, zrsOk,
+		[If, [FileExecute, zrsDll, "RSOverlayInfo", "4"] != 1,
+			[VarSet, zrsOk, 0]
+			[Note, "Press Overlay first: the views are shown by the overlay."]
+		]
+	]
+	[If, zrsOk,
+		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+		[VarSet, zrsRot, [StrMerge, zrsRx, " ", zrsRy, " ", zrsRz]]
+	]
+	// The DLL knows each view's rotation, so an image can be loaded for any
+	// view from anywhere; it shows when that view is snapped to.
+	[If, zrsOk,
+		[VarSet, zrsFile, [FileNameAsk, "Image (*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd)|*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd||", , [StrMerge, "Choose the ", zrsMsg2, " image"]]]
+		[If, [StrLength, zrsFile] == 0,
+			[VarSet, zrsOk, 0]
+			[Note, "No image chosen."]
+		]
+	]
+	[If, zrsOk,
+		[VarSet, zrsArgs, [StrMerge, zrsView, " ", zrsSx, " ", zrsPx, " ", zrsPy, " ", zrsRot]]
+		[FileExecute, zrsDll, "RSViewPrep", zrsArgs]
+		[VarSet, zrsResult, [FileExecute, zrsDll, "RSViewImage", zrsFile]]
+		[If, zrsResult == 2,
+			[If, [FileExecute, zrsDll, "RSOverlayInfo", "39"] > 0,
+				[Note, [StrMerge, zrsMsg2, " image loaded. It shows when you snap to the ", zrsMsg2, " view."], , 2]
+				,
+				[Note, [StrMerge, zrsMsg2, " image loaded, but ZBrush's rotation was not found, so views cannot switch.\nPress Overlay again and send nav_log.txt if this keeps happening."]]
+			]
+		]
+		[If, zrsResult == 1,
+			[Note, [StrMerge, zrsMsg2, " image loaded (kept with the project in the JRef folder next to the first image).\nLine it up with Adjust Image if it needs it."], , 2]
+		]
+		[If, zrsResult < 1,
+			[Note, [StrMerge, "Could not read the image (", zrsResult, "):\n", zrsFile]]
+		]
+	]
+]
+
+// Removes view zrsView's image (named zrsMsg2).
+[RoutineDef, ZRSViewRemove,
+	[If, [FileExecute, zrsDll, "RSViewUsed", [StrMerge, zrsView, ""]],
+		[FileExecute, zrsDll, "RSViewClear", [StrMerge, zrsView, ""]]
+		[Note, [StrMerge, zrsMsg2, " image removed."], , 1]
+		,
+		[Note, [StrMerge, zrsMsg2, " has no image to remove."], , 1]
+	]
+]
+
+// The key colour as the document background (Document > Back, gradient Range
+// 0) on a cleared canvas: unlike filled pixels it has no depth, so the model
+// can never go behind it. The user's background is saved by the DLL and put
+// back by Overlay Off.
+[RoutineDef, ZRSKeyBackground,
+	[If, [IExists, "Document:Back"],
+		[VarSet, zrsTick, [IGet, "Document:Back"]]
+		[If, zrsTick != 16711935,
+			[FileExecute, zrsDll, "RSValue", [StrMerge, "back ", zrsTick]]
+			[If, [IExists, "Document:Range"], [FileExecute, zrsDll, "RSValue", [StrMerge, "range ", [IGet, "Document:Range"]]]]
+		]
+		[IColorSet, 255, 0, 255]
+		[IPress, "Document:Back"]
+		[If, [IExists, "Document:Range"], [ISet, "Document:Range", 0]]
+		[IColorSet, 255, 255, 255]
+	]
+	[VarSet, zrsCleared, [IExists, "Layer:Clear"]]
+	[If, zrsCleared, [IPress, "Layer:Clear"]]
+]
+
+[RoutineDef, ZRSRestoreBackground,
+	[VarSet, zrsTick, [FileExecute, zrsDll, "RSValue", "back"]]
+	[VarSet, zrsOk, [IExists, "Document:Back"]]
+	[If, zrsTick <= 0, [VarSet, zrsOk, 0]]
+	[If, zrsTick >= 256, [VarSet, zrsOk, 0]]
+	[If, zrsOk,
+		[IColorSet, zrsTick, zrsTick, zrsTick]
+		[IPress, "Document:Back"]
+		[IColorSet, 255, 255, 255]
+	]
+	[If, [IExists, "Document:Range"], [ISet, "Document:Range", [FileExecute, zrsDll, "RSValue", "range"]]]
+]
+
+// Finds where ZBrush keeps the model's view in memory, so the DLL can follow
+// zooms and pans exactly: reports the current view, sets three test views
+// (moved and scaled a little) and a rotated one (which rules out rotation
+// matrix entries that equal the scale in the current view) and reports each,
+// then puts the view back and reports that. zrsResult is 1 when the DLL has locked on.
+[RoutineDef, ZRSMemProbe,
+	[VarSet, zrsResult, 0]
+	[If, [FileExecute, zrsDll, "RSAnchorGet", "0"] > 0,
+		[TransformGet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
+		[VarSet, zrsArgs, [StrMerge, "start ", zrsKsx, " ", zrsKx, " ", zrsKy, " ", [FileExecute, zrsDll, "RSAnchorGet", "0"]]]
+		[FileExecute, zrsDll, "RSMemProbe", zrsArgs]
+		[Loop, 3,
+			[VarSet, zrsTick, zrsTick + 1]
+			[TransformSet, zrsKx + 11 * zrsTick, zrsKy + 7 * zrsTick, zrsKz, zrsKsx * (1 + 0.04 * zrsTick), zrsKsy * (1 + 0.04 * zrsTick), zrsKsz * (1 + 0.04 * zrsTick), zrsKrx, zrsKry, zrsKrz]
+			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+			[VarSet, zrsArgs, [StrMerge, "next ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [FileExecute, zrsDll, "RSAnchorGet", "0"]]]
+			[FileExecute, zrsDll, "RSMemProbe", zrsArgs]
+		]
+		[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx + 15, zrsKry + 25, zrsKrz]
+		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+		[VarSet, zrsArgs, [StrMerge, "next ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [FileExecute, zrsDll, "RSAnchorGet", "0"]]]
+		[FileExecute, zrsDll, "RSMemProbe", zrsArgs]
+		// The rotation too, so the DLL sees snaps to a view.
+		[FileExecute, zrsDll, "RSRotProbe", [StrMerge, "start ", zrsRx, " ", zrsRy, " ", zrsRz]]
+		[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx + 40, zrsKry - 30, zrsKrz + 10]
+		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+		[FileExecute, zrsDll, "RSRotProbe", [StrMerge, "next ", zrsRx, " ", zrsRy, " ", zrsRz]]
+		[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
+		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+		[FileExecute, zrsDll, "RSRotProbe", [StrMerge, "last ", zrsRx, " ", zrsRy, " ", zrsRz]]
+		[VarSet, zrsArgs, [StrMerge, "last ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [FileExecute, zrsDll, "RSAnchorGet", "0"]]]
+		[VarSet, zrsResult, [FileExecute, zrsDll, "RSMemProbe", zrsArgs]]
+	]
+]
+
+// Logs ZBrush's canvas depth (PixolPick component 1) and colour (0) on a 5 x 5
+// grid over the document, labelled with zrsMsg2, to nav_log.txt: shows
+// whether empty canvas has depth left in it that could hide the model.
+[RoutineDef, ZRSDepthProbe,
+	[VarSet, zrsMult, [IGet, Document:Height] * 0.05]
+	[Loop, 5,
+		[VarSet, zrsTry, [IGet, Document:Width] * 0.05]
+		[Loop, 5,
+			[VarSet, zrsArgs, [StrMerge, zrsMsg2, " at ", zrsTry, " ", zrsMult, " depth "]]
+			[FileExecute, zrsDll, "RSLog", [StrMerge, zrsArgs, [PixolPick, 1, zrsTry, zrsMult], " colour ", [PixolPick, 0, zrsTry, zrsMult]]]
+			[VarSet, zrsTry, zrsTry + [IGet, Document:Width] * 0.225]
+		]
+		[VarSet, zrsMult, zrsMult + [IGet, Document:Height] * 0.225]
+	]
+]
+
+// Counts in zrsCount how many points of a 30 x 30 grid over the document
+// ZBrush has drawn something other than the key colour at (the model).
+[RoutineDef, ZRSCountModel,
+	[VarSet, zrsCount, 0]
+	[VarSet, zrsMult, [IGet, Document:Height] / 60]
+	[Loop, 30,
+		[VarSet, zrsTry, [IGet, Document:Width] / 60]
+		[Loop, 30,
+			[If, [PixolPick, 0, zrsTry, zrsMult] != 16711935, [VarSet, zrsCount, zrsCount + 1]]
+			[VarSet, zrsTry, zrsTry + [IGet, Document:Width] / 30]
+		]
+		[VarSet, zrsMult, zrsMult + [IGet, Document:Height] / 30]
+	]
+]
+
+// ZBrush stops drawing what is behind its back clipping plane, and a model
+// at the canvas plane (depth 0) is cut off when zoomed out. The ZBrush fix is
+// to bring the model forward in depth. This shrinks the view to 30% (where
+// the cut-off shows), counts how much of the model ZBrush draws with it 5x
+// its scale in front of and behind its depth, keeps whichever shows more,
+// and restores the zoom. The factor is kept with RSValue "depth".
+[RoutineDef, ZRSDepthFix,
+	[TransformGet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
+	[VarSet, zrsBestZ, zrsKz]
+	[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx * 0.3, zrsKsy * 0.3, zrsKsz * 0.3, zrsKrx, zrsKry, zrsKrz]
+	[RoutineCall, ZRSCountModel]
+	[VarSet, zrsBestCount, zrsCount]
+	[VarSet, zrsMemFound, zrsCount]
+	[TransformSet, zrsKx, zrsKy, zrsKz - 5 * zrsKsx, zrsKsx * 0.3, zrsKsy * 0.3, zrsKsz * 0.3, zrsKrx, zrsKry, zrsKrz]
+	[RoutineCall, ZRSCountModel]
+	[VarSet, zrsTurn, zrsCount]
+	[If, zrsCount > zrsBestCount + 2,
+		[VarSet, zrsBestZ, zrsKz - 5 * zrsKsx]
+	]
+	[If, zrsCount > zrsBestCount + 2,
+		[VarSet, zrsBestCount, zrsCount]
+	]
+	[TransformSet, zrsKx, zrsKy, zrsKz + 5 * zrsKsx, zrsKsx * 0.3, zrsKsy * 0.3, zrsKsz * 0.3, zrsKrx, zrsKry, zrsKrz]
+	[RoutineCall, ZRSCountModel]
+	[If, zrsCount > zrsBestCount + 2,
+		[VarSet, zrsBestZ, zrsKz + 5 * zrsKsx]
+	]
+	[If, zrsCount > zrsBestCount + 2,
+		[VarSet, zrsBestCount, zrsCount]
+	]
+	[FileExecute, zrsDll, "RSLog", [StrMerge, "document ", [IGet, Document:Width], " x ", [IGet, Document:Height]]]
+	[VarSet, zrsArgs, [StrMerge, "depth fix: z ", zrsKz, " shows ", zrsMemFound, ", z-5s shows ", zrsTurn, ", z+5s shows ", zrsCount]]
+	[FileExecute, zrsDll, "RSLog", [StrMerge, zrsArgs, ", using ", zrsBestZ]]
+	[TransformSet, zrsKx, zrsKy, zrsBestZ, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
+	[If, zrsBestZ != zrsKz,
+		[FileExecute, zrsDll, "RSValue", [StrMerge, "depth ", zrsBestZ / zrsKsx]]
+		,
+		[FileExecute, zrsDll, "RSValue", "depth 0"]
+	]
+]
+
+// Sets zrsMsg2 to the label of Multiview cell zrsN (0 top left, 1 top
+// right, 2 bottom right, 3 bottom left): "Front View" ... or "No View".
+[RoutineDef, ZRSCellName,
+	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", [StrMerge, "cell ", zrsN]]]
+	[If, zrsTick < 0,
+		[VarSet, zrsMsg2, "No View"]
+		,
+		[RoutineCall, ZRSViewName]
+		[VarSet, zrsMsg2, [StrMerge, zrsMsg2, " View"]]
+	]
+]
+
+// The Multiview views: a popup with a row per cell, its name, an arrow and a
+// button showing its view; pressing the view (or its row) steps it to the
+// next view. Plugin buttons cannot change their text, so this is a popup,
+// rebuilt after every press.
+[RoutineDef, ZRSMultiDialog,
+	[Loop, 100,
+		[VarSet, zrsN, 0]
+		[RoutineCall, ZRSCellName]
+		[VarSet, zrsL0, zrsMsg2]
+		[VarSet, zrsN, 1]
+		[RoutineCall, ZRSCellName]
+		[VarSet, zrsL1, zrsMsg2]
+		[VarSet, zrsN, 2]
+		[RoutineCall, ZRSCellName]
+		[VarSet, zrsL2, zrsMsg2]
+		[VarSet, zrsN, 3]
+		[RoutineCall, ZRSCellName]
+		[VarSet, zrsL3, zrsMsg2]
+		[NoteIButton, "Top Left", , 0, 0, 20, 50, 130, 30]
+		[NoteIButton, "->", , 0, 0, 160, 50, 40, 30]
+		[NoteIButton, zrsL0, , 0, 0, 210, 50, 150, 30]
+		[NoteIButton, "Top Right", , 0, 0, 20, 90, 130, 30]
+		[NoteIButton, "->", , 0, 0, 160, 90, 40, 30]
+		[NoteIButton, zrsL1, , 0, 0, 210, 90, 150, 30]
+		[NoteIButton, "Bottom Right", , 0, 0, 20, 130, 130, 30]
+		[NoteIButton, "->", , 0, 0, 160, 130, 40, 30]
+		[NoteIButton, zrsL2, , 0, 0, 210, 130, 150, 30]
+		[NoteIButton, "Bottom Left", , 0, 0, 20, 170, 130, 30]
+		[NoteIButton, "->", , 0, 0, 160, 170, 40, 30]
+		[NoteIButton, zrsL3, , 0, 0, 210, 170, 150, 30]
+		[NoteIButton, "Done", , 0, 0, 140, 220, 100, 30]
+		[VarSet, zrsTry, [Note, "Multiview: press a view to switch it.", , 0, , , 380, 270]]
+		[VarSet, zrsN, -1]
+		[If, zrsTry > 0, [VarSet, zrsN, 0]]
+		[If, zrsTry > 3, [VarSet, zrsN, 1]]
+		[If, zrsTry > 6, [VarSet, zrsN, 2]]
+		[If, zrsTry > 9, [VarSet, zrsN, 3]]
+		[If, zrsTry > 12, [VarSet, zrsN, -1]]
+		[If, zrsN < 0, [LoopExit]]
+		[FileExecute, zrsDll, "RSDisplay", [StrMerge, "cell ", zrsN, " -1"]]
+	]
+]
+
+// ---------------------------------------------------------------------------
+// Interface: the JRef menu
+// ---------------------------------------------------------------------------
+[IPalette, "JRef"]
+
+// Main buttons, in a group without a title.
+[ISubPalette, "JRef:Main", 2]
+
+// Overlay: works out the layout for the current camera (rendering it to
+// frame0.png also saves the layout for the DLL), fills the canvas with the
+// calibration pattern, which also hides the model, waits a second so ZBrush
+// repaints the screen, lets the DLL find the pattern on screen, then fills the
+// canvas with the key colour magenta (or with the reference if that failed)
+// and puts the model back. The overlay shows the reference wherever it sees
+// magenta, so the model stays in front.
+// Every fill uses frame0.png: importing a name that already exists replaces
+// that texture in place, so a single name keeps it the last texture.
+[IButton, "JRef:Main:Overlay",
+	"Show the reference in a click-through window over the canvas, behind the model. Press again to find the canvas again.",
+	[RoutineCall, ZRSCheckDll]
+	[FileExecute, zrsDll, "RSOverlayStop"]
+	[If, [IGet, Transform:Edit] == 0,
+		[Note, "Put the model in Edit mode first."]
+		,
+				[VarSet, zrsAutoAnchored, 0]
+		[If, [FileExecute, zrsDll, "RSAnchorGet", "0"] <= 0,
+			[RoutineCall, ZRSAnchorNow]
+			[VarSet, zrsAutoAnchored, 1]
+		]
+		[If, [FileExecute, zrsDll, "RSAnchorGet", "0"] > 0,
+			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+			[VarSet, zrsRatio, zrsSx / [FileExecute, zrsDll, "RSAnchorGet", "0"]]
+			[VarSet, zrsAx, [FileExecute, zrsDll, "RSAnchorGet", "1"]]
+			[VarSet, zrsAy, [FileExecute, zrsDll, "RSAnchorGet", "2"]]
+			,
+			[RoutineCall, ZRSBase]
+		]
+		[VarSet, zrsArgs, [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " ", zrsRatio, " ", zrsPx]]
+		[VarSet, zrsArgs, [StrMerge, zrsArgs, " ", zrsPy, " ", zrsAx, " ", zrsAy]]
+		[VarSet, zrsArgs, [StrMerge, zrsArgs, " frame0.png"]]
+		// The overlay shows only the views' images, so no image (-3) is fine.
+		// ZScript does not evaluate "a != b && c != d" as two comparisons, so
+		// conditions are built one step at a time.
+		[VarSet, zrsResult, [FileExecute, zrsDll, "RSRender", zrsArgs]]
+		[If, zrsResult == -3, [VarSet, zrsResult, 1]]
+		[If, zrsResult != 1,
+			[Note, [StrMerge, "Render failed (", zrsResult, ")."]]
+			,
+			[FileExecute, zrsDll, "RSPattern", [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " frame0.png"]]
+			[VarSet, zrsFile, [FileNameResolvePath, "JRef_Data\frame0.png"]]
+			[TransformGet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
+			[VarSet, zrsMsg2, "before overlay"]
+			[RoutineCall, ZRSDepthProbe]
+			[RoutineCall, ZRSFillOnly]
+			[VarSet, zrsMsg2, "pattern fill"]
+			[RoutineCall, ZRSDepthProbe]
+			[Sleep, 1, [VarSet, zrsTick, 0]]
+			[RoutineCall, ZRSOverlayOn]
+			[If, zrsResult > 0,
+				[RoutineCall, ZRSKeyBackground]
+				,
+				[VarSet, zrsTick, [FileExecute, zrsDll, "RSRender", zrsArgs]]
+				[VarSet, zrsTick, [FileExecute, zrsDll, "RSOverlayInfo", "3"]]
+				[RoutineCall, ZRSFillOnly]
+			]
+			[RoutineCall, ZRSRestore]
+			[VarSet, zrsLastRatio, zrsRatio]
+			[VarSet, zrsLastPx, zrsPx]
+			[VarSet, zrsLastPy, zrsPy]
+			[If, zrsResult > 0,
+				[VarSet, zrsArgs, [StrMerge, "Overlay on: found the canvas at ", zrsOx, ", ", zrsOy, ", ", zrsZoom, " screen px per document px (match ", zrsTick, "%)"]]
+				[VarSet, zrsResult, [FileExecute, zrsDll, "RSOverlayInfo", "5"]]
+				[If, zrsResult == 1,
+					[VarSet, zrsMsg, "Model in front: keying on (1)."]
+					,
+					[VarSet, zrsMsg, [StrMerge, "Keying unavailable (", zrsResult, "): 0 = this Windows cannot exclude the overlay from capture, -1 = exclusion did not work. The overlay covers the model."]]
+				]
+				[Sleep, 0.5, [VarSet, zrsTick, 0]]
+				[VarSet, zrsMsg2, "overlay ready"]
+				[RoutineCall, ZRSDepthProbe]
+				[VarSet, zrsTick, [FileExecute, zrsDll, "RSOverlayInfo", "32"]]
+				[If, zrsTick < 5,
+					[FileExecute, zrsDll, "RSBlank", [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " frame0.png 255 0 255"]]
+					[VarSet, zrsFile, [FileNameResolvePath, "JRef_Data\frame0.png"]]
+					[RoutineCall, ZRSFill]
+					[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nBackground colour did not turn magenta (", zrsTick, "%): using a fill, the model may clip."]]
+				]
+				[VarSet, zrsTick, 0]
+				[RoutineCall, ZRSMemProbe]
+				[VarSet, zrsSetResult, zrsResult]
+				[RoutineCall, ZRSDepthFix]
+				[VarSet, zrsResult, zrsSetResult]
+				[If, zrsResult == 1,
+					[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nFound ZBrush's view in memory: zoom and pan follow exactly."]]
+					[If, [FileExecute, zrsDll, "RSOverlayInfo", "39"] > 0,
+						[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nFound the rotation too: snapping to a view switches its image."]]
+						,
+						[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nRotation not found in memory: views will not switch. Please send nav_log.txt."]]
+					]
+
+					,
+					[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nZBrush's view not found in memory (", zrsResult, "), candidates ", [FileExecute, zrsDll, "RSOverlayInfo", "23"], " ", [FileExecute, zrsDll, "RSOverlayInfo", "24"], " ", [FileExecute, zrsDll, "RSOverlayInfo", "25"]]]
+					[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nScan: ", [FileExecute, zrsDll, "RSOverlayInfo", "27"], " MB, x matches ", [FileExecute, zrsDll, "RSOverlayInfo", "28"], ", pairs ", [FileExecute, zrsDll, "RSOverlayInfo", "29"]]]
+					[VarSet, zrsMsg, [StrMerge, zrsMsg, ", scales ", [FileExecute, zrsDll, "RSOverlayInfo", "30"], ", ", [FileExecute, zrsDll, "RSOverlayInfo", "31"], " ms. View ", zrsKsx, " ", zrsKx, " ", zrsKy]]
+				]
+				[If, zrsCleared == 0, [VarSet, zrsMsg, [StrMerge, zrsMsg, "\nLayer:Clear not found, the model may show stripes."]]]
+				[If, zrsAutoAnchored, [VarSet, zrsMsg, [StrMerge, zrsMsg, "\nNo anchor was set: anchored at the current view."]]]
+				[Note, [StrMerge, zrsArgs, "\n", zrsMsg]]
+				[If, [FileExecute, zrsDll, "RSValue", "depth"] != 0,
+					[Note, [StrMerge, "Moved the model off ZBrush's back clipping plane, to depth ", zrsBestZ]]
+					,
+					[Note, [StrMerge, "Depth unchanged: the model showed at ", zrsMemFound, " / ", zrsTurn, " / ", zrsCount, " of 900 points (now / in front / behind)."]]
+				]
+				// No image is shown until a view is snapped to (the DLL looks views
+				// up as the rotation changes).
+				,
+				[VarSet, zrsMsg, "-3: frame0.png missing.\n-4: screen capture failed.\n-5: the pattern was not found on screen."]
+				[VarSet, zrsArgs, [StrMerge, "Overlay failed (", zrsResult, "). Best match ", zrsTick, "% at ", zrsOx, ", ", zrsOy]]
+				[Note, [StrMerge, zrsArgs, " scale ", zrsZoom, "\n", zrsMsg]]
+				[Note, [StrMerge, "What the plugin saw is saved as\n", [FileNameResolvePath, "JRef_Data\capture.png"], "\nPlease send that file."]]
+			]
+		]
+	]
+	, 0, 0.5
+]
+
+[IButton, "JRef:Main:Overlay Off",
+	"Hide the overlay and give the document its own background back.",
+	[FileExecute, zrsDll, "RSOverlayStop"]
+	[RoutineCall, ZRSRestoreBackground]
+	[Note, "Overlay off.", , 1]
+	, 0, 0.5
+]
+
+[IButton, "JRef:Main:Classic",
+	"Classic: the reference shows behind the model.",
+	[FileExecute, zrsDll, "RSDisplay", "mode 0"]
+	[Note, "Classic: the reference shows behind the model.", , 1.5]
+	, 0, 0.5
+]
+[IButton, "JRef:Main:PureRef",
+	"PureRef: the reference shows in a panel at the side, zoomed and panned with the camera.",
+	[VarSet, zrsTick, [FileExecute, zrsDll, "RSValue", "back"]]
+	[If, zrsTick < 256, [FileExecute, zrsDll, "RSDisplay", [StrMerge, "back ", zrsTick]]]
+	[FileExecute, zrsDll, "RSDisplay", "mode 1"]
+	[Note, "PureRef: the reference shows in a panel at the side.", , 1.5]
+	, 0, 0.5
+]
+[IButton, "JRef:Main:Panel Side",
+	"PureRef: move the panel to the other side of the canvas.",
+	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "left -1"]]
+	[If, zrsTick == 1, [Note, "PureRef panel on the left.", , 1], [Note, "PureRef panel on the right.", , 1]]
+	, 0, 0.5
+]
+
+[IButton, "JRef:Main:Reset",
+	"Snap to the Front view lined up with its reference, like Front in Image Plane's reference views, keeping your references.",
+	[If, [IGet, Transform:Edit] == 0,
+		[Note, "Put the model in Edit mode first."]
+		,
+		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+		[VarSet, zrsKsx, zrsSx]
+		[If, [FileExecute, zrsDll, "RSViewUsed", "0"],
+			[VarSet, zrsKsx, [FileExecute, zrsDll, "RSViewGet", "0 0"]]
+			[VarSet, zrsPx, [FileExecute, zrsDll, "RSViewGet", "0 1"]]
+			[VarSet, zrsPy, [FileExecute, zrsDll, "RSViewGet", "0 2"]]
+		]
+		[If, zrsSx > 0,
+			[TransformSet, zrsPx, zrsPy, zrsPz, zrsKsx, zrsSy * zrsKsx / zrsSx, zrsSz * zrsKsx / zrsSx, 0, 0, 0]
+		]
+	]
+	, 0, 0.5
+]
+
+[IButton, "JRef:Main:Adjust Image",
+	"Press to move and scale the reference image: drag inside it to move it, drag a corner or edge (or right-drag) to scale it. Press again or Esc when done.",
+	[If, [FileExecute, zrsDll, "RSOverlayInfo", "38"] == 1,
+		[FileExecute, zrsDll, "RSAdjust", "0"]
+		[Note, "Adjust Image off: the image keeps its new place and size.", , 1.5]
+		,
+		// The note comes first: while Adjust Image is on, clicks on the image
+		// do not reach ZBrush.
+		[VarSet, zrsTick, [FileExecute, zrsDll, "RSAdjust", "2"]]
+		[If, zrsTick == 1,
+			[Note, "Adjust Image: drag the image to move it, drag a corner or edge or right-drag to scale it.\nPress Adjust Image again or Esc when done.", , 2]
+			[FileExecute, zrsDll, "RSAdjust", "1"]
+			,
+			[If, zrsTick == 0, [Note, "No reference image is showing: snap to a view that has one."]]
+			[If, zrsTick == -1, [Note, "Press Overlay first."]]
+			[If, zrsTick == -2, [Note, "Adjust Image works in Classic mode (JRef > Classic)."]]
+		]
+	]
+	, 0, 0.5
+]
+[IButton, "JRef:Main:Anchor",
+	"With the model lined up with the image, press to record this zoom and position as the 1:1 match.",
+	[If, [IGet, Transform:Edit] == 0,
+		[Note, "Put the model in Edit mode first."]
+		,
+		// Anchors the view whose image is showing, while snapped to it.
+		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+		[VarSet, zrsRot, [StrMerge, zrsRx, " ", zrsRy, " ", zrsRz]]
+		[VarSet, zrsView, [FileExecute, zrsDll, "RSOverlayInfo", "37"]]
+		[VarSet, zrsOk, [FileExecute, zrsDll, "RSViewSnapped", zrsRot]]
+		[If, zrsView < 0, [VarSet, zrsOk, 0]]
+		[If, zrsView > 5, [VarSet, zrsOk, 0]]
+		[If, zrsOk != 1,
+			[Note, "Snap to a view that has an image first (Views > Load)."]
+			,
+			[VarSet, zrsArgs, [StrMerge, zrsView, " ", zrsSx, " ", zrsPx, " ", zrsPy, " ", zrsRot]]
+			[FileExecute, zrsDll, "RSViewAnchor", zrsArgs]
+			[Note, [StrMerge, "Anchored view ", zrsView, " (0 Front 1 Back 2 Right 3 Left 4 Top 5 Bottom): model scale ", zrsSx, ", position ", zrsPx, ", ", zrsPy]]
+		]
+	]
+	, 0, 0.5
+]
+
+// One reference image per view, in Image Plane's order.
+[ISubPalette, "JRef:Views", 1]
+
+[IButton, "JRef:Views:Load Front",
+	"Snap to the Front view, then load its reference image.",
+	[VarSet, zrsView, 0]
+	[VarSet, zrsMsg2, "Front"]
+	[RoutineCall, ZRSViewLoad]
+	, 0, 0.8
+]
+
+[IButton, "JRef:Views:Remove Front",
+	"Remove the Front image, so another can be loaded.",
+	[VarSet, zrsView, 0]
+	[VarSet, zrsMsg2, "Front"]
+	[RoutineCall, ZRSViewRemove]
+	, 0, 0.2, , "JRef_Data\trash.psd"
+]
+
+[IButton, "JRef:Views:Load Back",
+	"Snap to the Back view, then load its reference image.",
+	[VarSet, zrsView, 1]
+	[VarSet, zrsMsg2, "Back"]
+	[RoutineCall, ZRSViewLoad]
+	, 0, 0.8
+]
+
+[IButton, "JRef:Views:Remove Back",
+	"Remove the Back image, so another can be loaded.",
+	[VarSet, zrsView, 1]
+	[VarSet, zrsMsg2, "Back"]
+	[RoutineCall, ZRSViewRemove]
+	, 0, 0.2, , "JRef_Data\trash.psd"
+]
+
+[IButton, "JRef:Views:Load Right",
+	"Snap to the Right view, then load its reference image.",
+	[VarSet, zrsView, 2]
+	[VarSet, zrsMsg2, "Right"]
+	[RoutineCall, ZRSViewLoad]
+	, 0, 0.8
+]
+
+[IButton, "JRef:Views:Remove Right",
+	"Remove the Right image, so another can be loaded.",
+	[VarSet, zrsView, 2]
+	[VarSet, zrsMsg2, "Right"]
+	[RoutineCall, ZRSViewRemove]
+	, 0, 0.2, , "JRef_Data\trash.psd"
+]
+
+[IButton, "JRef:Views:Load Left",
+	"Snap to the Left view, then load its reference image.",
+	[VarSet, zrsView, 3]
+	[VarSet, zrsMsg2, "Left"]
+	[RoutineCall, ZRSViewLoad]
+	, 0, 0.8
+]
+
+[IButton, "JRef:Views:Remove Left",
+	"Remove the Left image, so another can be loaded.",
+	[VarSet, zrsView, 3]
+	[VarSet, zrsMsg2, "Left"]
+	[RoutineCall, ZRSViewRemove]
+	, 0, 0.2, , "JRef_Data\trash.psd"
+]
+
+[IButton, "JRef:Views:Load Top",
+	"Snap to the Top view, then load its reference image.",
+	[VarSet, zrsView, 4]
+	[VarSet, zrsMsg2, "Top"]
+	[RoutineCall, ZRSViewLoad]
+	, 0, 0.8
+]
+
+[IButton, "JRef:Views:Remove Top",
+	"Remove the Top image, so another can be loaded.",
+	[VarSet, zrsView, 4]
+	[VarSet, zrsMsg2, "Top"]
+	[RoutineCall, ZRSViewRemove]
+	, 0, 0.2, , "JRef_Data\trash.psd"
+]
+
+[IButton, "JRef:Views:Load Bottom",
+	"Snap to the Bottom view, then load its reference image.",
+	[VarSet, zrsView, 5]
+	[VarSet, zrsMsg2, "Bottom"]
+	[RoutineCall, ZRSViewLoad]
+	, 0, 0.8
+]
+
+[IButton, "JRef:Views:Remove Bottom",
+	"Remove the Bottom image, so another can be loaded.",
+	[VarSet, zrsView, 5]
+	[VarSet, zrsMsg2, "Bottom"]
+	[RoutineCall, ZRSViewRemove]
+	, 0, 0.2, , "JRef_Data\trash.psd"
+]
+
+// The reference's gamma and saturation.
+[ISubPalette, "JRef:Image", 1]
+
+[ISlider, "JRef:Image:Gamma", 1, 0.01, 0.2, 3,
+	"Gamma of the reference image: above 1 brightens its midtones, below 1 darkens them.",
+	[RoutineCall, ZRSLevels]
+	, 0, 1
+]
+
+[ISlider, "JRef:Image:Saturation", 100, 1, 0, 200,
+	"Saturation of the reference image, in percent: 0 is greyscale, 100 as loaded.",
+	[RoutineCall, ZRSLevels]
+	, 0, 1
+]
+
+// Multiview (PureRef): four views in the panel.
+[ISubPalette, "JRef:Multiview", 1]
+
+[IButton, "JRef:Multiview:Multiview On",
+	"PureRef: show four views in the panel (choose them with Views).",
+	[FileExecute, zrsDll, "RSDisplay", "multi 1"]
+	[Note, "Multiview on: four views in the PureRef panel.", , 1.5]
+	, 0, 0.5
+]
+[IButton, "JRef:Multiview:Multiview Off",
+	"PureRef: the panel shows the view you are snapped to.",
+	[FileExecute, zrsDll, "RSDisplay", "multi 0"]
+	[Note, "Multiview off: the panel shows the view you are snapped to.", , 1.5]
+	, 0, 0.5
+]
+
+[IButton, "JRef:Multiview:Views",
+	"Choose the view in each corner of the Multiview panel: Top Left, Top Right, Bottom Right, Bottom Left.",
+	[RoutineCall, ZRSMultiDialog]
+	, 0, 1
+]
+
+// The project, and help.
+[ISubPalette, "JRef:Project", 1]
+
+[IButton, "JRef:Project:Open Project",
+	"Open a JRef project: the project.jref file in a project's JRef folder (made next to the first image you load). Use it on another computer, or to switch projects.",
+	[VarSet, zrsFile, [FileNameAsk, "JRef project (*.jref)|*.jref||", , "Open project.jref in a JRef folder"]]
+	[If, [StrLength, zrsFile] == 0,
+		[Note, "No project chosen.", , 1]
+		,
+		[VarSet, zrsTick, [FileExecute, zrsDll, "RSProject", [StrMerge, "open ", zrsFile]]]
+		[If, zrsTick == 1,
+			[Note, "Project opened: its views and settings are loaded.", , 1.5]
+			,
+			[Note, [StrMerge, "Could not open that project:\n", zrsFile]]
+		]
+	]
+	, 0, 0.5
+]
+
+[IButton, "JRef:Project:Snapshot",
+	"Save what the overlay captured and what it showed, to send when something looks wrong.",
+	[VarSet, zrsMsg2, "snapshot"]
+	[RoutineCall, ZRSDepthProbe]
+	[VarSet, zrsTick, [FileExecute, zrsDll, "RSSnapshot"]]
+	[If, zrsTick == 1,
+		[Note, [StrMerge, "Saved snap_capture.png and snap_overlay.png in the folder of\n", [FileNameResolvePath, zrsDll]]]
+		,
+		[Note, "Nothing to save: turn the overlay on first."]
+	]
+	, 0, 0.25
+]
+[IButton, "JRef:Project:About",
+	"Show which build is running and whether the helper DLL loads.",
+	[VarSet, zrsTick, [FileExecute, zrsDll, "RSVersion"]]
+	[Note, [StrMerge, "JRef ", zrsBuild, "\nDLL build ", zrsTick, " (needs ", zrsDllBuild, ")\n", [FileNameResolvePath, zrsDll]]]
+	, 0, 0.25
+]

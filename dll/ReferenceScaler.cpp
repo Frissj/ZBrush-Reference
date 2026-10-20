@@ -50,6 +50,41 @@ static std::wstring Widen(const char* text)
 	return out;
 }
 
+// A JRef project: the folder ("<images folder>\\JRef\\") where a project's
+// views (project.jref), outlines, display settings and copies of its images
+// are kept, so it can be copied to another computer with the images. The last
+// one opened is reopened next time (last_project.txt next to the DLL).
+// Without one, the DLL's folder holds them.
+static std::wstring gProjectDir;
+static bool gProjectTried = false;
+
+static std::wstring ProjectFolder()
+{
+	if (!gProjectTried) {
+		gProjectTried = true;
+		if (FILE* f = _wfopen((DllFolder() + L"last_project.txt").c_str(), L"rb")) {
+			char buf[1024] = {0};
+			buf[fread(buf, 1, sizeof(buf) - 1, f)] = 0;
+			fclose(f);
+			std::string dir = buf;
+			while (!dir.empty() && (dir.back() == '\n' || dir.back() == '\r'))
+				dir.pop_back();
+			const std::wstring w = Widen(dir.c_str());
+			const DWORD attr = w.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(w.c_str());
+			if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+				gProjectDir = w;
+		}
+	}
+	return gProjectDir.empty() ? DllFolder() : gProjectDir;
+}
+
+// An image path as stored: relative ones are in the project folder.
+static std::wstring ResolveImage(const std::string& path)
+{
+	const bool absolute = path.size() > 1 && (path[1] == ':' || (path[0] == '\\' && path[1] == '\\'));
+	return absolute ? Widen(path.c_str()) : ProjectFolder() + Widen(path.c_str());
+}
+
 static void StartGdiplus()
 {
 	if (gGdiplusToken)
@@ -135,7 +170,7 @@ static void ViewsDefaultChanged(const double* anchor, const char* imagePath);
 
 static std::wstring AnchorPath()
 {
-	return DllFolder() + L"anchor.txt";
+	return ProjectFolder() + L"anchor.txt";
 }
 
 // text: "scale x y rx ry rz". Returns 1, or -1 if it cannot be saved.
@@ -170,7 +205,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 85;
+static const int kDllBuild = 86;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -952,12 +987,22 @@ struct Level {
 static std::string gOverlayPath;
 
 // Mip levels of an image, cached for the few images on show (PureRef's
-// multiview shows two at once).
+// multiview shows four at once), reloaded when the file changes (a project's
+// "Front.png" replaced by another image). Used by the overlay thread only.
 struct ImageCache {
 	std::wstring path;
 	std::vector<Level> levels;
 	DWORD usedAt;
+	FILETIME written;
 };
+
+static FILETIME WrittenAt(const std::wstring& path)
+{
+	WIN32_FILE_ATTRIBUTE_DATA data = {};
+	if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
+		return FILETIME{0, 0};
+	return data.ftLastWriteTime;
+}
 static std::vector<ImageCache> gImages;
 
 static bool LoadLevels(const std::wstring& path, std::vector<Level>& levels)
@@ -1010,12 +1055,19 @@ static const std::vector<Level>* LevelsFor(const std::string& path)
 {
 	if (path.empty())
 		return nullptr;
-	const std::wstring w = Widen(path.c_str());
-	for (ImageCache& c : gImages)
-		if (c.path == w) {
+	const std::wstring w = ResolveImage(path);
+	const FILETIME written = WrittenAt(w);
+	for (size_t i = 0; i < gImages.size(); ++i) {
+		ImageCache& c = gImages[i];
+		if (c.path != w)
+			continue;
+		if (CompareFileTime(&c.written, &written) == 0) {
 			c.usedAt = GetTickCount();
 			return c.levels.empty() ? nullptr : &c.levels;
 		}
+		gImages.erase(gImages.begin() + i);
+		break;
+	}
 	if (gImages.size() >= 4) {
 		size_t oldest = 0;
 		for (size_t i = 1; i < gImages.size(); ++i)
@@ -1023,7 +1075,7 @@ static const std::vector<Level>* LevelsFor(const std::string& path)
 				oldest = i;
 		gImages.erase(gImages.begin() + oldest);
 	}
-	gImages.push_back({w, {}, GetTickCount()});
+	gImages.push_back({w, {}, GetTickCount(), written});
 	LoadLevels(w, gImages.back().levels);
 	return gImages.back().levels.empty() ? nullptr : &gImages.back().levels;
 }
@@ -1226,6 +1278,9 @@ static void DrawGizmo(const OverlayState& st, Buffer32& b)
 // (gMultiA above gMultiB) share the panel. Outside the panel the background
 // shows gBackGrey.
 static int gMode = 0, gPanelLeft = 0, gMulti = 0, gMultiA = 0, gMultiB = 3, gBackGrey = 48;
+// Multiview's four cells (top left, top right, bottom right, bottom left):
+// a view slot each, or -1 for none.
+static int gCells[4] = {0, 3, 4, 1};
 // The reference's gamma and saturation, in percent (100 leaves it as is),
 // from the plugin's sliders (not saved: the sliders start at 100).
 static int gGamma = 100, gSat = 100;
@@ -1411,9 +1466,13 @@ static bool BuildRefLayer(const OverlayState& st)
 		int px, py, pw, ph;
 		PanelRect(w, h, px, py, pw, ph);
 		if (gMulti) {
-			DrawPanelCell(st, gMultiA, px, py, pw, ph / 2);
-			DrawPanelCell(st, gMultiB, px, py + ph / 2, pw, ph - ph / 2);
-			FillRect(gRefLayer, px, py + ph / 2 - 1, px + pw, py + ph / 2 + 1, 0xFF505050u);
+			const int hw = pw / 2, hh = ph / 2;
+			DrawPanelCell(st, gCells[0], px, py, hw, hh);
+			DrawPanelCell(st, gCells[1], px + hw, py, pw - hw, hh);
+			DrawPanelCell(st, gCells[2], px + hw, py + hh, pw - hw, ph - hh);
+			DrawPanelCell(st, gCells[3], px, py + hh, hw, ph - hh);
+			FillRect(gRefLayer, px, py + hh - 1, px + pw, py + hh + 1, 0xFF505050u);
+			FillRect(gRefLayer, px + hw - 1, py, px + hw + 1, py + ph, 0xFF505050u);
 		} else {
 			DrawPanelCell(st, ActiveViewSlot(), px, py, pw, ph);
 		}
@@ -2408,14 +2467,15 @@ static DWORD gLastFrameAt = 0;  // when the overlay last composited a new captur
 
 static std::wstring ViewsPath()
 {
-	return DllFolder() + L"views.txt";
+	const std::wstring folder = ProjectFolder();
+	return folder + (gProjectDir.empty() ? L"views.txt" : L"project.jref");
 }
 
 static std::wstring MaskPath(int i)
 {
 	wchar_t name[32];
 	swprintf(name, 32, L"view%d_outline.bin", i);  // (view%d_mask.bin: before build 83, with the interface in it)
-	return DllFolder() + name;
+	return ProjectFolder() + name;
 }
 
 static void SaveViews()
@@ -2836,26 +2896,32 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 
 static std::wstring DisplayPath()
 {
-	return DllFolder() + L"display.txt";
+	return ProjectFolder() + L"display.txt";
 }
 
 static void SaveDisplay()
 {
 	if (FILE* f = _wfopen(DisplayPath().c_str(), L"wb")) {
-		fprintf(f, "%d %d %d %d %d %d\n", gMode, gPanelLeft, gMulti, gMultiA, gMultiB, gBackGrey);
+		fprintf(f, "%d %d %d %d %d %d %d %d %d %d\n", gMode, gPanelLeft, gMulti, gMultiA, gMultiB, gBackGrey,
+			gCells[0], gCells[1], gCells[2], gCells[3]);
 		fclose(f);
 	}
 }
 
+static bool gDisplayLoaded = false;
+
 static void LoadDisplay()
 {
-	static bool loaded = false;
-	if (loaded)
+	if (gDisplayLoaded)
 		return;
-	loaded = true;
+	gDisplayLoaded = true;
 	if (FILE* f = _wfopen(DisplayPath().c_str(), L"rb")) {
-		int v[6];
-		if (fscanf(f, "%d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) {
+		int v[10] = {0, 0, 0, 0, 3, 48, 0, 3, 4, 1};
+		const int n = fscanf(f, "%d %d %d %d %d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]);
+		if (n == 10)
+			for (int i = 0; i < 4; ++i)
+				gCells[i] = v[6 + i] >= -1 && v[6 + i] < 6 ? v[6 + i] : -1;
+		if (n >= 6) {
 			gMode = v[0] == 1;
 			gPanelLeft = v[1] != 0;
 			gMulti = v[2] != 0;
@@ -3672,7 +3738,7 @@ static DWORD WINAPI OverlayThread(LPVOID ready)
 	HWND owner = nullptr;
 	EnumWindows(FindZBrushWindow, reinterpret_cast<LPARAM>(&owner));
 	gOverlayWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-		wc.lpszClassName, L"Reference Scaler", WS_POPUP, 0, 0, 1, 1, owner, nullptr, wc.hInstance, nullptr);
+		wc.lpszClassName, L"JRef", WS_POPUP, 0, 0, 1, 1, owner, nullptr, wc.hInstance, nullptr);
 	// WDA_EXCLUDEFROMCAPTURE (Windows 10 2004 and later): the overlay's own
 	// captures of the screen see what is underneath it.
 #ifdef RS_TEST_HIDE_CAPTURE
@@ -4334,6 +4400,25 @@ ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 	EnsureLock();
 	EnterCriticalSection(&gOverlayLock);
 	LoadDisplay();
+	if (strcmp(name, "cell") == 0) {
+		// "cell i" returns cell i's view (-1 none); "cell i -1" steps it to
+		// the next view (Front ... Bottom, then none).
+		int cell = -1, step = 0;
+		const int n = sscanf(text, "%15s %d %d", name, &cell, &step);
+		float result = -2;
+		if (n >= 2 && cell >= 0 && cell < 4) {
+			if (n == 3 && step == -1) {
+				gCells[cell] = (gCells[cell] + 2) % 7 - 1;
+				SaveDisplay();
+				gRedrawPending = true;
+			}
+			result = static_cast<float>(gCells[cell]);
+		}
+		LeaveCriticalSection(&gOverlayLock);
+		if (gOverlayWnd)
+			PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+		return result;
+	}
 	int* field = strcmp(name, "mode") == 0 ? &gMode : strcmp(name, "left") == 0 ? &gPanelLeft :
 		strcmp(name, "multi") == 0 ? &gMulti : strcmp(name, "a") == 0 ? &gMultiA : strcmp(name, "b") == 0 ? &gMultiB :
 		strcmp(name, "back") == 0 ? &gBackGrey : strcmp(name, "gamma") == 0 ? &gGamma : strcmp(name, "sat") == 0 ? &gSat : nullptr;
@@ -4508,6 +4593,169 @@ static void AnchorSlot(int slot, const double* v)
 	ActivateView(slot);
 }
 
+static void SwitchProject(const std::wstring& dir);
+
+// Without a project, the first image loaded starts one in a JRef folder next
+// to it. The image is copied into the project ("Front.png" ...) and stored
+// by that name, so the project keeps working when moved. Returns the stored
+// path (the original if it cannot be copied).
+static std::string ProjectImage(int slot, const char* source)
+{
+	static const wchar_t* kNames[6] = {L"Front", L"Back", L"Right", L"Left", L"Top", L"Bottom"};
+	const std::wstring src = Widen(source);
+	if (gProjectDir.empty()) {
+		const size_t slash = src.find_last_of(L"\\/");
+		if (slash != std::wstring::npos) {
+			// Views loaded before there was a project move into it, unless
+			// that folder already holds a project.
+			std::vector<View> before(gViews, gViews + kViewSlots);
+			std::vector<std::wstring> paths;
+			for (const View& v : before)
+				paths.push_back(v.path.empty() ? L"" : ResolveImage(v.path));
+			const std::wstring dir = src.substr(0, slash + 1) + L"JRef\\";
+			CreateDirectoryW(dir.c_str(), nullptr);
+			SwitchProject(dir);
+			bool empty = true;
+			for (int i = 0; i < kViewSlots; ++i)
+				empty = empty && !gViews[i].used;
+			if (empty) {
+				for (int i = 0; i < kViewSlots; ++i) {
+					if (!before[i].used || i == slot)
+						continue;
+					gViews[i] = before[i];
+					if (i < 6 && !paths[i].empty()) {
+						char utf8[MAX_PATH * 3] = {0};
+						WideCharToMultiByte(CP_UTF8, 0, paths[i].c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr);
+						gViews[i].path = ProjectImage(i, utf8);
+					}
+					SaveMask(i);
+				}
+				SaveViews();
+			}
+		}
+	}
+	if (gProjectDir.empty() || slot < 0 || slot >= 6)
+		return source;
+	const size_t dot = src.find_last_of(L'.');
+	const std::wstring ext = dot != std::wstring::npos && src.find_last_of(L"\\/") < dot ? src.substr(dot) : L".png";
+	const std::wstring name = std::wstring(kNames[slot]) + ext;
+	const std::wstring dest = gProjectDir + name;
+	if (_wcsicmp(dest.c_str(), src.c_str()) != 0 && !CopyFileW(src.c_str(), dest.c_str(), FALSE))
+		return source;
+	char utf8[MAX_PATH * 3] = {0};
+	WideCharToMultiByte(CP_UTF8, 0, name.c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr);
+	return utf8;
+}
+
+// Makes dir (with a trailing backslash) the project: remembered for next
+// time, and its views and settings loaded. Caller holds the lock.
+static void SwitchProject(const std::wstring& dir)
+{
+	gProjectTried = true;
+	gProjectDir = dir;
+	if (FILE* f = _wfopen((DllFolder() + L"last_project.txt").c_str(), L"wb")) {
+		char utf8[MAX_PATH * 3] = {0};
+		WideCharToMultiByte(CP_UTF8, 0, dir.c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr);
+		fputs(utf8, f);
+		fclose(f);
+	}
+	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		char utf8[MAX_PATH * 3] = {0};
+		WideCharToMultiByte(CP_UTF8, 0, dir.c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr);
+		fprintf(f, "%lu project %s\n", GetTickCount(), utf8);
+		fclose(f);
+	}
+	for (int i = 0; i < kViewSlots; ++i)
+		gViews[i] = View();
+	gViewsLoaded = false;
+	gDisplayLoaded = false;
+	LoadViews();
+	LoadDisplay();
+	BlankView();
+}
+
+// text: "open path", path being a project's project.jref (or any file in its
+// folder): makes it the project. "has" returns 1 if a project is open.
+// Returns 1, or -1 if the folder does not exist.
+ZFUNC RSProject(char* text, double, char*, int, char*, int, char**)
+{
+	if (!text)
+		return -1;
+	EnsureLock();
+	if (strncmp(text, "has", 3) == 0) {
+		ProjectFolder();
+		return gProjectDir.empty() ? 0 : 1;
+	}
+	if (strncmp(text, "open ", 5) != 0)
+		return -1;
+	std::wstring path = Widen(text + 5);
+	if (path.size() > 2 && path[0] == L'!' && path[1] == L':')
+		path = path.substr(2);
+	for (wchar_t& c : path)
+		if (c == L'/')
+			c = L'\\';
+	const DWORD attr = GetFileAttributesW(path.c_str());
+	if (attr == INVALID_FILE_ATTRIBUTES)
+		return -1;
+	if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+		const size_t slash = path.find_last_of(L'\\');
+		path = slash == std::wstring::npos ? L"" : path.substr(0, slash);
+	}
+	if (path.empty())
+		return -1;
+	if (path.back() != L'\\')
+		path += L'\\';
+	EnterCriticalSection(&gOverlayLock);
+	SwitchProject(path);
+	LeaveCriticalSection(&gOverlayLock);
+	if (gOverlayWnd)
+		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	return 1;
+}
+
+// text: "name" returns a stored number (0 if none), "name value" stores it.
+// Kept in values.txt next to the DLL (this computer's settings: the saved
+// document background, the depth fix).
+ZFUNC RSValue(char* text, double, char*, int, char*, int, char**)
+{
+	char name[32] = {0};
+	double value = 0;
+	if (!text)
+		return 0;
+	const int n = sscanf(text, "%31s %lf", name, &value);
+	if (n < 1)
+		return 0;
+	std::vector<std::pair<std::string, double>> values;
+	const std::wstring path = DllFolder() + L"values.txt";
+	if (FILE* f = _wfopen(path.c_str(), L"rb")) {
+		char k[32];
+		double v;
+		while (fscanf(f, "%31s %lf", k, &v) == 2)
+			values.push_back({k, v});
+		fclose(f);
+	}
+	double found = 0;
+	bool had = false;
+	for (auto& kv : values)
+		if (kv.first == name) {
+			if (n == 2)
+				kv.second = value;
+			found = kv.second;
+			had = true;
+		}
+	if (n == 2) {
+		if (!had)
+			values.push_back({name, value});
+		if (FILE* f = _wfopen(path.c_str(), L"wb")) {
+			for (const auto& kv : values)
+				fprintf(f, "%s %.6f\n", kv.first.c_str(), kv.second);
+			fclose(f);
+		}
+		return static_cast<float>(value);
+	}
+	return static_cast<float>(found);
+}
+
 // text: the image's full path, for the slot given to RSViewPrep. The view
 // is anchored at the current zoom and position and shown, fitted to the
 // document. Returns 1 (shown), 2 (kept: not snapped to that view now), -1 if
@@ -4522,7 +4770,7 @@ ZFUNC RSViewImage(char* text, double, char*, int, char*, int, char**)
 	EnterCriticalSection(&gOverlayLock);
 	LoadViews();
 	View& w = gViews[gPrepSlot];
-	w.path = text;
+	w.path = ProjectImage(gPrepSlot, text);
 	w.imgSX = w.imgSY = 1;
 	w.imgX = w.imgY = 0;
 	// Shown (and the model's outline recorded) now only when snapped to that

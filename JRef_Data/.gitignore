@@ -13,3 +13,6 @@ views.txt
 view*_mask.bin
 view*_outline.bin
 display.txt
+values.txt
+last_project.txt
+project.jref
