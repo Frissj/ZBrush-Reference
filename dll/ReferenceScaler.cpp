@@ -167,7 +167,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 62;
+static const int kDllBuild = 63;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1596,6 +1596,10 @@ static bool TripletValues(double& sx, double& px, double& py, bool dragging)
 		double a, b, c;
 		if (!MemRead(t.s, a) || !MemRead(t.x, b) || !MemRead(t.y, c))
 			continue;
+		// ZBrush borrows this memory to draw the navigation head: whole-number
+		// scale and position (scale 64). Such a read is skipped.
+		if (a == floor(a) && b == floor(b) && c == floor(c))
+			continue;
 		if (a != t.s.last || b != t.x.last || c != t.y.last) {
 			if (dragging) {
 				++t.dragFrames;
@@ -1618,26 +1622,35 @@ static bool TripletValues(double& sx, double& px, double& py, bool dragging)
 				t.dragFrames != o.dragFrames ? t.dragFrames > o.dragFrames : static_cast<int>(t.changedAt - o.changedAt) > 0)
 			best = static_cast<int>(i);
 	}
+	// Stay with the copy in use unless another is clearly busier: near-equal
+	// copies (a pixel or two apart) would otherwise make the image jitter.
+	if (best >= 0 && gTripletInUse >= 0 && gTripletInUse < static_cast<int>(gTriplets.size()) && best != gTripletInUse) {
+		const MemTriplet& cur = gTriplets[gTripletInUse];
+		const MemTriplet& cand = gTriplets[best];
+		double a, b, c;
+		const bool curReadable = MemRead(cur.s, a) && MemRead(cur.x, b) && MemRead(cur.y, c);
+		if (curReadable && cand.posFrames <= cur.posFrames * 3 / 2 + 10 && !(cur.dragFrames == 0 && cand.dragFrames > 0))
+			best = gTripletInUse;
+	}
 	if (best < 0)
 		return false;
 	const MemTriplet& t = gTriplets[best];
 	const bool jump = sx > 0 && (fabs(t.s.last / sx - 1) > 0.3 || fabs(t.x.last - px) > 200 || fabs(t.y.last - py) > 200);
 	// ZBrush briefly reuses the view's memory, for example to draw the
-	// navigation head (scale 64 at whole-pixel positions). A big jump is only
-	// taken once the next read still shows it.
-	static bool pending = false;
+	// navigation head. A big jump is only taken once three reads in a row
+	// show it.
+	static int pending = 0;
 	static double pendS = 0, pendX = 0, pendY = 0;
 	if (jump) {
-		const bool confirmed = pending && fabs(t.s.last / pendS - 1) < 0.02 && fabs(t.x.last - pendX) < 5 && fabs(t.y.last - pendY) < 5;
-		if (!confirmed) {
-			pending = true;
-			pendS = t.s.last;
-			pendX = t.x.last;
-			pendY = t.y.last;
+		const bool same = pending > 0 && fabs(t.s.last / pendS - 1) < 0.02 && fabs(t.x.last - pendX) < 5 && fabs(t.y.last - pendY) < 5;
+		pending = same ? pending + 1 : 1;
+		pendS = t.s.last;
+		pendX = t.x.last;
+		pendY = t.y.last;
+		if (pending < 3)
 			return true;  // keep the values passed in
-		}
 	}
-	pending = false;
+	pending = 0;
 	if (best != gTripletInUse || jump) {
 		if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
 			fprintf(f, "%lu read triplet %d of %zu (drag frames %d)%s: scale %.4f x %.3f y %.3f, was %.4f %.3f %.3f\n",
@@ -1696,10 +1709,12 @@ static void MemFollow()
 		return;
 	EnterCriticalSection(&gOverlayLock);
 	if (!gGesture.active && static_cast<int>(gMemWatchUntil - GetTickCount()) > 0) {
+		const size_t before = gMemScale.cands.size() + gMemX.cands.size() + gMemY.cands.size();
 		MemWeedOut(gMemScale);
 		MemWeedOut(gMemX);
 		MemWeedOut(gMemY);
-		BuildTriplets();
+		if (gMemScale.cands.size() + gMemX.cands.size() + gMemY.cands.size() != before)
+			BuildTriplets();
 	}
 	const bool rotating = gGesture.active && gGesture.mode == kDragNone;
 	OverlayState& st = gOverlay;
