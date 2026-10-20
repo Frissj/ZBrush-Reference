@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 81;
+static const int kDllBuild = 82;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1737,11 +1737,12 @@ static void Composite(HWND wnd, const OverlayState& st)
 			out[2] = static_cast<unsigned char>(r);
 			continue;
 		}
-		if (t > 200) {
-			++magenta;
+		if (t > 128) {
 			++rowMagenta[i / w];
 			++colMagenta[i % w];
 		}
+		if (t > 200)
+			++magenta;
 		t = t > 230 ? 256 : (t << 8) / 255;
 		const int ob = b + (t * (ref[0] - 255) >> 8), og = g + (t * ref[1] >> 8), orr = r + (t * (ref[2] - 255) >> 8);
 		out[0] = static_cast<unsigned char>(ob < 0 ? 0 : ob > 255 ? 255 : ob);
@@ -1752,13 +1753,24 @@ static void Composite(HWND wnd, const OverlayState& st)
 	{
 		// The viewport grows to every row and column the background shows
 		// in (at least 8 pixels of it, so stray magenta in the interface
-		// does not count).
+		// does not count), from frames where the background spans at least
+		// a third of the document each way (a popup or the model can hide
+		// most of it).
 		int x0 = w, x1 = -1, y0 = h, y1 = -1;
 		for (int x = 0; x < w; ++x)
 			if (colMagenta[x] >= 8) { x0 = std::min(x0, x); x1 = x; }
 		for (int y = 0; y < h; ++y)
 			if (rowMagenta[y] >= 8) { y0 = std::min(y0, y); y1 = y; }
-		if (x1 >= x0 && y1 >= y0) {
+		static DWORD statsAt = 0;
+		if (GetTickCount() - statsAt >= 2000) {
+			statsAt = GetTickCount();
+			if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				fprintf(f, "%lu capture method %d, %.1f fps, magenta %.1f%%, background spans %d %d to %d %d, viewport %d %d to %d %d, mode %d\n",
+					statsAt, gCaptureMethod, gFps, gMagentaShare, x0, y0, x1, y1, gViewX0, gViewY0, gViewX1, gViewY1, gMode);
+				fclose(f);
+			}
+		}
+		if (x1 - x0 >= w / 3 && y1 - y0 >= h / 3) {
 			const bool had = gViewX1 > gViewX0;
 			const int nx0 = had ? std::min(gViewX0, x0) : x0, ny0 = had ? std::min(gViewY0, y0) : y0;
 			const int nx1 = had ? std::max(gViewX1, x1 + 1) : x1 + 1, ny1 = had ? std::max(gViewY1, y1 + 1) : y1 + 1;
