@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 72;
+static const int kDllBuild = 73;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1988,9 +1988,9 @@ struct View {
 	bool used = false;
 	double rx = 0, ry = 0, rz = 0, scale = 0, ax = 0, ay = 0;
 	double imgSX = 1, imgSY = 1, imgX = 0, imgY = 0;  // Adjust Image
-	// The view's rotation matrix as read from ZBrush's memory, each entry
-	// rounded to -1, 0 or 1 and packed (see RotCode), or -1 if not known.
-	int code = -1;
+	// The view's rotation matrices as read from ZBrush's memory (it keeps a
+	// few copies, not all laid out alike), each packed by RotCode.
+	std::vector<int> codes;
 	std::string path;
 	// Silhouette in image space: 0 not seen, 1 background, 2 model.
 	std::vector<unsigned char> mask;
@@ -2027,8 +2027,11 @@ static void SaveViews()
 		return;
 	for (int i = 0; i < kViewSlots; ++i) {
 		const View& v = gViews[i];
-		fprintf(f, "%d %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %d|%s\n", v.used ? 1 : 0, v.rx, v.ry, v.rz, v.scale,
-			v.ax, v.ay, v.imgSX, v.imgSY, v.imgX, v.imgY, v.code, v.path.c_str());
+		std::string codes;
+		for (int c : v.codes)
+			codes += (codes.empty() ? "" : ",") + std::to_string(c);
+		fprintf(f, "%d %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %s|%s\n", v.used ? 1 : 0, v.rx, v.ry, v.rz, v.scale,
+			v.ax, v.ay, v.imgSX, v.imgSY, v.imgX, v.imgY, codes.empty() ? "-1" : codes.c_str(), v.path.c_str());
 	}
 	fclose(f);
 }
@@ -2073,15 +2076,20 @@ static void LoadViews()
 		for (int i = 0; i < kViewSlots && fgets(line, sizeof(line), f); ++i) {
 			View& v = gViews[i];
 			int used = 0;
-			const int got = sscanf(line, "%d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %d", &used, &v.rx, &v.ry, &v.rz, &v.scale,
-				&v.ax, &v.ay, &v.imgSX, &v.imgSY, &v.imgX, &v.imgY, &v.code);
+			char codes[200] = {0};
+			const int got = sscanf(line, "%d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %199[-0-9,]", &used, &v.rx, &v.ry, &v.rz, &v.scale,
+				&v.ax, &v.ay, &v.imgSX, &v.imgSY, &v.imgX, &v.imgY, codes);
 			if (got < 7)
 				continue;
 			if (got < 12 || v.imgSX <= 0 || v.imgSY <= 0) {
 				v.imgSX = v.imgSY = 1;
 				v.imgX = v.imgY = 0;
-				v.code = -1;
+				codes[0] = 0;
 			}
+			v.codes.clear();
+			for (char* t = strtok(codes, ","); t; t = strtok(nullptr, ","))
+				if (atoi(t) >= 0)
+					v.codes.push_back(atoi(t));
 			v.used = used != 0;
 			const char* bar = strchr(line, '|');
 			v.path = bar ? bar + 1 : "";
@@ -2436,11 +2444,11 @@ struct RotCand {
 	int stride;  // values from one row to the next
 	double m[9];
 	DWORD changedAt;
+	double settled[9];  // m when the view was last looked up
 };
 static std::vector<RotCand> gRotCands;
 static int gRotNarrowings = 0;
 static bool gRotLocked = false;
-static double gRotNow[9];
 static DWORD gRotChangedAt = 0;
 static bool gRotSettled = true;
 
@@ -2462,7 +2470,7 @@ static int RotCode(const double* m)
 	int code = 0;
 	for (int i = 8; i >= 0; --i) {
 		const double r = floor(m[i] + 0.5);
-		if (fabs(m[i] - r) > 2e-3 || r < -1 || r > 1)
+		if (fabs(m[i] - r) > 0.01 || r < -1 || r > 1)
 			return -1;
 		code = code * 3 + static_cast<int>(r) + 1;
 	}
@@ -2558,7 +2566,7 @@ static void RotScan()
 							RotFromBytes(&buf[i], isDouble != 0, stride, m);
 							if (!IsRotation(m) || RotCode(m) >= 0 || gRotCands.size() >= 200000)
 								continue;
-							RotCand c = {chunk + i, isDouble != 0, stride, {}, 0};
+							RotCand c = {chunk + i, isDouble != 0, stride, {}, 0, {}};
 							memcpy(c.m, m, sizeof(m));
 							gRotCands.push_back(c);
 						}
@@ -2599,67 +2607,84 @@ static void RotNarrow()
 	++gRotNarrowings;
 }
 
-// The rotation now: of the candidates, the one that changed last. Returns
-// false if none can be read.
-static bool RotValue(double* out)
+// Reads every candidate. Returns the codes of the ones that are snapped
+// (axis-aligned), without repeats, and whether any changed since the last
+// read (more than rounding). With sinceSettled, only the copies that changed
+// since the view was last looked up count: a copy ZBrush stopped updating
+// would otherwise keep reporting its old view.
+static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = false)
 {
-	const DWORD now = GetTickCount();
-	int best = -1;
-	for (size_t i = 0; i < gRotCands.size(); ++i) {
-		RotCand& c = gRotCands[i];
+	std::vector<int> codes;
+	bool any = false;
+	for (RotCand& c : gRotCands) {
 		double m[9];
 		if (!RotRead(c, m))
 			continue;
-		if (memcmp(m, c.m, sizeof(m)) != 0) {
-			memcpy(c.m, m, sizeof(m));
-			c.changedAt = now;
+		bool moved = false;
+		for (int i = 0; i < 9; ++i) {
+			if (fabs(m[i] - c.m[i]) > 1e-5)
+				any = true;
+			if (fabs(m[i] - c.settled[i]) > 1e-4)
+				moved = true;
 		}
-		if (best < 0 || static_cast<int>(c.changedAt - gRotCands[best].changedAt) > 0)
-			best = static_cast<int>(i);
+		memcpy(c.m, m, sizeof(m));
+		if (sinceSettled && !moved)
+			continue;
+		const int code = RotCode(m);
+		if (code >= 0 && std::find(codes.begin(), codes.end(), code) == codes.end())
+			codes.push_back(code);
 	}
-	if (best < 0)
-		return false;
-	memcpy(out, gRotCands[best].m, sizeof(gRotNow));
-	return true;
+	if (changed)
+		*changed = any;
+	return codes;
 }
 
-// The current view's code, or -1 if not snapped or not known.
-static int CurrentRotCode()
+static std::vector<int> CurrentRotCodes()
 {
-	double m[9];
-	return gRotLocked && RotValue(m) ? RotCode(m) : -1;
+	return gRotLocked ? RotCodes() : std::vector<int>();
 }
 
-static int ViewTickCode(int code);
+static int ViewTickCodes(const std::vector<int>& codes);
 
 // Each overlay frame: when the rotation has changed and then held still for
-// 200 ms (a snap's animation has finished), the view is looked up.
+// 200 ms (a snap's animation has finished), the view is looked up. Every
+// candidate's matrix is logged then, to show what ZBrush keeps.
 static void RotFollow()
 {
 	if (!gRotLocked)
 		return;
 	EnterCriticalSection(&gOverlayLock);
-	double m[9];
-	if (RotValue(m)) {
-		const DWORD now = GetTickCount();
-		double change = 0;
-		for (int i = 0; i < 9; ++i)
-			change = std::max(change, fabs(m[i] - gRotNow[i]));
-		if (change > 1e-5) {
-			memcpy(gRotNow, m, sizeof(m));
-			gRotChangedAt = now;
-			gRotSettled = false;
-		} else if (!gRotSettled && !gGesture.active && now - gRotChangedAt >= 200) {
-			gRotSettled = true;
-			const int code = RotCode(m);
-			const int result = ViewTickCode(code);
-			if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
-				fprintf(f, "%lu rotation settled, view code %d: result %d\n", now, code, result);
-				fclose(f);
+	bool changed = false;
+	const std::vector<int> codes = RotCodes(&changed, true);
+	const DWORD now = GetTickCount();
+	if (changed) {
+		gRotChangedAt = now;
+		gRotSettled = false;
+	} else if (!gRotSettled && !gGesture.active && now - gRotChangedAt >= 200) {
+		gRotSettled = true;
+		const int result = ViewTickCodes(codes);
+		for (RotCand& c : gRotCands)
+			memcpy(c.settled, c.m, sizeof(c.m));
+		if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			fprintf(f, "%lu rotation settled, %zu snapped copies, result %d:", now, codes.size(), result);
+			for (const RotCand& c : gRotCands) {
+				fprintf(f, " [%d", RotCode(c.m));
+				for (int i = 0; i < 9; ++i)
+					fprintf(f, " %.4f", c.m[i]);
+				fprintf(f, "]");
 			}
+			fprintf(f, "\n");
+			fclose(f);
 		}
 	}
 	LeaveCriticalSection(&gOverlayLock);
+}
+
+static void AddCodes(View& v, const std::vector<int>& codes)
+{
+	for (int c : codes)
+		if (std::find(v.codes.begin(), v.codes.end(), c) == v.codes.end())
+			v.codes.push_back(c);
 }
 
 // The view's rotation, from Live or the rotation read from memory. When the
@@ -2684,14 +2709,12 @@ static int ViewTickLocked(double rx, double ry, double rz)
 			result = -2;
 		}
 	} else {
-		// A view loaded before its matrix code was known learns it here.
-		if (gViews[slot].code < 0) {
-			const int code = CurrentRotCode();
-			if (code >= 0) {
-				gViews[slot].code = code;
-				SaveViews();
-			}
-		}
+		// A view loaded before its matrix codes were known learns them here.
+		const std::vector<int> codes = CurrentRotCodes();
+		const size_t before = gViews[slot].codes.size();
+		AddCodes(gViews[slot], codes);
+		if (gViews[slot].codes.size() != before)
+			SaveViews();
 		if (slot != gActiveView || gViewAway) {
 			ActivateView(slot);
 			result = 10 + slot;
@@ -2702,19 +2725,28 @@ static int ViewTickLocked(double rx, double ry, double rz)
 	return result;
 }
 
-// The same from the rotation matrix read from memory: code is RotCode of
-// it (-1 when not snapped). Caller holds the lock.
-static int ViewTickCode(int code)
+// The same from the rotation matrices read from memory: codes are the
+// snapped copies' RotCodes (none when turned freely). The view is the slot
+// sharing the most codes with them. Caller holds the lock.
+static int ViewTickCodes(const std::vector<int>& codes)
 {
 	LoadViews();
-	if (code < 0) {
+	if (codes.empty()) {
 		gViewAway = true;  // turning freely leaves the reference as it is
 		return -1;
 	}
-	int slot = -1;
-	for (int i = 0; i < kDefaultView; ++i)
-		if (gViews[i].used && gViews[i].code == code)
+	int slot = -1, best = 0;
+	for (int i = 0; i < kDefaultView; ++i) {
+		if (!gViews[i].used)
+			continue;
+		int shared = 0;
+		for (int c : codes)
+			shared += std::find(gViews[i].codes.begin(), gViews[i].codes.end(), c) != gViews[i].codes.end();
+		if (shared > best) {
+			best = shared;
 			slot = i;
+		}
+	}
 	int result = slot;
 	if (slot < 0) {
 		gViewAway = true;
@@ -3426,7 +3458,9 @@ ZFUNC RSRotProbe(char* text, double, char*, int, char*, int, char**)
 		gRotLocked = !gRotCands.empty() && gRotNarrowings >= 2;
 		// The Overlay press looks the current view up itself once its
 		// popups are closed (they would get into the outline match).
-		RotValue(gRotNow);
+		RotCodes();
+		for (RotCand& c : gRotCands)
+			memcpy(c.settled, c.m, sizeof(c.m));
 		gRotSettled = true;
 	}
 	const size_t n = gRotCands.size();
@@ -3577,9 +3611,9 @@ static void AnchorSlot(int slot, const double* v)
 	w.rx = v[3];
 	w.ry = v[4];
 	w.rz = v[5];
-	const int code = CurrentRotCode();
-	if (code >= 0)
-		w.code = code;
+	const std::vector<int> codes = CurrentRotCodes();
+	if (!codes.empty())
+		w.codes = codes;
 	w.mask.clear();
 	w.gw = 0;
 	SaveMask(slot);
@@ -3602,7 +3636,7 @@ ZFUNC RSViewImage(char* text, double, char*, int, char*, int, char**)
 	LoadViews();
 	gViews[gPrepSlot].path = text;
 	gViews[gPrepSlot].imgSX = gViews[gPrepSlot].imgSY = 1;
-	gViews[gPrepSlot].code = -1;
+	gViews[gPrepSlot].codes.clear();
 	gViews[gPrepSlot].imgX = gViews[gPrepSlot].imgY = 0;
 	AnchorSlot(gPrepSlot, gPrep);
 	gPrepSlot = -1;
