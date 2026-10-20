@@ -239,3 +239,229 @@ ZFUNC RSPixel(char* text, double, char*, int, char*, int, char**)
 	delete frame;
 	return result;
 }
+
+// ---------------------------------------------------------------------------
+// Overlay window (stage 1 of the live reference)
+// ---------------------------------------------------------------------------
+// A click-through layered window owned by ZBrush's main window (so it stays
+// above ZBrush but not above other programs), placed over the canvas and
+// redrawn on its own thread. It shows the reference with the same layout as
+// RSRender, at a constant opacity. The DLL pins itself when the overlay
+// starts, since ZBrush may unload it between [FileExecute] calls while the
+// overlay thread is still running.
+
+struct OverlayState {
+	double screenX = 0, screenY = 0;  // screen position of document (0, 0)
+	double pixelsPerDoc = 1;          // screen pixels per document pixel
+	double docW = 0, docH = 0;
+	double ratio = 1, px = 0, py = 0, ax = 0, ay = 0;
+	int alpha = 128;
+	bool visible = false;
+};
+
+static CRITICAL_SECTION gOverlayLock;
+static bool gOverlayLockReady = false;
+static OverlayState gOverlay;
+static HWND gOverlayWnd = nullptr;
+static DWORD gOverlayThreadId = 0;
+static const UINT WM_RS_REDRAW = WM_APP + 1;
+static const UINT WM_RS_CLOSE = WM_APP + 2;
+
+static BOOL CALLBACK FindZBrushWindow(HWND wnd, LPARAM param)
+{
+	DWORD pid = 0;
+	GetWindowThreadProcessId(wnd, &pid);
+	if (pid != GetCurrentProcessId() || !IsWindowVisible(wnd) || GetWindow(wnd, GW_OWNER))
+		return TRUE;
+	RECT r;
+	GetWindowRect(wnd, &r);
+	HWND* best = reinterpret_cast<HWND*>(param);
+	RECT b = {0, 0, 0, 0};
+	if (*best)
+		GetWindowRect(*best, &b);
+	if ((r.right - r.left) * (r.bottom - r.top) > (b.right - b.left) * (b.bottom - b.top))
+		*best = wnd;
+	return TRUE;
+}
+
+// Renders the current state into a premultiplied 32bpp bitmap the size of
+// the document area on screen and pushes it to the layered window.
+static void OverlayRedraw(HWND wnd)
+{
+	EnterCriticalSection(&gOverlayLock);
+	const OverlayState st = gOverlay;
+	const bool haveImage = LoadSavedImage();
+	if (!st.visible || !haveImage || st.docW < 1 || st.docH < 1) {
+		LeaveCriticalSection(&gOverlayLock);
+		ShowWindow(wnd, SW_HIDE);
+		return;
+	}
+	const int w = static_cast<int>(st.docW * st.pixelsPerDoc + 0.5);
+	const int h = static_cast<int>(st.docH * st.pixelsPerDoc + 0.5);
+
+	BITMAPINFO bi = {};
+	bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+	bi.bmiHeader.biWidth = w;
+	bi.bmiHeader.biHeight = -h;
+	bi.bmiHeader.biPlanes = 1;
+	bi.bmiHeader.biBitCount = 32;
+	bi.bmiHeader.biCompression = BI_RGB;
+	void* bits = nullptr;
+	HDC screen = GetDC(nullptr);
+	HDC mem = CreateCompatibleDC(screen);
+	HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+	HGDIOBJ old = SelectObject(mem, dib);
+	{
+		Gdiplus::Bitmap target(w, h, w * 4, PixelFormat32bppPARGB, static_cast<BYTE*>(bits));
+		Gdiplus::Graphics g(&target);
+		g.Clear(Gdiplus::Color(0, 0, 0, 0));
+		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+		g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+
+		const double imgW = gImage->GetWidth(), imgH = gImage->GetHeight();
+		const double fit = (st.docW / imgW < st.docH / imgH) ? st.docW / imgW : st.docH / imgH;
+		const double baseW = imgW * fit, baseH = imgH * fit;
+		const double baseX = (st.docW - baseW) * 0.5, baseY = (st.docH - baseH) * 0.5;
+		const double x = st.px + st.ratio * (baseX - st.ax);
+		const double y = st.py + st.ratio * (baseY - st.ay);
+		const double k = st.pixelsPerDoc;
+		g.DrawImage(gImage, Gdiplus::RectF(static_cast<Gdiplus::REAL>(x * k), static_cast<Gdiplus::REAL>(y * k),
+			static_cast<Gdiplus::REAL>(baseW * st.ratio * k), static_cast<Gdiplus::REAL>(baseH * st.ratio * k)));
+	}
+	LeaveCriticalSection(&gOverlayLock);
+
+	POINT dst = {static_cast<LONG>(st.screenX), static_cast<LONG>(st.screenY)};
+	SIZE size = {w, h};
+	POINT src = {0, 0};
+	BLENDFUNCTION blend = {AC_SRC_OVER, 0, static_cast<BYTE>(st.alpha), AC_SRC_ALPHA};
+	UpdateLayeredWindow(wnd, screen, &dst, &size, mem, &src, 0, &blend, ULW_ALPHA);
+	ShowWindow(wnd, SW_SHOWNOACTIVATE);
+
+	SelectObject(mem, old);
+	DeleteObject(dib);
+	DeleteDC(mem);
+	ReleaseDC(nullptr, screen);
+}
+
+static LRESULT CALLBACK OverlayProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+	switch (msg) {
+	case WM_RS_REDRAW:
+		OverlayRedraw(wnd);
+		return 0;
+	case WM_RS_CLOSE:
+		DestroyWindow(wnd);
+		return 0;
+	case WM_NCHITTEST:
+		return HTTRANSPARENT;
+	case WM_MOUSEACTIVATE:
+		return MA_NOACTIVATE;
+	case WM_DESTROY:
+		gOverlayWnd = nullptr;
+		PostQuitMessage(0);
+		return 0;
+	}
+	return DefWindowProcW(wnd, msg, wp, lp);
+}
+
+static DWORD WINAPI OverlayThread(LPVOID ready)
+{
+	StartGdiplus();
+	WNDCLASSW wc = {};
+	wc.lpfnWndProc = OverlayProc;
+	wc.hInstance = GetModuleHandleW(nullptr);
+	wc.lpszClassName = L"ReferenceScalerOverlay";
+	RegisterClassW(&wc);
+	HWND owner = nullptr;
+	EnumWindows(FindZBrushWindow, reinterpret_cast<LPARAM>(&owner));
+	gOverlayWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+		wc.lpszClassName, L"Reference Scaler", WS_POPUP, 0, 0, 1, 1, owner, nullptr, wc.hInstance, nullptr);
+	SetEvent(static_cast<HANDLE>(ready));
+	MSG msg;
+	while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+		TranslateMessage(&msg);
+		DispatchMessageW(&msg);
+	}
+	gOverlayThreadId = 0;
+	return 0;
+}
+
+// Starts the overlay thread once and keeps the DLL loaded for it.
+static bool EnsureOverlay()
+{
+	if (!gOverlayLockReady) {
+		InitializeCriticalSection(&gOverlayLock);
+		gOverlayLockReady = true;
+	}
+	if (gOverlayWnd)
+		return true;
+	HMODULE self = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+		reinterpret_cast<LPCWSTR>(&EnsureOverlay), &self);
+	HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	HANDLE thread = CreateThread(nullptr, 0, OverlayThread, ready, 0, &gOverlayThreadId);
+	if (!thread) {
+		CloseHandle(ready);
+		return false;
+	}
+	WaitForSingleObject(ready, 5000);
+	CloseHandle(ready);
+	CloseHandle(thread);
+	return gOverlayWnd != nullptr;
+}
+
+// text: "screenX screenY pixelsPerDoc docW docH alpha" — where document pixel
+// (0, 0) is on screen, how many screen pixels one document pixel covers, the
+// document size, and opacity 0-255. Shows the overlay. Returns 1, -1 for bad
+// arguments, -2 if the window could not be created.
+ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
+{
+	double sx, sy, k, dw, dh, a;
+	if (!text || sscanf(text, "%lf %lf %lf %lf %lf %lf", &sx, &sy, &k, &dw, &dh, &a) != 6 || k <= 0 || dw < 1 || dh < 1)
+		return -1;
+	if (!EnsureOverlay())
+		return -2;
+	EnterCriticalSection(&gOverlayLock);
+	gOverlay.screenX = sx;
+	gOverlay.screenY = sy;
+	gOverlay.pixelsPerDoc = k;
+	gOverlay.docW = dw;
+	gOverlay.docH = dh;
+	gOverlay.alpha = a < 0 ? 0 : a > 255 ? 255 : static_cast<int>(a);
+	gOverlay.visible = true;
+	LeaveCriticalSection(&gOverlayLock);
+	PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	return 1;
+}
+
+// text: "ratio px py anchorX anchorY", as for RSRender. Returns 1, -1 for bad
+// arguments, -2 if the overlay is not running.
+ZFUNC RSOverlaySet(char* text, double, char*, int, char*, int, char**)
+{
+	double r, px, py, ax, ay;
+	if (!text || sscanf(text, "%lf %lf %lf %lf %lf", &r, &px, &py, &ax, &ay) != 5 || r <= 0)
+		return -1;
+	if (!gOverlayWnd)
+		return -2;
+	EnterCriticalSection(&gOverlayLock);
+	gOverlay.ratio = r;
+	gOverlay.px = px;
+	gOverlay.py = py;
+	gOverlay.ax = ax;
+	gOverlay.ay = ay;
+	LeaveCriticalSection(&gOverlayLock);
+	PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	return 1;
+}
+
+// Hides the overlay. Returns 1.
+ZFUNC RSOverlayStop(char*, double, char*, int, char*, int, char**)
+{
+	if (gOverlayWnd) {
+		EnterCriticalSection(&gOverlayLock);
+		gOverlay.visible = false;
+		LeaveCriticalSection(&gOverlayLock);
+		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	}
+	return 1;
+}

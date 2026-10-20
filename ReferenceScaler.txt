@@ -24,7 +24,7 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 40"]
+[VarDef, zrsBuild, "build 41"]
 [VarDef, zrsDll, "ReferenceScaler_Data\ReferenceScaler64.dll"]
 [VarDef, zrsLive, 0]
 [VarDef, zrsPx, 0]
@@ -47,6 +47,9 @@
 [VarDef, zrsFile, ""]
 [VarDef, zrsMsg, ""]
 [VarDef, zrsTick, 0]
+[VarDef, zrsOx, 0]
+[VarDef, zrsOy, 0]
+[VarDef, zrsZoom, 1]
 [VarDef, zrsEditFill, -1]
 [VarDef, zrsEditAfter, -1]
 [VarDef, zrsKx, 0]
@@ -113,6 +116,7 @@
 			[VarSet, zrsLastRatio, zrsRatio]
 			[VarSet, zrsLastPx, zrsPx]
 			[VarSet, zrsLastPy, zrsPy]
+			[FileExecute, zrsDll, "RSOverlaySet", [StrMerge, zrsRatio, " ", zrsPx, " ", zrsPy, " ", zrsAx, " ", zrsAy]]
 			[VarSet, zrsMsg, [StrMerge, "Shown at ratio ", zrsRatio, ", model at ", zrsPx, ", ", zrsPy]]
 			[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nEdit after fill ", zrsEditFill, ", after restore ", zrsEditAfter]]
 		]
@@ -122,14 +126,14 @@
 // Works out the ratio and positions from the current model and the anchor
 // sliders, then shows the frame. Leaves a result in zrsMsg.
 [RoutineDef, ZRSUpdate,
-	[If, [IGet, "ZPlugin:Reference Scaler b40:Anchor Scale"] <= 0,
+	[If, [IGet, "ZPlugin:Reference Scaler b41:Anchor Scale"] <= 0,
 		[VarSet, zrsMsg, "Not anchored: line the model up with the image and press Anchor first."]
 		[VarSet, zrsResult, 0]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b40:Anchor Scale"]]
-		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b40:Anchor X"]]
-		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b40:Anchor Y"]]
+		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b41:Anchor Scale"]]
+		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b41:Anchor X"]]
+		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b41:Anchor Y"]]
 		[RoutineCall, ZRSShow]
 	]
 ]
@@ -144,27 +148,46 @@
 			[VarSet, zrsTick, zrsTick + 1]
 			[If, [IGet, Transform:Edit],
 				[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b40:Anchor Scale"]]
+				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b41:Anchor Scale"]]
 				[If, ABS(zrsRatio - zrsLastRatio) > 0.002 || ABS(zrsPx - zrsLastPx) > 0.5 || ABS(zrsPy - zrsLastPy) > 0.5,
 					[RoutineCall, ZRSUpdate]
-					[If, [IGet, "ZPlugin:Reference Scaler b40:Diag"] || zrsResult != 1, [Note, [StrMerge, "Live tick ", zrsTick, ": redrew, result ", zrsResult, "\n", zrsMsg], , 1]]
+					[If, [IGet, "ZPlugin:Reference Scaler b41:Diag"] || zrsResult != 1, [Note, [StrMerge, "Live tick ", zrsTick, ": redrew, result ", zrsResult, "\n", zrsMsg], , 1]]
 					,
-					[If, [IGet, "ZPlugin:Reference Scaler b40:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": no change (ratio ", zrsRatio, ")"], , 0.5]]
+					[If, [IGet, "ZPlugin:Reference Scaler b41:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": no change (ratio ", zrsRatio, ")"], , 0.5]]
 				]
 				,
-				[If, [IGet, "ZPlugin:Reference Scaler b40:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": model not in Edit mode"], , 0.5]]
+				[If, [IGet, "ZPlugin:Reference Scaler b41:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": model not in Edit mode"], , 0.5]]
 			]
 			[SleepAgain, 0.5, 9]
 		]
 	, 9]
 ]
 
+// Overlay (stage 1 of the live reference): a click-through window drawn by
+// the DLL over the canvas. The canvas origin on screen is the mouse position
+// in screen coordinates minus its position in canvas coordinates (scaled by
+// the canvas zoom), which works wherever the mouse is. It starts at the last
+// drawn zoom and position, or fitted to the document if nothing was drawn yet.
+[RoutineDef, ZRSOverlayOn,
+	[VarSet, zrsZoom, [CanvasZoomGet]]
+	[VarSet, zrsOx, [MouseHPos, 1] - [MouseHPos] * zrsZoom]
+	[VarSet, zrsOy, [MouseVPos, 1] - [MouseVPos] * zrsZoom]
+	[VarSet, zrsArgs, [StrMerge, zrsOx, " ", zrsOy, " ", zrsZoom, " ", [IGet, Document:Width]]]
+	[VarSet, zrsArgs, [StrMerge, zrsArgs, " ", [IGet, Document:Height], " ", [IGet, "ZPlugin:Reference Scaler b41:Overlay Opacity"] * 2.55]]
+	[VarSet, zrsResult, [FileExecute, zrsDll, "RSOverlayStart", zrsArgs]]
+	[If, zrsLastRatio > 0,
+		[FileExecute, zrsDll, "RSOverlaySet", [StrMerge, zrsLastRatio, " ", zrsLastPx, " ", zrsLastPy, " ", [IGet, "ZPlugin:Reference Scaler b41:Anchor X"], " ", [IGet, "ZPlugin:Reference Scaler b41:Anchor Y"]]]
+		,
+		[FileExecute, zrsDll, "RSOverlaySet", "1 0 0 0 0"]
+	]
+]
+
 // ---------------------------------------------------------------------------
 // Interface
 // ---------------------------------------------------------------------------
-[ISubPalette, "ZPlugin:Reference Scaler b40"]
+[ISubPalette, "ZPlugin:Reference Scaler b41"]
 
-[IButton, "ZPlugin:Reference Scaler b40:Load Image",
+[IButton, "ZPlugin:Reference Scaler b41:Load Image",
 	"Choose the reference image and show it behind the model, fitted to the document.",
 	[VarSet, zrsFile, [FileNameAsk, "Image (*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd)|*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd||", , "Choose reference image"]]
 	[If, [StrLength, zrsFile] == 0,
@@ -182,35 +205,35 @@
 	, 0, 1
 ]
 
-[IButton, "ZPlugin:Reference Scaler b40:Anchor",
+[IButton, "ZPlugin:Reference Scaler b41:Anchor",
 	"With the model lined up with the image, press to record this zoom and position as the 1:1 match.",
 	[If, [IGet, Transform:Edit] == 0,
 		[Note, "Put the model in Edit mode first."]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[ISet, "ZPlugin:Reference Scaler b40:Anchor Scale", zrsSx]
-		[ISet, "ZPlugin:Reference Scaler b40:Anchor X", zrsPx]
-		[ISet, "ZPlugin:Reference Scaler b40:Anchor Y", zrsPy]
+		[ISet, "ZPlugin:Reference Scaler b41:Anchor Scale", zrsSx]
+		[ISet, "ZPlugin:Reference Scaler b41:Anchor X", zrsPx]
+		[ISet, "ZPlugin:Reference Scaler b41:Anchor Y", zrsPy]
 		[Note, [StrMerge, "Anchored: model scale ", zrsSx, ", position ", zrsPx, ", ", zrsPy]]
 	]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b40:Sync",
+[IButton, "ZPlugin:Reference Scaler b41:Sync",
 	"Redraw the reference for the current zoom and position once.",
 	[RoutineCall, ZRSUpdate]
 	[If, zrsResult != 1, [Note, zrsMsg], [Note, [StrMerge, "Sync: ", zrsMsg], , 1]]
 	, 0, 0.5
 ]
 
-[ISwitch, "ZPlugin:Reference Scaler b40:Live", 0,
+[ISwitch, "ZPlugin:Reference Scaler b41:Live", 0,
 	"Keep redrawing the reference as the camera zooms and pans.",
 	[VarSet, zrsLive, 1]
 	[RoutineCall, ZRSUpdate]
 	[If, zrsResult != 1,
 		[Note, [StrMerge, "Live could not start: ", zrsMsg]]
 		[VarSet, zrsLive, 0]
-		[ISet, "ZPlugin:Reference Scaler b40:Live", 0]
+		[ISet, "ZPlugin:Reference Scaler b41:Live", 0]
 		,
 		[VarSet, zrsTick, 0]
 		[Note, "Live on: zoom or pan, and the reference follows when you release the mouse.", , 2]
@@ -222,7 +245,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b40:Reset",
+[IButton, "ZPlugin:Reference Scaler b41:Reset",
 	"Show the reference fitted to the document again, unscaled.",
 	[RoutineCall, ZRSBase]
 	[RoutineCall, ZRSShow]
@@ -230,29 +253,43 @@
 	, 0, 0.5
 ]
 
-[ISwitch, "ZPlugin:Reference Scaler b40:Diag", 0,
+[ISwitch, "ZPlugin:Reference Scaler b41:Overlay", 0,
+	"Stage 1 test: show the reference in a click-through window over the canvas (it covers the model for now).",
+	[RoutineCall, ZRSOverlayOn]
+	[Note, [StrMerge, "Overlay start ", zrsResult, " (1 = ok)\nCanvas origin on screen ", zrsOx, ", ", zrsOy, ", zoom ", zrsZoom, "\nDoes the image line up with the canvas?"]]
+	,
+	[FileExecute, zrsDll, "RSOverlayStop"]
+	, 0, 0.5
+]
+
+[ISlider, "ZPlugin:Reference Scaler b41:Overlay Opacity", 50, 1, 0, 100,
+	"Opacity of the overlay window, in percent. Press Overlay again after changing it.",
+	, 0, 0.5
+]
+
+[ISwitch, "ZPlugin:Reference Scaler b41:Diag", 0,
 	"Show a short popup on every Live wake-up, not just on redraws.",
 	, , 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b40:About",
+[IButton, "ZPlugin:Reference Scaler b41:About",
 	"Show which build is running and whether the helper DLL loads.",
 	[Note, [StrMerge, "Reference Scaler ", zrsBuild, "\nDLL check: ", [FileExecute, zrsDll, "RSVersion"], " (1 = ok)"]]
 	, 0, 0.5
 ]
 
 // Anchor storage. Set by Anchor; shown so the anchored values are visible.
-[ISlider, "ZPlugin:Reference Scaler b40:Anchor Scale", 0, 0.001, 0, 100000,
+[ISlider, "ZPlugin:Reference Scaler b41:Anchor Scale", 0, 0.001, 0, 100000,
 	"Model scale recorded by Anchor.",
 	, 0, 1
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b40:Anchor X", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b41:Anchor X", 0, 0.001, -100000, 100000,
 	"Model horizontal position recorded by Anchor.",
 	, 0, 0.5
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b40:Anchor Y", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b41:Anchor Y", 0, 0.001, -100000, 100000,
 	"Model vertical position recorded by Anchor.",
 	, 0, 0.5
 ]
