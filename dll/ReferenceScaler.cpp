@@ -117,7 +117,7 @@ static bool WritePng(const std::wstring& path, Gdiplus::Bitmap& frame)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 53;
+static const int kDllBuild = 54;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -519,6 +519,9 @@ struct Gesture {
 static NavModel gNav;
 static double gLastErrorPos = 0, gLastErrorScale = 1;
 static int gLastKind = kKindNone;
+static Gesture gPending;      // last finished navigation drag, until Live reports
+static int gPendingCount = 0; // navigation drags since Live last reported
+static int gStaleSets = 0;    // reports ignored as not including the drag yet
 static Gesture gGesture;
 static HHOOK gMouseHook = nullptr, gKeyHook = nullptr;
 static int gHookEvents = 0;
@@ -680,6 +683,13 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 				(g.moveX != 0 || g.moveY != 0) ? kKindMove : g.rotated ? kKindRotate : kKindNone;
 			gLastKind = g.kind;
 			g.done = g.kind == kKindMove || g.kind == kKindScale || g.kind == kKindRotate;
+			if (g.done) {
+				// Waits for Live's exact values. Two navigation drags before
+				// they come cannot be told apart, so that one is not learned.
+				gPendingCount = gPending.done ? gPendingCount + 1 : 1;
+				gPending = g;
+				gStaleSets = 0;
+			}
 			if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
 				fprintf(f, "drag kind %d right %d alt %d scaleSegs %d move %.0f %.0f scale %.0f %.0f predicted %.5f %.2f %.2f\n",
 					g.kind, g.right, g.altSeen, g.scaleSegments, g.moveX, g.moveY, g.scaleDx, g.scaleDy,
@@ -698,10 +708,12 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 // Caller holds the lock.
 static void Learn(double ratio, double px, double py)
 {
-	Gesture& g = gGesture;
+	Gesture& g = gPending;
 	if (!g.done)
 		return;
 	g.done = false;
+	const bool single = gPendingCount == 1;
+	gPendingCount = 0;
 	const double k = gOverlay.pixelsPerDoc;
 	const double s = ratio / g.ratio0;
 	// Every drag is logged, so ZBrush's behaviour can be checked.
@@ -712,7 +724,7 @@ static void Learn(double ratio, double px, double py)
 			g.ratio0, g.px0, g.py0, gOverlay.ratio, gOverlay.px, gOverlay.py, ratio, px, py, k);
 		fclose(f);
 	}
-	if (g.kind == kKindRotate)
+	if (g.kind == kKindRotate || !single)
 		return;
 	if (g.scaleSegments == 0) {
 		// Move only: gain along the direction moved.
@@ -1760,7 +1772,8 @@ ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 // text: "ratio px py anchorX anchorY", as for RSRender. Also how the
 // navigation model learns: values set right after a drag are the exact
 // result of that drag. Returns 1, -1 for bad arguments, -2 if the overlay is
-// not running.
+// not running, 3 if not applied because a drag is in progress or the values
+// do not include the last drag yet (call again).
 ZFUNC RSOverlaySet(char* text, double, char*, int, char*, int, char**)
 {
 	double r, px, py, ax, ay;
@@ -1769,7 +1782,23 @@ ZFUNC RSOverlaySet(char* text, double, char*, int, char*, int, char**)
 	if (!gOverlayWnd)
 		return -2;
 	EnterCriticalSection(&gOverlayLock);
-	if (gGesture.done) {
+	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "set %.5f %.2f %.2f dragging %d unreported %d shown %.5f %.2f %.2f\n",
+			r, px, py, gGesture.active, gPending.done ? gPendingCount : 0, gOverlay.ratio, gOverlay.px, gOverlay.py);
+		fclose(f);
+	}
+	// ZBrush can report the values from before a drag for a while after it.
+	// Values still equal to the drag's start, while the prediction moved,
+	// are not applied (the script retries); after a few tries they are.
+	if (gGesture.active || (gPending.done && gStaleSets < 4 &&
+			fabs(px - gPending.px0) < 0.3 && fabs(py - gPending.py0) < 0.3 && fabs(r / gPending.ratio0 - 1) < 0.001 &&
+			(fabs(gOverlay.px - px) > 2 || fabs(gOverlay.py - py) > 2 || fabs(gOverlay.ratio / r - 1) > 0.01))) {
+		if (!gGesture.active)
+			++gStaleSets;
+		LeaveCriticalSection(&gOverlayLock);
+		return 3;
+	}
+	if (gPending.done) {
 		// How far the drag prediction was from the exact values.
 		gLastErrorPos = sqrt((gOverlay.px - px) * (gOverlay.px - px) + (gOverlay.py - py) * (gOverlay.py - py));
 		gLastErrorScale = gOverlay.ratio / r;
