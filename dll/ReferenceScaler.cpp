@@ -217,3 +217,25 @@ ZFUNC RSGet(char* text, double, char*, int, char*, int, char**)
 	fclose(f);
 	return result;
 }
+
+// text: "x y frameName". Returns the frame pixel at (x, y) as R*65536+G*256+B
+// (exact in a float), or -1 if the frame cannot be read or (x, y) is outside.
+ZFUNC RSPixel(char* text, double, char*, int, char*, int, char**)
+{
+	double x, y;
+	char frameName[256] = {0};
+	if (!text || sscanf(text, "%lf %lf %255s", &x, &y, frameName) != 3)
+		return -1;
+	StartGdiplus();
+	const std::wstring name = Widen(frameName);
+	const bool absolute = name.size() > 2 && name[1] == L':';
+	Gdiplus::Bitmap* frame = Gdiplus::Bitmap::FromFile((absolute ? name : DllFolder() + name).c_str());
+	float result = -1;
+	if (frame && frame->GetLastStatus() == Gdiplus::Ok && x >= 0 && y >= 0 && x < frame->GetWidth() && y < frame->GetHeight()) {
+		Gdiplus::Color c;
+		if (frame->GetPixel(static_cast<INT>(x), static_cast<INT>(y), &c) == Gdiplus::Ok)
+			result = static_cast<float>(c.GetR() * 65536 + c.GetG() * 256 + c.GetB());
+	}
+	delete frame;
+	return result;
+}
