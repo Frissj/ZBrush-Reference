@@ -115,10 +115,13 @@ static bool WritePng(const std::wstring& path, Gdiplus::Bitmap& frame)
 	return saved;
 }
 
-// Returns 1 so the script can check the DLL loads at all.
+// The DLL's build number, so the script can tell when ZBrush still has an
+// older DLL loaded (the overlay keeps it loaded until ZBrush closes).
+static const int kDllBuild = 53;
+
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
-	return 1;
+	return kDllBuild;
 }
 
 // text: full path of the reference image. Remembers it for RSRender.
@@ -677,6 +680,12 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 				(g.moveX != 0 || g.moveY != 0) ? kKindMove : g.rotated ? kKindRotate : kKindNone;
 			gLastKind = g.kind;
 			g.done = g.kind == kKindMove || g.kind == kKindScale || g.kind == kKindRotate;
+			if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				fprintf(f, "drag kind %d right %d alt %d scaleSegs %d move %.0f %.0f scale %.0f %.0f predicted %.5f %.2f %.2f\n",
+					g.kind, g.right, g.altSeen, g.scaleSegments, g.moveX, g.moveY, g.scaleDx, g.scaleDy,
+					gOverlay.ratio, gOverlay.px, gOverlay.py);
+				fclose(f);
+			}
 		}
 		break;
 	}
@@ -697,7 +706,7 @@ static void Learn(double ratio, double px, double py)
 	const double s = ratio / g.ratio0;
 	// Every drag is logged, so ZBrush's behaviour can be checked.
 	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
-		fprintf(f, "kind %d right %d alt %d scaleSegs %d move %.0f %.0f scale %.0f %.0f afterScaleMove %d "
+		fprintf(f, "exact kind %d right %d alt %d scaleSegs %d move %.0f %.0f scale %.0f %.0f afterScaleMove %d "
 			"start %.5f %.2f %.2f predicted %.5f %.2f %.2f exact %.5f %.2f %.2f k %.4f\n",
 			g.kind, g.right, g.altSeen, g.scaleSegments, g.moveX, g.moveY, g.scaleDx, g.scaleDy, g.movedAfterScale,
 			g.ratio0, g.px0, g.py0, gOverlay.ratio, gOverlay.px, gOverlay.py, ratio, px, py, k);
@@ -1112,9 +1121,10 @@ static bool Capture(const OverlayState& st)
 	return true;
 }
 
-// Below this share of magenta (out of 255) a pixel counts as model. ZBrush
-// tints some model pixels slightly towards the background colour.
-static const int kModelBelow = 70;
+// Below this share of magenta (out of 255) a pixel is left as it is. Above
+// it the magenta is replaced, which also removes any magenta tint ZBrush puts
+// on the model.
+static const int kModelBelow = 12;
 
 // Builds the opaque output from gCapture: each pixel's share of magenta is
 // replaced by the reference (gRefLayer, black where there is none).
