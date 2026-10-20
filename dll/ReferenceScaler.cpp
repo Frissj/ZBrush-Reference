@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 83;
+static const int kDllBuild = 84;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1237,6 +1237,10 @@ static const double kPanelShare = 0.35;  // of the canvas width
 // until then, which means the whole document.
 static int gViewX0 = 0, gViewY0 = 0, gViewX1 = 0, gViewY1 = 0;
 static bool gRedrawPending = false;
+// ZBrush's view gizmo (the head and axes) in the viewport's top right
+// corner, which a panel on the right starts below: its bottom in overlay
+// pixels, 0 until seen.
+static int gGizmoBottom = 0;
 
 static void ViewportRect(int w, int h, int& x0, int& y0, int& x1, int& y1)
 {
@@ -1258,9 +1262,9 @@ static void PanelRect(int w, int h, int& x0, int& y0, int& pw, int& ph)
 	int vx0, vy0, vx1, vy1;
 	ViewportRect(w, h, vx0, vy0, vx1, vy1);
 	pw = static_cast<int>((vx1 - vx0) * kPanelShare + 0.5);
-	ph = vy1 - vy0;
 	x0 = gPanelLeft ? vx0 : vx1 - pw;
-	y0 = vy0;
+	y0 = !gPanelLeft && gGizmoBottom > vy0 && gGizmoBottom < vy1 - 50 ? gGizmoBottom : vy0;
+	ph = vy1 - y0;
 }
 
 // Layout and image of a view slot for the panel, from the current camera.
@@ -1761,6 +1765,58 @@ static void Composite(HWND wnd, const OverlayState& st)
 		out[2] = static_cast<unsigned char>(orr < 0 ? 0 : orr > 255 ? 255 : orr);
 	}
 	gMagentaShare = n ? 100.0 * magenta / n : 0;
+	if (gViewX1 > gViewX0 && gViewY1 > gViewY0) {
+		// The gizmo: what is not background in the viewport's top right
+		// corner (a square of 30% of its height), when the background shows
+		// in most of that corner (the model is not across it). Its lowest
+		// row so far, plus a margin.
+		const int q = static_cast<int>(std::min(gViewX1 - gViewX0, gViewY1 - gViewY0) * 0.3);
+		const int cx0 = std::max(0, gViewX1 - q), cy0 = std::max(0, gViewY0), cx1 = std::min(w, gViewX1), cy1 = std::min(h, gViewY0 + q);
+		int lowest = -1;
+		size_t other = 0, all = 0;
+		for (int y = cy0; y < cy1; ++y)
+			for (int x = cx0; x < cx1; ++x) {
+				++all;
+				// A few pixels in from the viewport's edge: its border is not the gizmo.
+				if (gKeyShare[static_cast<size_t>(y) * w + x] < 64 && x < cx1 - 4 && y > cy0 + 4) {
+					++other;
+					lowest = y;
+				}
+			}
+		if (all && other * 2 < all && lowest >= 0) {
+			// Raised at once; lowered (to the most seen meanwhile) once it
+			// has been lower for 3 seconds, as after a popup there closes.
+			const int bottom = lowest + 6;
+			static DWORD lowerSince = 0;
+			static int lowerMax = 0;
+			const DWORD now = GetTickCount();
+			int next = gGizmoBottom;
+			if (bottom >= gGizmoBottom) {
+				next = bottom;
+				lowerSince = 0;
+			} else {
+				if (!lowerSince) {
+					lowerSince = now;
+					lowerMax = bottom;
+				}
+				lowerMax = std::max(lowerMax, bottom);
+				if (now - lowerSince >= 3000) {
+					next = lowerMax;
+					lowerSince = 0;
+				}
+			}
+			if (next != gGizmoBottom) {
+				gGizmoBottom = next;
+				EnterCriticalSection(&gOverlayLock);
+				gRedrawPending = true;
+				LeaveCriticalSection(&gOverlayLock);
+				if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+					fprintf(f, "%lu view gizmo down to %d (corner %d %d to %d %d)\n", GetTickCount(), gGizmoBottom, cx0, cy0, cx1, cy1);
+					fclose(f);
+				}
+			}
+		}
+	}
 	{
 		// The viewport grows to every row and column the background shows
 		// in (at least 8 pixels of it, so stray magenta in the interface
@@ -2832,6 +2888,8 @@ static void SampleSilhouette(const OverlayState& st, double offX, double offY, V
 	// the model.
 	int vx0, vy0, vx1, vy1;
 	ViewportRect(gKeyW, gKeyH, vx0, vy0, vx1, vy1);
+	// Nor is the view gizmo in the top right corner.
+	const int gizmoX = vx1 - static_cast<int>(std::min(vx1 - vx0, vy1 - vy0) * 0.3);
 	for (int j = 0; j < g.gh; ++j) {
 		const double v = g.v0 + (j + 0.5) * g.cell;
 		const int yp = static_cast<int>(floor((st.py + st.ratio * (v - st.ay - offY)) * k));
@@ -2840,7 +2898,7 @@ static void SampleSilhouette(const OverlayState& st, double offX, double offY, V
 		for (int i = 0; i < g.gw; ++i) {
 			const double u = g.u0 + (i + 0.5) * g.cell;
 			const int xp = static_cast<int>(floor((st.px + st.ratio * (u - st.ax - offX)) * k));
-			if (xp < vx0 || xp >= vx1)
+			if (xp < vx0 || xp >= vx1 || (xp >= gizmoX && yp < gGizmoBottom))
 				continue;
 			out[static_cast<size_t>(j) * g.gw + i] = gKeyShare[static_cast<size_t>(yp) * gKeyW + xp] < 128 ? 2 : 1;
 		}
@@ -3544,6 +3602,7 @@ static bool OverlayStep(HWND wnd)
 			gDup.Release();
 			gDup.failed = false;
 			gViewX0 = gViewY0 = gViewX1 = gViewY1 = 0;
+			gGizmoBottom = 0;
 		}
 		if (!BuildRefLayer(st)) {
 			ShowWindow(wnd, SW_HIDE);
