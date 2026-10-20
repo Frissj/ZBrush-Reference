@@ -5,10 +5,11 @@
 // side (PureRef), following ZBrush's zoom, pan and view snaps, which the DLL
 // reads from ZBrush's memory.
 //
-// Install: keep the JRef_Data folder next to this file. To load JRef every
-// time ZBrush starts, put the compiled JRef.zsc (ZBrush writes it next to
-// this file when the file is loaded with ZScript > Load) and the JRef_Data
-// folder into ZBrush's ZStartup\ZPlugs64 folder. It appears as the JRef menu.
+// Install: put JRef.zsc (ZBrush writes it next to this file when this file is
+// loaded with ZScript > Load) and the JRef_Data folder into ZBrush's
+// ZStartup\ZPlugs64 folder; JRef then loads every time ZBrush starts, as the
+// JRef menu. Where JRef_Data cannot be written, the DLL writes its frames,
+// log and settings to C:\Users\Public\Documents\JRef instead.
 //
 // A project's views, outlines and settings live in a JRef folder next to the
 // first image loaded, with copies of the images, so the folder can be taken to
@@ -20,9 +21,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 87"]
+[VarDef, zrsBuild, "build 88"]
 [VarDef, zrsDll, "JRef_Data\JRef64.dll"]
-[VarDef, zrsDllBuild, 87]
+[VarDef, zrsDllBuild, 88]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -135,6 +136,18 @@
 	[TransformGet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
 	[RoutineCall, ZRSFillOnly]
 	[RoutineCall, ZRSRestore]
+]
+
+// Sets zrsFile to frame0.png where the DLL writes it: JRef_Data, or
+// C:/Users/Public/Documents/JRef when JRef_Data cannot be written (JRef
+// installed in ZBrush's ZStartup folder without admin rights). nav_log.txt
+// and the snapshots are there too.
+[RoutineDef, ZRSFramePath,
+	[If, [FileExecute, zrsDll, "RSDataFolder"] == 1,
+		[VarSet, zrsFile, "C:/Users/Public/Documents/JRef/frame0.png"]
+		,
+		[VarSet, zrsFile, [FileNameResolvePath, "JRef_Data\frame0.png"]]
+	]
 ]
 
 // Records the current view as the anchor, in the DLL's anchor.txt.
@@ -484,7 +497,7 @@
 			[Note, [StrMerge, "Render failed (", zrsResult, ")."]]
 			,
 			[FileExecute, zrsDll, "RSPattern", [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " frame0.png"]]
-			[VarSet, zrsFile, [FileNameResolvePath, "JRef_Data\frame0.png"]]
+			[RoutineCall, ZRSFramePath]
 			[TransformGet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
 			[VarSet, zrsMsg2, "before overlay"]
 			[RoutineCall, ZRSDepthProbe]
@@ -518,7 +531,7 @@
 				[VarSet, zrsTick, [FileExecute, zrsDll, "RSOverlayInfo", "32"]]
 				[If, zrsTick < 5,
 					[FileExecute, zrsDll, "RSBlank", [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " frame0.png 255 0 255"]]
-					[VarSet, zrsFile, [FileNameResolvePath, "JRef_Data\frame0.png"]]
+					[RoutineCall, ZRSFramePath]
 					[RoutineCall, ZRSFill]
 					[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nBackground colour did not turn magenta (", zrsTick, "%): using a fill, the model may clip."]]
 				]
@@ -554,7 +567,8 @@
 				[VarSet, zrsMsg, "-3: frame0.png missing.\n-4: screen capture failed.\n-5: the pattern was not found on screen."]
 				[VarSet, zrsArgs, [StrMerge, "Overlay failed (", zrsResult, "). Best match ", zrsTick, "% at ", zrsOx, ", ", zrsOy]]
 				[Note, [StrMerge, zrsArgs, " scale ", zrsZoom, "\n", zrsMsg]]
-				[Note, [StrMerge, "What the plugin saw is saved as\n", [FileNameResolvePath, "JRef_Data\capture.png"], "\nPlease send that file."]]
+				[RoutineCall, ZRSFramePath]
+				[Note, [StrMerge, "What the plugin saw is saved as capture.png next to\n", zrsFile, "\nPlease send that file."]]
 			]
 		]
 	]
@@ -813,7 +827,8 @@
 	[RoutineCall, ZRSDepthProbe]
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSSnapshot"]]
 	[If, zrsTick == 1,
-		[Note, [StrMerge, "Saved snap_capture.png and snap_overlay.png in the folder of\n", [FileNameResolvePath, zrsDll]]]
+		[RoutineCall, ZRSFramePath]
+		[Note, [StrMerge, "Saved snap_capture.png and snap_overlay.png next to\n", zrsFile]]
 		,
 		[Note, "Nothing to save: turn the overlay on first."]
 	]

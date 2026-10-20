@@ -42,6 +42,35 @@ static std::wstring DllFolder()
 	return slash == std::wstring::npos ? L"" : folder.substr(0, slash + 1);
 }
 
+// Where the DLL writes (frames, logs, this computer's settings): its own
+// folder, or, when that cannot be written (installed in ZBrush's ZStartup
+// folder without admin rights), C:\\Users\\Public\\Documents\\JRef\\. The
+// script asks RSDataFolder which, to find frame0.png.
+static std::wstring gDataFolder;
+
+static std::wstring DataFolder()
+{
+	if (!gDataFolder.empty())
+		return gDataFolder;
+	const std::wstring own = DllFolder(), test = own + L"write_test.tmp";
+	HANDLE h = CreateFileW(test.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+	if (h != INVALID_HANDLE_VALUE) {
+		CloseHandle(h);
+		gDataFolder = own;
+	} else {
+		CreateDirectoryW(L"C:\\Users\\Public\\Documents\\JRef", nullptr);
+		gDataFolder = L"C:\\Users\\Public\\Documents\\JRef\\";
+	}
+	return gDataFolder;
+}
+
+// 1 when the DLL writes to C:\\Users\\Public\\Documents\\JRef\\, 0 when to its own
+// folder.
+extern "C" __declspec(dllexport) float RSDataFolder(char*, double, char*, int, char*, int, char**)
+{
+	return DataFolder() == DllFolder() ? 0.0f : 1.0f;
+}
+
 static std::wstring Widen(const char* text)
 {
 	int len = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
@@ -64,7 +93,7 @@ static std::wstring ProjectFolder()
 {
 	if (!gProjectTried) {
 		gProjectTried = true;
-		if (FILE* f = _wfopen((DllFolder() + L"last_project.txt").c_str(), L"rb")) {
+		if (FILE* f = _wfopen((DataFolder() + L"last_project.txt").c_str(), L"rb")) {
 			char buf[1024] = {0};
 			buf[fread(buf, 1, sizeof(buf) - 1, f)] = 0;
 			fclose(f);
@@ -77,7 +106,7 @@ static std::wstring ProjectFolder()
 				gProjectDir = w;
 		}
 	}
-	return gProjectDir.empty() ? DllFolder() : gProjectDir;
+	return gProjectDir.empty() ? DataFolder() : gProjectDir;
 }
 
 // An image path as stored: relative ones are in the project folder.
@@ -99,7 +128,7 @@ static void StartGdiplus()
 // unloading the DLL between calls.
 static std::wstring ConfigPath()
 {
-	return DllFolder() + L"reference_path.txt";
+	return DataFolder() + L"reference_path.txt";
 }
 
 // Loads (or reuses) the reference image. Returns false if it cannot be read.
@@ -158,7 +187,7 @@ ZFUNC RSLog(char* text, double, char*, int, char*, int, char**)
 {
 	if (!text)
 		return -1;
-	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 		fprintf(f, "%lu %s\n", GetTickCount(), text);
 		fclose(f);
 	}
@@ -207,7 +236,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 87;
+static const int kDllBuild = 88;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -232,7 +261,7 @@ ZFUNC RSSetImage(char* text, double, char*, int, char*, int, char**)
 // Layout of the last rendered frame, "ratio px py anchorX anchorY".
 static std::wstring LayoutPath()
 {
-	return DllFolder() + L"frame_layout.txt";
+	return DataFolder() + L"frame_layout.txt";
 }
 
 // text: "docW docH ratio px py anchorX anchorY frameName"
@@ -275,7 +304,7 @@ ZFUNC RSRender(char* text, double, char*, int, char*, int, char**)
 	// frameName is relative to the DLL folder unless it is an absolute path.
 	const std::wstring name = Widen(frameName);
 	const bool absolute = name.size() > 2 && name[1] == L':';
-	if (!WritePng(absolute ? name : DllFolder() + name, frame))
+	if (!WritePng(absolute ? name : DataFolder() + name, frame))
 		return -4;
 	// The overlay starts from this layout (see RSOverlayStart).
 	if (FILE* f = _wfopen(LayoutPath().c_str(), L"wb")) {
@@ -301,7 +330,7 @@ ZFUNC RSBlank(char* text, double, char*, int, char*, int, char**)
 		Gdiplus::Graphics gr(&frame);
 		gr.Clear(Gdiplus::Color(255, static_cast<BYTE>(r), static_cast<BYTE>(g), static_cast<BYTE>(b)));
 	}
-	return WritePng(DllFolder() + Widen(frameName), frame) ? 1 : -4;
+	return WritePng(DataFolder() + Widen(frameName), frame) ? 1 : -4;
 }
 
 // The calibration pattern: random black and white blocks at two sizes, the
@@ -343,7 +372,7 @@ ZFUNC RSPattern(char* text, double, char*, int, char*, int, char**)
 		}
 	}
 	frame.UnlockBits(&data);
-	return WritePng(DllFolder() + Widen(frameName), frame) ? 1 : -4;
+	return WritePng(DataFolder() + Widen(frameName), frame) ? 1 : -4;
 }
 
 // Settings snapshot, for comparing ZBrush state before and after another
@@ -351,7 +380,7 @@ ZFUNC RSPattern(char* text, double, char*, int, char*, int, char**)
 // snapshot.txt next to the DLL as "id value" lines.
 static std::wstring SnapshotPath()
 {
-	return DllFolder() + L"snapshot.txt";
+	return DataFolder() + L"snapshot.txt";
 }
 
 // text: "clear" empties the snapshot; otherwise "id value" appends a value.
@@ -400,7 +429,7 @@ ZFUNC RSPixel(char* text, double, char*, int, char*, int, char**)
 	StartGdiplus();
 	const std::wstring name = Widen(frameName);
 	const bool absolute = name.size() > 2 && name[1] == L':';
-	Gdiplus::Bitmap* frame = Gdiplus::Bitmap::FromFile((absolute ? name : DllFolder() + name).c_str());
+	Gdiplus::Bitmap* frame = Gdiplus::Bitmap::FromFile((absolute ? name : DataFolder() + name).c_str());
 	float result = -1;
 	if (frame && frame->GetLastStatus() == Gdiplus::Ok && x >= 0 && y >= 0 && x < frame->GetWidth() && y < frame->GetHeight()) {
 		Gdiplus::Color c;
@@ -648,7 +677,7 @@ static int gKeyW = 0, gKeyH = 0;
 
 static std::wstring NavPath()
 {
-	return DllFolder() + L"nav_model.txt";
+	return DataFolder() + L"nav_model.txt";
 }
 
 static void SaveNav()
@@ -836,7 +865,7 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 				gPending = g;
 				gStaleSets = 0;
 			}
-			if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 				fprintf(f, "%lu drag kind %d right %d alt %d scaleSegs %d move %.0f %.0f scale %.0f %.0f predicted %.5f %.2f %.2f\n", GetTickCount(),
 					g.kind, g.right, g.altSeen, g.scaleSegments, g.moveX, g.moveY, g.scaleDx, g.scaleDy,
 					gOverlay.ratio, gOverlay.px, gOverlay.py);
@@ -863,7 +892,7 @@ static void Learn(double ratio, double px, double py)
 	const double k = gOverlay.pixelsPerDoc;
 	const double s = ratio / g.ratio0;
 	// Every drag is logged, so ZBrush's behaviour can be checked.
-	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 		fprintf(f, "%lu exact kind %d right %d alt %d scaleSegs %d move %.0f %.0f scale %.0f %.0f afterScaleMove %d "
 			"start %.5f %.2f %.2f predicted %.5f %.2f %.2f exact %.5f %.2f %.2f k %.4f\n", GetTickCount(),
 			g.kind, g.right, g.altSeen, g.scaleSegments, g.moveX, g.moveY, g.scaleDx, g.scaleDy, g.movedAfterScale,
@@ -1725,7 +1754,7 @@ static void RefreshUiRects()
 	const std::string desc = scan.desc + " | children" + children;
 	if (desc != lastDesc) {
 		lastDesc = desc;
-		if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 			fprintf(f, "%lu zbrush windows:%s\n", now, desc.c_str());
 			fclose(f);
 		}
@@ -1772,7 +1801,7 @@ static bool UpdatePanelAside(const OverlayState& st)
 		gPanelAside = true;
 	if (cur != logged && onCanvas) {
 		logged = cur;
-		if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 			fprintf(f, "%lu cursor %p (arrow %p, canvas %p) at %d %d, on panel %d, panel aside %d\n", GetTickCount(),
 				static_cast<void*>(cur), static_cast<void*>(LoadCursor(nullptr, IDC_ARROW)), static_cast<void*>(canvas), x, y,
 				onPanel ? 1 : 0, gPanelAside ? 1 : 0);
@@ -1868,7 +1897,7 @@ static void Composite(HWND wnd, const OverlayState& st)
 			}
 			if (next != gGizmoBottom) {
 				gGizmoBottom = next;
-				if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 					fprintf(f, "%lu view gizmo down to %d (corner %d %d to %d %d)\n", GetTickCount(), gGizmoBottom, cx0, cy0, cx1, cy1);
 					fclose(f);
 				}
@@ -1889,7 +1918,7 @@ static void Composite(HWND wnd, const OverlayState& st)
 		static DWORD statsAt = 0;
 		if (GetTickCount() - statsAt >= 2000) {
 			statsAt = GetTickCount();
-			if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 				fprintf(f, "%lu capture method %d, %.1f fps, magenta %.1f%%, background spans %d %d to %d %d, viewport %d %d to %d %d, mode %d\n",
 					statsAt, gCaptureMethod, gFps, gMagentaShare, x0, y0, x1, y1, gViewX0, gViewY0, gViewX1, gViewY1, gMode);
 				fclose(f);
@@ -1907,7 +1936,7 @@ static void Composite(HWND wnd, const OverlayState& st)
 				EnterCriticalSection(&gOverlayLock);
 				gRedrawPending = true;
 				LeaveCriticalSection(&gOverlayLock);
-				if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 					fprintf(f, "%lu viewport %d %d to %d %d of %d x %d\n", GetTickCount(), gViewX0, gViewY0, gViewX1, gViewY1, w, h);
 					fclose(f);
 				}
@@ -2162,7 +2191,7 @@ static void MemScan(double sx, double px, double py)
 	gScanStats[2] = static_cast<double>(gMemX.cands.size());
 	gScanStats[3] = static_cast<double>(gMemScale.cands.size());
 	gScanStats[4] = static_cast<double>(GetTickCount() - t0);
-	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 		fprintf(f, "%lu scan for scale %.4f x %.4f y %.4f: %zu MB in %lu ms, x matches %zu, y matches %zu, pairs %zu, scales near %zu\n",
 			GetTickCount(), sx, px, py, scanned >> 20, GetTickCount() - t0, rawX, rawY, gMemX.cands.size(), gMemScale.cands.size());
 		fclose(f);
@@ -2281,7 +2310,7 @@ static bool TripletValues(double& sx, double& px, double& py, int mode)
 			continue;
 		if (a != t.s.last || b != t.x.last || c != t.y.last) {
 			if (mode == kDragNone && a == t.s.last && (b != t.x.last || c != t.y.last) && t.rotFrames++ == 0) {
-				if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 					fprintf(f, "%lu triplet %zu moves when rotating: not the camera (x %.3f y %.3f, was %.3f %.3f)\n",
 						now, i, b, c, t.x.last, t.y.last);
 					fclose(f);
@@ -2340,7 +2369,7 @@ static bool TripletValues(double& sx, double& px, double& py, int mode)
 	}
 	pending = 0;
 	if (best != gTripletInUse || jump) {
-		if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 			fprintf(f, "%lu read triplet %d of %zu (drag frames %d)%s: scale %.4f x %.3f y %.3f, was %.4f %.3f %.3f\n",
 				now, best, gTriplets.size(), t.dragFrames, jump ? " JUMP" : "", t.s.last, t.x.last, t.y.last, sx, px, py);
 			fclose(f);
@@ -2380,7 +2409,7 @@ static void MemReport(double sx, double px, double py)
 	if (gMemLocked)
 		BuildTriplets();
 	gMemWatchUntil = GetTickCount() + 1000;
-	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 		fprintf(f, "%lu memory %d candidates %zu %zu %zu narrowed %d %d %d locked %d\n", GetTickCount(),
 			gMemScanned, gMemScale.cands.size(), gMemX.cands.size(), gMemY.cands.size(),
 			gMemScale.narrowings, gMemX.narrowings, gMemY.narrowings, gMemLocked);
@@ -2635,7 +2664,7 @@ static void WriteReferencePath(const std::string& path)
 
 static void ViewLog(const char* what, int slot)
 {
-	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 		fprintf(f, "%lu view %s slot %d score %.3f shift %.2f %.2f offset %.2f %.2f\n", GetTickCount(), what, slot,
 			gViewScore, gViewShiftX, gViewShiftY, gOverlay.offX, gOverlay.offY);
 		fclose(f);
@@ -3348,7 +3377,7 @@ static void RotScan(const double* deg)
 			break;
 		addr = next;
 	}
-	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 		fprintf(f, "%lu rotation matrix scan: %zu MB in %lu ms, %zu rows tried, %zu rotations by this angle found%s\n", GetTickCount(),
 			scanned >> 20, GetTickCount() - t0, rows, gRotCands.size(), gRotCands.size() >= 200000 ? " (FULL)" : "");
 		fclose(f);
@@ -3418,7 +3447,7 @@ static void RotRelate()
 				c.rel = rel;
 		}
 	}
-	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 		fprintf(f, "%lu rotation copies:", GetTickCount());
 		for (const RotCand& c : gRotCands)
 			fprintf(f, " [%s %s stride %d relation %d]", c.unit ? "pure" : "scaled", c.isDouble ? "double" : "float", c.stride, c.rel);
@@ -3455,7 +3484,7 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 				moved = true;
 		}
 		if (step && idle) {
-			if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 				fprintf(f, "%lu rotation copy %zu changed with the mouse buttons up: not the camera, dropped (%zu left)\n",
 					GetTickCount(), ci, gRotCands.size() - 1);
 				fclose(f);
@@ -3503,7 +3532,7 @@ static void RotFollow()
 	static DWORD loggedAt = 0;
 	if (changed && now - loggedAt >= 250) {
 		loggedAt = now;
-		if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 			fprintf(f, "%lu rotation moving, dragging %d:", now, gGesture.active ? 1 : 0);
 			for (const RotCand& c : gRotCands) {
 				fprintf(f, " [%d", RotCode(c.m));
@@ -3528,7 +3557,7 @@ static void RotFollow()
 		const int result = ViewTickCodes(codes);
 		for (RotCand& c : gRotCands)
 			memcpy(c.settled, c.m, sizeof(c.m));
-		if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 			fprintf(f, "%lu rotation settled, %zu snapped copies, result %d:", now, codes.size(), result);
 			for (const RotCand& c : gRotCands) {
 				fprintf(f, " [%d", RotCode(c.m));
@@ -4095,7 +4124,7 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 		return -2;
 	PhysicalPixels physical;
 	Rgb frame;
-	if (!LoadRgb(DllFolder() + L"frame0.png", frame))
+	if (!LoadRgb(DataFolder() + L"frame0.png", frame))
 		return -3;
 
 	EnterCriticalSection(&gOverlayLock);
@@ -4112,7 +4141,7 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 	Rgb screen;
 	if (!CaptureScreen(r, screen))
 		return -4;
-	SaveRgb(DllFolder() + L"capture.png", screen);
+	SaveRgb(DataFolder() + L"capture.png", screen);
 	Calibration cal;
 	const bool found = Calibrate(frame, screen, cal);
 	cal.screenX += r.left;
@@ -4243,7 +4272,7 @@ ZFUNC RSOverlaySet(char* text, double, char*, int, char*, int, char**)
 		ax = gViews[gActiveView].ax;
 		ay = gViews[gActiveView].ay;
 	}
-	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 		fprintf(f, "%lu set %.5f %.2f %.2f dragging %d unreported %d shown %.5f %.2f %.2f\n", GetTickCount(),
 			r, px, py, gGesture.active, gPending.done ? gPendingCount : 0, gOverlay.ratio, gOverlay.px, gOverlay.py);
 		fclose(f);
@@ -4341,7 +4370,7 @@ ZFUNC RSRotProbe(char* text, double, char*, int, char*, int, char**)
 		gRotSettled = true;
 	}
 	const size_t n = gRotCands.size();
-	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 		fprintf(f, "%lu rotation %s %.3f %.3f %.3f: %zu left, locked %d\n", GetTickCount(), mode, r[0], r[1], r[2], n, gRotLocked);
 		fclose(f);
 	}
@@ -4369,8 +4398,8 @@ ZFUNC RSSnapshot(char*, double, char*, int, char*, int, char**)
 			out.px[i * 3 + c] = gOutput.bits[i * 4 + c];
 		}
 	LeaveCriticalSection(&gOverlayLock);
-	SaveRgb(DllFolder() + L"snap_capture.png", cap);
-	SaveRgb(DllFolder() + L"snap_overlay.png", out);
+	SaveRgb(DataFolder() + L"snap_capture.png", cap);
+	SaveRgb(DataFolder() + L"snap_overlay.png", out);
 	return 1;
 }
 
@@ -4434,7 +4463,7 @@ ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 			*field = view ? value % 6 : field == &gBackGrey ? std::min(value, 255) :
 				field == &gGamma ? std::max(20, std::min(value, 300)) : field == &gSat ? std::min(value, 200) : value != 0;
 		if (value != -2) {
-			if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 				fprintf(f, "%lu display %s\n", GetTickCount(), text);
 				fclose(f);
 			}
@@ -4657,13 +4686,13 @@ static void SwitchProject(const std::wstring& dir)
 {
 	gProjectTried = true;
 	gProjectDir = dir;
-	if (FILE* f = _wfopen((DllFolder() + L"last_project.txt").c_str(), L"wb")) {
+	if (FILE* f = _wfopen((DataFolder() + L"last_project.txt").c_str(), L"wb")) {
 		char utf8[MAX_PATH * 3] = {0};
 		WideCharToMultiByte(CP_UTF8, 0, dir.c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr);
 		fputs(utf8, f);
 		fclose(f);
 	}
-	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 		char utf8[MAX_PATH * 3] = {0};
 		WideCharToMultiByte(CP_UTF8, 0, dir.c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr);
 		fprintf(f, "%lu project %s\n", GetTickCount(), utf8);
@@ -4713,7 +4742,7 @@ static void ProjectLog(const char* what, const std::wstring& path)
 {
 	char utf8[MAX_PATH * 3] = {0};
 	WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr);
-	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 		fprintf(f, "%lu %s %s\n", GetTickCount(), what, utf8);
 		fclose(f);
 	}
@@ -5038,7 +5067,7 @@ ZFUNC RSValue(char* text, double, char*, int, char*, int, char**)
 	if (n < 1)
 		return 0;
 	std::vector<std::pair<std::string, double>> values;
-	const std::wstring path = DllFolder() + L"values.txt";
+	const std::wstring path = DataFolder() + L"values.txt";
 	if (FILE* f = _wfopen(path.c_str(), L"rb")) {
 		char k[32];
 		double v;
