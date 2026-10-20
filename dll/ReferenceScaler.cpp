@@ -559,77 +559,86 @@ struct Sample {
 	double fx, fy;  // frame position (pixel centre)
 };
 
-// Counts samples whose colour on the screen image matches the frame, for
-// the document placed at (ox, oy) in img pixels with k img pixels per
-// document pixel. Stops early once it cannot beat `beat`.
-static int Score(const Rgb& img, const std::vector<Sample>& samples, const std::vector<int>& colors,
-	double ox, double oy, double k, int tolerance, int beat)
+// Luminance of a B, G, R pixel.
+static int Lum(const unsigned char* p)
 {
-	int score = 0;
-	const int n = static_cast<int>(samples.size());
-	for (int i = 0; i < n; ++i) {
-		if (score + (n - i) <= beat)
-			return 0;
+	return (p[0] + p[1] * 5 + p[2] * 2) / 8;
+}
+
+// Correlation between the frame's sample luminances and the screen image at
+// the same points, for the document placed at (ox, oy) in img pixels with k
+// img pixels per document pixel. Correlation ignores brightness and contrast
+// changes in how ZBrush displays the canvas. Returns -1 if under 70% of the
+// samples land on the image.
+static double Score(const Rgb& img, const std::vector<Sample>& samples, const std::vector<int>& lums,
+	double ox, double oy, double k)
+{
+	double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+	int n = 0;
+	for (size_t i = 0; i < samples.size(); ++i) {
 		const int x = static_cast<int>(floor(ox + k * samples[i].fx));
 		const int y = static_cast<int>(floor(oy + k * samples[i].fy));
 		if (x < 0 || y < 0 || x >= img.w || y >= img.h)
 			continue;
-		const unsigned char* p = img.at(x, y);
-		const int* c = &colors[i * 3];
-		if (abs(p[0] - c[0]) + abs(p[1] - c[1]) + abs(p[2] - c[2]) < tolerance)
-			++score;
+		const double va = lums[i], vb = Lum(img.at(x, y));
+		sa += va;
+		sb += vb;
+		saa += va * va;
+		sbb += vb * vb;
+		sab += va * vb;
+		++n;
 	}
-	return score;
+	if (n < samples.size() * 0.7)
+		return -1;
+	const double cov = sab - sa * sb / n, va = saa - sa * sa / n, vb = sbb - sb * sb / n;
+	if (va <= 0 || vb <= 0)
+		return -1;
+	return cov / sqrt(va * vb);
 }
 
-static void SampleColors(const Rgb& frame, const std::vector<Sample>& samples, double radius, std::vector<int>& colors)
+static void SampleLums(const Rgb& frame, const std::vector<Sample>& samples, double radius, std::vector<int>& lums)
 {
-	colors.resize(samples.size() * 3);
-	for (size_t i = 0; i < samples.size(); ++i)
-		FrameColor(frame, samples[i].fx, samples[i].fy, radius, &colors[i * 3]);
+	lums.resize(samples.size());
+	for (size_t i = 0; i < samples.size(); ++i) {
+		int c[3];
+		FrameColor(frame, samples[i].fx, samples[i].fy, radius, c);
+		const unsigned char p[3] = {static_cast<unsigned char>(c[0]), static_cast<unsigned char>(c[1]), static_cast<unsigned char>(c[2])};
+		lums[i] = Lum(p);
+	}
 }
 
 struct Calibration {
 	double screenX = 0, screenY = 0, pixelsPerDoc = 0;
-	double percent = 0;  // share of sample points that matched
+	double percent = 0;  // correlation of the best placement, x100
 };
 static Calibration gCalibration;
 
-// Finds the frame in the screen capture. Returns false if no placement
-// matches at least a third of the sample points.
+// Finds the frame in the screen capture. Returns false if the best
+// placement correlates under 0.5.
 static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
 {
-	// Sample points on a grid, skipping near-black frame pixels (outside the
-	// image) unless the image covers too little of the frame.
-	std::vector<Sample> all, picked;
-	const int grid = 40;
+	std::vector<Sample> samples;
+	const int grid = 36;
 	for (int j = 0; j < grid; ++j)
-		for (int i = 0; i < grid; ++i) {
-			Sample s = {(i + 0.5) * frame.w / grid, (j + 0.5) * frame.h / grid};
-			all.push_back(s);
-			int c[3];
-			FrameColor(frame, s.fx, s.fy, 1, c);
-			if (c[0] + c[1] + c[2] > 30)
-				picked.push_back(s);
-		}
-	const std::vector<Sample>& samples = picked.size() >= 100 ? picked : all;
+		for (int i = 0; i < grid; ++i)
+			samples.push_back({(i + 0.5) * frame.w / grid, (j + 0.5) * frame.h / grid});
 
 	// Coarse search on the capture shrunk by d, over scales 0.25 to 4.
 	const int d = 8;
 	const Rgb small = Shrink(screen, d);
 	std::vector<Sample> coarse;
-	for (size_t i = 0; i < samples.size(); i += 3)
-		coarse.push_back(samples[i]);
-	std::vector<int> colors;
-	int best = 0;
-	double bestK = 0, bestX = 0, bestY = 0;
-	for (double k = 0.25; k <= 4.0; k *= 1.03) {
+	for (int j = 0; j < grid; j += 2)
+		for (int i = 0; i < grid; i += 2)
+			coarse.push_back(samples[j * grid + i]);
+	std::vector<int> lums;
+	double best = -2, bestK = 1, bestX = 0, bestY = 0;
+	for (double k = 0.25; k <= 4.0; k *= 1.04) {
 		const double ks = k / d;  // small-image pixels per document pixel
-		SampleColors(frame, coarse, 0.5 / ks, colors);
+		SampleLums(frame, coarse, 0.5 / ks, lums);
 		const double tw = ks * frame.w, th = ks * frame.h;
-		for (double oy = -th * 0.25; oy <= small.h - th * 0.75; oy += 1)
-			for (double ox = -tw * 0.25; ox <= small.w - tw * 0.75; ox += 1) {
-				const int s = Score(small, coarse, colors, ox, oy, ks, 60, best);
+		for (double oy = -th * 0.3; oy <= small.h - th * 0.7; oy += 1)
+			for (double ox = -tw * 0.3; ox <= small.w - tw * 0.7; ox += 1) {
+				const double s = Score(small, coarse, lums, ox, oy, ks);
 				if (s > best) {
 					best = s;
 					bestK = k;
@@ -638,28 +647,25 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
 				}
 			}
 	}
-	if (best == 0)
-		return false;
 
-	// Refine at full resolution: scale within 4% in 0.5% steps, then 0.1%.
+	// Refine at full resolution: scale within 5% in 0.5% steps, then 0.1%.
 	struct Pass { double scaleRange, scaleStep; int offRange, offStep; };
-	const Pass passes[] = {{0.045, 0.005, 2 * d + 4, 2}, {0.006, 0.001, 3, 1}};
+	const Pass passes[] = {{0.05, 0.005, 2 * d + 4, 2}, {0.006, 0.001, 3, 1}};
 	for (const Pass& pass : passes) {
 		const double k0 = bestK, x0 = bestX, y0 = bestY;
-		best = -1;
 		for (double f = 1 - pass.scaleRange; f <= 1 + pass.scaleRange + 1e-9; f += pass.scaleStep) {
 			const double k = k0 * f;
-			SampleColors(frame, samples, 0.5 / k, colors);
+			SampleLums(frame, samples, 0.5 / k, lums);
 			// Keep the document centre fixed while trying scales.
-			const double cx = x0 + (k0 - k) * frame.w * 0.5, cy = y0 + (k0 - k) * frame.h * 0.5;
+			const double cx = floor(x0 + (k0 - k) * frame.w * 0.5), cy = floor(y0 + (k0 - k) * frame.h * 0.5);
 			for (int dy = -pass.offRange; dy <= pass.offRange; dy += pass.offStep)
 				for (int dx = -pass.offRange; dx <= pass.offRange; dx += pass.offStep) {
-					const int s = Score(screen, samples, colors, floor(cx) + dx, floor(cy) + dy, k, 45, best);
+					const double s = Score(screen, samples, lums, cx + dx, cy + dy, k);
 					if (s > best) {
 						best = s;
 						bestK = k;
-						bestX = floor(cx) + dx;
-						bestY = floor(cy) + dy;
+						bestX = cx + dx;
+						bestY = cy + dy;
 					}
 				}
 		}
@@ -667,15 +673,29 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
 	out.pixelsPerDoc = bestK;
 	out.screenX = bestX;
 	out.screenY = bestY;
-	out.percent = 100.0 * best / samples.size();
-	return out.percent >= 33;
+	out.percent = 100.0 * best;
+	return best >= 0.5;
+}
+
+// Saves an Rgb image as PNG, for diagnosing calibration.
+static void SaveRgb(const std::wstring& path, const Rgb& img)
+{
+	Gdiplus::Bitmap bmp(img.w, img.h, PixelFormat24bppRGB);
+	Gdiplus::Rect r(0, 0, img.w, img.h);
+	Gdiplus::BitmapData data;
+	if (bmp.LockBits(&r, Gdiplus::ImageLockModeWrite, PixelFormat24bppRGB, &data) != Gdiplus::Ok)
+		return;
+	for (int y = 0; y < img.h; ++y)
+		memcpy(static_cast<BYTE*>(data.Scan0) + y * data.Stride, &img.px[static_cast<size_t>(y) * img.w * 3], img.w * 3);
+	bmp.UnlockBits(&data);
+	WritePng(path, bmp);
 }
 
 // text: "docW docH alpha" — the document size and opacity 0-255. Hides the
 // overlay, captures ZBrush's window, finds the canvas by matching
 // frame0.png against it, then shows the overlay there with that frame's
-// layout. Returns the share of
-// sample points that matched (33-100), or -1 bad arguments, -2 the window
+// layout. The capture is saved as capture.png. Returns the match strength
+// (correlation x100, 50-100), or -1 bad arguments, -2 the window
 // could not be created, -3 frame0.png missing (show the image first), -4 the
 // screen could not be captured, -5 the frame was not found on screen
 // (RSOverlayInfo 3 gives the best match).
@@ -704,6 +724,7 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 	Rgb screen;
 	if (!CaptureScreen(r, screen))
 		return -4;
+	SaveRgb(DllFolder() + L"capture.png", screen);
 	Calibration cal;
 	const bool found = Calibrate(frame, screen, cal);
 	cal.screenX += r.left;
@@ -740,7 +761,7 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 }
 
 // text: "0" screen X of the document's top-left corner, "1" screen Y, "2"
-// screen pixels per document pixel (x1000), "3" percent matched, from the
+// screen pixels per document pixel (x1000), "3" match strength, from the
 // last RSOverlayStart; "4" 1 if the overlay is showing, else 0.
 ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 {
