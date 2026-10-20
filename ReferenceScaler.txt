@@ -24,9 +24,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 80"]
+[VarDef, zrsBuild, "build 81"]
 [VarDef, zrsDll, "ReferenceScaler_Data\ReferenceScaler64.dll"]
-[VarDef, zrsDllBuild, 80]
+[VarDef, zrsDllBuild, 81]
 [VarDef, zrsLive, 0]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
@@ -194,12 +194,12 @@
 // anchor.txt (which outlives reloads and new builds).
 [RoutineDef, ZRSAnchorNow,
 	[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-	[ISet, "ZPlugin:Reference Scaler b80:Anchor Scale", zrsSx]
-	[ISet, "ZPlugin:Reference Scaler b80:Anchor X", zrsPx]
-	[ISet, "ZPlugin:Reference Scaler b80:Anchor Y", zrsPy]
-	[ISet, "ZPlugin:Reference Scaler b80:Anchor Rot X", zrsRx]
-	[ISet, "ZPlugin:Reference Scaler b80:Anchor Rot Y", zrsRy]
-	[ISet, "ZPlugin:Reference Scaler b80:Anchor Rot Z", zrsRz]
+	[ISet, "ZPlugin:Reference Scaler b81:Anchor Scale", zrsSx]
+	[ISet, "ZPlugin:Reference Scaler b81:Anchor X", zrsPx]
+	[ISet, "ZPlugin:Reference Scaler b81:Anchor Y", zrsPy]
+	[ISet, "ZPlugin:Reference Scaler b81:Anchor Rot X", zrsRx]
+	[ISet, "ZPlugin:Reference Scaler b81:Anchor Rot Y", zrsRy]
+	[ISet, "ZPlugin:Reference Scaler b81:Anchor Rot Z", zrsRz]
 	[VarSet, zrsArgs, [StrMerge, zrsSx, " ", zrsPx, " ", zrsPy, " ", zrsRx, " ", zrsRy]]
 	[FileExecute, zrsDll, "RSAnchorSave", [StrMerge, zrsArgs, " ", zrsRz]]
 	[FileExecute, zrsDll, "RSOverlayResetOffset"]
@@ -208,27 +208,27 @@
 
 // Fills empty anchor sliders (a new build or a reload) from anchor.txt.
 [RoutineDef, ZRSLoadAnchor,
-	[If, [IGet, "ZPlugin:Reference Scaler b80:Anchor Scale"] <= 0,
+	[If, [IGet, "ZPlugin:Reference Scaler b81:Anchor Scale"] <= 0,
 		[VarSet, zrsTick, [FileExecute, zrsDll, "RSAnchorGet", "0"]]
 		[If, zrsTick > 0,
-			[ISet, "ZPlugin:Reference Scaler b80:Anchor Scale", zrsTick]
-			[ISet, "ZPlugin:Reference Scaler b80:Anchor X", [FileExecute, zrsDll, "RSAnchorGet", "1"]]
-			[ISet, "ZPlugin:Reference Scaler b80:Anchor Y", [FileExecute, zrsDll, "RSAnchorGet", "2"]]
-			[ISet, "ZPlugin:Reference Scaler b80:Anchor Rot X", [FileExecute, zrsDll, "RSAnchorGet", "3"]]
-			[ISet, "ZPlugin:Reference Scaler b80:Anchor Rot Y", [FileExecute, zrsDll, "RSAnchorGet", "4"]]
-			[ISet, "ZPlugin:Reference Scaler b80:Anchor Rot Z", [FileExecute, zrsDll, "RSAnchorGet", "5"]]
+			[ISet, "ZPlugin:Reference Scaler b81:Anchor Scale", zrsTick]
+			[ISet, "ZPlugin:Reference Scaler b81:Anchor X", [FileExecute, zrsDll, "RSAnchorGet", "1"]]
+			[ISet, "ZPlugin:Reference Scaler b81:Anchor Y", [FileExecute, zrsDll, "RSAnchorGet", "2"]]
+			[ISet, "ZPlugin:Reference Scaler b81:Anchor Rot X", [FileExecute, zrsDll, "RSAnchorGet", "3"]]
+			[ISet, "ZPlugin:Reference Scaler b81:Anchor Rot Y", [FileExecute, zrsDll, "RSAnchorGet", "4"]]
+			[ISet, "ZPlugin:Reference Scaler b81:Anchor Rot Z", [FileExecute, zrsDll, "RSAnchorGet", "5"]]
 		]
 	]
 ]
 
 // Copies view zrsView's anchor into the anchor sliders (Sync and Live use them).
 [RoutineDef, ZRSViewSliders,
-	[ISet, "ZPlugin:Reference Scaler b80:Anchor Scale", [FileExecute, zrsDll, "RSViewGet", [StrMerge, zrsView, " 0"]]]
-	[ISet, "ZPlugin:Reference Scaler b80:Anchor X", [FileExecute, zrsDll, "RSViewGet", [StrMerge, zrsView, " 1"]]]
-	[ISet, "ZPlugin:Reference Scaler b80:Anchor Y", [FileExecute, zrsDll, "RSViewGet", [StrMerge, zrsView, " 2"]]]
-	[ISet, "ZPlugin:Reference Scaler b80:Anchor Rot X", [FileExecute, zrsDll, "RSViewGet", [StrMerge, zrsView, " 3"]]]
-	[ISet, "ZPlugin:Reference Scaler b80:Anchor Rot Y", [FileExecute, zrsDll, "RSViewGet", [StrMerge, zrsView, " 4"]]]
-	[ISet, "ZPlugin:Reference Scaler b80:Anchor Rot Z", [FileExecute, zrsDll, "RSViewGet", [StrMerge, zrsView, " 5"]]]
+	[ISet, "ZPlugin:Reference Scaler b81:Anchor Scale", [FileExecute, zrsDll, "RSViewGet", [StrMerge, zrsView, " 0"]]]
+	[ISet, "ZPlugin:Reference Scaler b81:Anchor X", [FileExecute, zrsDll, "RSViewGet", [StrMerge, zrsView, " 1"]]]
+	[ISet, "ZPlugin:Reference Scaler b81:Anchor Y", [FileExecute, zrsDll, "RSViewGet", [StrMerge, zrsView, " 2"]]]
+	[ISet, "ZPlugin:Reference Scaler b81:Anchor Rot X", [FileExecute, zrsDll, "RSViewGet", [StrMerge, zrsView, " 3"]]]
+	[ISet, "ZPlugin:Reference Scaler b81:Anchor Rot Y", [FileExecute, zrsDll, "RSViewGet", [StrMerge, zrsView, " 4"]]]
+	[ISet, "ZPlugin:Reference Scaler b81:Anchor Rot Z", [FileExecute, zrsDll, "RSViewGet", [StrMerge, zrsView, " 5"]]]
 ]
 
 // Works out the ratio and positions from the current model, the anchor
@@ -236,14 +236,14 @@
 // zrsMsg.
 [RoutineDef, ZRSUpdate,
 	[RoutineCall, ZRSLoadAnchor]
-	[If, [IGet, "ZPlugin:Reference Scaler b80:Anchor Scale"] <= 0,
+	[If, [IGet, "ZPlugin:Reference Scaler b81:Anchor Scale"] <= 0,
 		[VarSet, zrsMsg, "Not anchored: line the model up with the image and press Anchor first."]
 		[VarSet, zrsResult, 0]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b80:Anchor Scale"]]
-		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b80:Anchor X"]]
-		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b80:Anchor Y"]]
+		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b81:Anchor Scale"]]
+		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b81:Anchor X"]]
+		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b81:Anchor Y"]]
 		[RoutineCall, ZRSShow]
 	]
 ]
@@ -263,14 +263,14 @@
 			[VarSet, zrsTick, zrsTick + 1]
 			[If, [IGet, Transform:Edit],
 				[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b80:Anchor Scale"]]
+				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b81:Anchor Scale"]]
 				[VarSet, zrsKind, [FileExecute, zrsDll, "RSOverlayInfo", "19"]]
 				[VarSet, zrsArgs, [StrMerge, "live tick ", zrsTick, " kind ", zrsKind, " scale ", zrsSx]]
 				[FileExecute, zrsDll, "RSLog", [StrMerge, zrsArgs, " pos ", zrsPx, " ", zrsPy, " z ", zrsPz]]
 				[VarSet, zrsForce, 0]
-				[VarSet, zrsTry, [IGet, "ZPlugin:Reference Scaler b80:Depth Factor"] * zrsSx]
+				[VarSet, zrsTry, [IGet, "ZPlugin:Reference Scaler b81:Depth Factor"] * zrsSx]
 				[VarSet, zrsOk, ABS(zrsPz - zrsTry) > ABS(zrsTry) * 0.05]
-				[If, [IGet, "ZPlugin:Reference Scaler b80:Depth Factor"] == 0, [VarSet, zrsOk, 0]]
+				[If, [IGet, "ZPlugin:Reference Scaler b81:Depth Factor"] == 0, [VarSet, zrsOk, 0]]
 				[If, zrsOk,
 					[TransformSet, zrsPx, zrsPy, zrsTry, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
 				]
@@ -279,14 +279,14 @@
 				[If, ABS(zrsPy - zrsLastPy) > 0.5, [VarSet, zrsForce, 1]]
 				[If, zrsForce,
 					[RoutineCall, ZRSUpdate]
-					[VarSet, zrsOk, [IGet, "ZPlugin:Reference Scaler b80:Diag"]]
+					[VarSet, zrsOk, [IGet, "ZPlugin:Reference Scaler b81:Diag"]]
 					[If, zrsResult != 1, [VarSet, zrsOk, 1]]
 					[If, zrsOk, [Note, [StrMerge, "Live tick ", zrsTick, ": redrew, result ", zrsResult, "\n", zrsMsg], , 1]]
 					,
-					[If, [IGet, "ZPlugin:Reference Scaler b80:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": no change (ratio ", zrsRatio, ")"], , 0.5]]
+					[If, [IGet, "ZPlugin:Reference Scaler b81:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": no change (ratio ", zrsRatio, ")"], , 0.5]]
 				]
 				,
-				[If, [IGet, "ZPlugin:Reference Scaler b80:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": model not in Edit mode"], , 0.5]]
+				[If, [IGet, "ZPlugin:Reference Scaler b81:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": model not in Edit mode"], , 0.5]]
 			]
 			[SleepAgain, 0.5, 9]
 		]
@@ -295,8 +295,10 @@
 
 // Sends the Gamma and Saturation sliders to the DLL (in percent).
 [RoutineDef, ZRSLevels,
-	[FileExecute, zrsDll, "RSDisplay", [StrMerge, "gamma ", [IGet, "ZPlugin:Reference Scaler b80:Display:Gamma"] * 100 + 0.5]]
-	[FileExecute, zrsDll, "RSDisplay", [StrMerge, "sat ", [IGet, "ZPlugin:Reference Scaler b80:Display:Saturation"] + 0.5]]
+	[VarSet, zrsTick, [IGet, "ZPlugin:Reference Scaler b81:Display:Gamma"] * 100 + 0.5]
+	[FileExecute, zrsDll, "RSDisplay", [StrMerge, "gamma ", zrsTick]]
+	[VarSet, zrsTick, [IGet, "ZPlugin:Reference Scaler b81:Display:Saturation"] + 0.5]
+	[FileExecute, zrsDll, "RSDisplay", [StrMerge, "sat ", zrsTick]]
 ]
 
 // Overlay (stage 1 of the live reference): a click-through window drawn by
@@ -381,7 +383,7 @@
 		]
 	]
 	// A button pressed while Live runs ends its loop: carry on if Live is on.
-	[If, [IGet, "ZPlugin:Reference Scaler b80:Live"],
+	[If, [IGet, "ZPlugin:Reference Scaler b81:Live"],
 		[VarSet, zrsLive, 1]
 		[RoutineCall, ZRSLiveLoop]
 	]
@@ -396,7 +398,7 @@
 		[Note, [StrMerge, zrsMsg2, " has no image to remove."], , 1]
 	]
 	// A button pressed while Live runs ends its loop: carry on if Live is on.
-	[If, [IGet, "ZPlugin:Reference Scaler b80:Live"],
+	[If, [IGet, "ZPlugin:Reference Scaler b81:Live"],
 		[VarSet, zrsLive, 1]
 		[RoutineCall, ZRSLiveLoop]
 	]
@@ -405,19 +407,19 @@
 // ---------------------------------------------------------------------------
 // Interface
 // ---------------------------------------------------------------------------
-[ISubPalette, "ZPlugin:Reference Scaler b80"]
+[ISubPalette, "ZPlugin:Reference Scaler b81"]
 
 // Collapsible list of views at the top of the plugin.
-[ISubPalette, "ZPlugin:Reference Scaler b80:Views"]
+[ISubPalette, "ZPlugin:Reference Scaler b81:Views"]
 
-[IButton, "ZPlugin:Reference Scaler b80:Views:Load Front",
+[IButton, "ZPlugin:Reference Scaler b81:Views:Load Front",
 	"Snap to the Front view, then load its reference image.",
 	[VarSet, zrsView, 0]
 	[VarSet, zrsMsg2, "Front"]
 	[RoutineCall, ZRSViewLoad]
 	, 0, 0.8
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Views:Remove Front",
+[IButton, "ZPlugin:Reference Scaler b81:Views:Remove Front",
 	"Remove the Front image, so another can be loaded.",
 	[VarSet, zrsView, 0]
 	[VarSet, zrsMsg2, "Front"]
@@ -425,14 +427,14 @@
 	, 0, 0.2, , "ReferenceScaler_Data\trash.psd"
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Views:Load Back",
+[IButton, "ZPlugin:Reference Scaler b81:Views:Load Back",
 	"Snap to the Back view, then load its reference image.",
 	[VarSet, zrsView, 1]
 	[VarSet, zrsMsg2, "Back"]
 	[RoutineCall, ZRSViewLoad]
 	, 0, 0.8
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Views:Remove Back",
+[IButton, "ZPlugin:Reference Scaler b81:Views:Remove Back",
 	"Remove the Back image, so another can be loaded.",
 	[VarSet, zrsView, 1]
 	[VarSet, zrsMsg2, "Back"]
@@ -440,14 +442,14 @@
 	, 0, 0.2, , "ReferenceScaler_Data\trash.psd"
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Views:Load Right",
+[IButton, "ZPlugin:Reference Scaler b81:Views:Load Right",
 	"Snap to the Right view, then load its reference image.",
 	[VarSet, zrsView, 2]
 	[VarSet, zrsMsg2, "Right"]
 	[RoutineCall, ZRSViewLoad]
 	, 0, 0.8
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Views:Remove Right",
+[IButton, "ZPlugin:Reference Scaler b81:Views:Remove Right",
 	"Remove the Right image, so another can be loaded.",
 	[VarSet, zrsView, 2]
 	[VarSet, zrsMsg2, "Right"]
@@ -455,14 +457,14 @@
 	, 0, 0.2, , "ReferenceScaler_Data\trash.psd"
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Views:Load Left",
+[IButton, "ZPlugin:Reference Scaler b81:Views:Load Left",
 	"Snap to the Left view, then load its reference image.",
 	[VarSet, zrsView, 3]
 	[VarSet, zrsMsg2, "Left"]
 	[RoutineCall, ZRSViewLoad]
 	, 0, 0.8
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Views:Remove Left",
+[IButton, "ZPlugin:Reference Scaler b81:Views:Remove Left",
 	"Remove the Left image, so another can be loaded.",
 	[VarSet, zrsView, 3]
 	[VarSet, zrsMsg2, "Left"]
@@ -470,14 +472,14 @@
 	, 0, 0.2, , "ReferenceScaler_Data\trash.psd"
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Views:Load Top",
+[IButton, "ZPlugin:Reference Scaler b81:Views:Load Top",
 	"Snap to the Top view, then load its reference image.",
 	[VarSet, zrsView, 4]
 	[VarSet, zrsMsg2, "Top"]
 	[RoutineCall, ZRSViewLoad]
 	, 0, 0.8
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Views:Remove Top",
+[IButton, "ZPlugin:Reference Scaler b81:Views:Remove Top",
 	"Remove the Top image, so another can be loaded.",
 	[VarSet, zrsView, 4]
 	[VarSet, zrsMsg2, "Top"]
@@ -485,14 +487,14 @@
 	, 0, 0.2, , "ReferenceScaler_Data\trash.psd"
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Views:Load Bottom",
+[IButton, "ZPlugin:Reference Scaler b81:Views:Load Bottom",
 	"Snap to the Bottom view, then load its reference image.",
 	[VarSet, zrsView, 5]
 	[VarSet, zrsMsg2, "Bottom"]
 	[RoutineCall, ZRSViewLoad]
 	, 0, 0.8
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Views:Remove Bottom",
+[IButton, "ZPlugin:Reference Scaler b81:Views:Remove Bottom",
 	"Remove the Bottom image, so another can be loaded.",
 	[VarSet, zrsView, 5]
 	[VarSet, zrsMsg2, "Bottom"]
@@ -500,7 +502,7 @@
 	, 0, 0.2, , "ReferenceScaler_Data\trash.psd"
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Views:Adjust Image",
+[IButton, "ZPlugin:Reference Scaler b81:Views:Adjust Image",
 	"Press to move and scale the reference image: drag inside it to move it, drag a corner or edge (or right-drag) to scale it. Press again or Esc when done.",
 	[If, [FileExecute, zrsDll, "RSOverlayInfo", "38"] == 1,
 		[FileExecute, zrsDll, "RSAdjust", "0"]
@@ -524,34 +526,34 @@
 // Display: Classic shows the reference behind the model; PureRef shows it in
 // a panel at the side, zoomed and panned with the camera, with Multiview
 // showing two views there, one above the other.
-[ISubPalette, "ZPlugin:Reference Scaler b80:Display"]
+[ISubPalette, "ZPlugin:Reference Scaler b81:Display"]
 
-[IButton, "ZPlugin:Reference Scaler b80:Display:Classic",
+[IButton, "ZPlugin:Reference Scaler b81:Display:Classic",
 	"Classic: the reference shows behind the model.",
 	[FileExecute, zrsDll, "RSDisplay", "mode 0"]
 	[Note, "Classic: the reference shows behind the model.", , 1.5]
 	, 0, 0.5
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Display:PureRef",
+[IButton, "ZPlugin:Reference Scaler b81:Display:PureRef",
 	"PureRef: the reference shows in a panel at the side, zoomed and panned with the camera.",
-	[VarSet, zrsTick, [IGet, "ZPlugin:Reference Scaler b80:Saved Back"]]
+	[VarSet, zrsTick, [IGet, "ZPlugin:Reference Scaler b81:Saved Back"]]
 	[If, zrsTick < 256, [FileExecute, zrsDll, "RSDisplay", [StrMerge, "back ", zrsTick]]]
 	[FileExecute, zrsDll, "RSDisplay", "mode 1"]
 	[Note, "PureRef: the reference shows in a panel at the side.", , 1.5]
 	, 0, 0.5
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Display:Panel Side",
+[IButton, "ZPlugin:Reference Scaler b81:Display:Panel Side",
 	"PureRef: move the panel to the other side of the canvas.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "left -1"]]
 	[If, zrsTick == 1, [Note, "PureRef panel on the left.", , 1], [Note, "PureRef panel on the right.", , 1]]
 	, 0, 1
 ]
-[ISlider, "ZPlugin:Reference Scaler b80:Display:Gamma", 1, 0.01, 0.2, 3,
+[ISlider, "ZPlugin:Reference Scaler b81:Display:Gamma", 1, 0.01, 0.2, 3,
 	"Gamma of the reference image: above 1 brightens its midtones, below 1 darkens them.",
 	[RoutineCall, ZRSLevels]
 	, 0, 1
 ]
-[ISlider, "ZPlugin:Reference Scaler b80:Display:Saturation", 100, 1, 0, 200,
+[ISlider, "ZPlugin:Reference Scaler b81:Display:Saturation", 100, 1, 0, 200,
 	"Saturation of the reference image, in percent: 0 is greyscale, 100 as loaded.",
 	[RoutineCall, ZRSLevels]
 	, 0, 1
@@ -559,9 +561,9 @@
 
 // Multiview (PureRef): two views in the panel, one above the other. Each
 // view's Top and Bottom buttons put it in that half.
-[ISubPalette, "ZPlugin:Reference Scaler b80:Multiview"]
+[ISubPalette, "ZPlugin:Reference Scaler b81:Multiview"]
 
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Multiview On",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Multiview On",
 	"PureRef: show two views in the panel, one above the other.",
 	[FileExecute, zrsDll, "RSDisplay", "multi 1"]
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "a"]]
@@ -572,14 +574,14 @@
 	[Note, [StrMerge, "Multiview on: ", zrsMsg, " above ", zrsMsg2, " (PureRef mode)."], , 1.5]
 	, 0, 0.5
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Multiview Off",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Multiview Off",
 	"PureRef: the panel shows the view you are snapped to.",
 	[FileExecute, zrsDll, "RSDisplay", "multi 0"]
 	[Note, "Multiview off: the panel shows the view you are snapped to.", , 1.5]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Front Top",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Front Top",
 	"Show the Front view at the top of the Multiview panel.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "a 0"]]
 	[If, [FileExecute, zrsDll, "RSViewUsed", "0"],
@@ -589,7 +591,7 @@
 	]
 	, 0, 0.5
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Front Bottom",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Front Bottom",
 	"Show the Front view at the bottom of the Multiview panel.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "b 0"]]
 	[If, [FileExecute, zrsDll, "RSViewUsed", "0"],
@@ -600,7 +602,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Back Top",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Back Top",
 	"Show the Back view at the top of the Multiview panel.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "a 1"]]
 	[If, [FileExecute, zrsDll, "RSViewUsed", "1"],
@@ -610,7 +612,7 @@
 	]
 	, 0, 0.5
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Back Bottom",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Back Bottom",
 	"Show the Back view at the bottom of the Multiview panel.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "b 1"]]
 	[If, [FileExecute, zrsDll, "RSViewUsed", "1"],
@@ -621,7 +623,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Right Top",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Right Top",
 	"Show the Right view at the top of the Multiview panel.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "a 2"]]
 	[If, [FileExecute, zrsDll, "RSViewUsed", "2"],
@@ -631,7 +633,7 @@
 	]
 	, 0, 0.5
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Right Bottom",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Right Bottom",
 	"Show the Right view at the bottom of the Multiview panel.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "b 2"]]
 	[If, [FileExecute, zrsDll, "RSViewUsed", "2"],
@@ -642,7 +644,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Left Top",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Left Top",
 	"Show the Left view at the top of the Multiview panel.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "a 3"]]
 	[If, [FileExecute, zrsDll, "RSViewUsed", "3"],
@@ -652,7 +654,7 @@
 	]
 	, 0, 0.5
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Left Bottom",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Left Bottom",
 	"Show the Left view at the bottom of the Multiview panel.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "b 3"]]
 	[If, [FileExecute, zrsDll, "RSViewUsed", "3"],
@@ -663,7 +665,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Top Top",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Top Top",
 	"Show the Top view at the top of the Multiview panel.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "a 4"]]
 	[If, [FileExecute, zrsDll, "RSViewUsed", "4"],
@@ -673,7 +675,7 @@
 	]
 	, 0, 0.5
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Top Bottom",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Top Bottom",
 	"Show the Top view at the bottom of the Multiview panel.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "b 4"]]
 	[If, [FileExecute, zrsDll, "RSViewUsed", "4"],
@@ -684,7 +686,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Bottom Top",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Bottom Top",
 	"Show the Bottom view at the top of the Multiview panel.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "a 5"]]
 	[If, [FileExecute, zrsDll, "RSViewUsed", "5"],
@@ -694,7 +696,7 @@
 	]
 	, 0, 0.5
 ]
-[IButton, "ZPlugin:Reference Scaler b80:Multiview:Bottom Bottom",
+[IButton, "ZPlugin:Reference Scaler b81:Multiview:Bottom Bottom",
 	"Show the Bottom view at the bottom of the Multiview panel.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "b 5"]]
 	[If, [FileExecute, zrsDll, "RSViewUsed", "5"],
@@ -705,7 +707,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Anchor",
+[IButton, "ZPlugin:Reference Scaler b81:Anchor",
 	"With the model lined up with the image, press to record this zoom and position as the 1:1 match.",
 	[If, [IGet, Transform:Edit] == 0,
 		[Note, "Put the model in Edit mode first."]
@@ -729,21 +731,21 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Sync",
+[IButton, "ZPlugin:Reference Scaler b81:Sync",
 	"Redraw the reference for the current zoom and position once.",
 	[RoutineCall, ZRSUpdate]
 	[If, zrsResult != 1, [Note, zrsMsg], [Note, [StrMerge, "Sync: ", zrsMsg], , 1]]
 	, 0, 0.5
 ]
 
-[ISwitch, "ZPlugin:Reference Scaler b80:Live", 0,
+[ISwitch, "ZPlugin:Reference Scaler b81:Live", 0,
 	"Keep redrawing the reference as the camera zooms and pans.",
 	[VarSet, zrsLive, 1]
 	[RoutineCall, ZRSUpdate]
 	[If, zrsResult != 1,
 		[Note, [StrMerge, "Live could not start: ", zrsMsg]]
 		[VarSet, zrsLive, 0]
-		[ISet, "ZPlugin:Reference Scaler b80:Live", 0]
+		[ISet, "ZPlugin:Reference Scaler b81:Live", 0]
 		,
 		[VarSet, zrsTick, 0]
 		[Note, "Live on: zoom or pan, and the reference follows when you release the mouse.", , 2]
@@ -755,7 +757,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Reset",
+[IButton, "ZPlugin:Reference Scaler b81:Reset",
 	"Show the reference fitted to the document again, unscaled.",
 	[RoutineCall, ZRSBase]
 	[RoutineCall, ZRSShow]
@@ -771,8 +773,8 @@
 	[If, [IExists, "Document:Back"],
 		[VarSet, zrsTick, [IGet, "Document:Back"]]
 		[If, zrsTick != 16711935,
-			[ISet, "ZPlugin:Reference Scaler b80:Saved Back", zrsTick]
-			[If, [IExists, "Document:Range"], [ISet, "ZPlugin:Reference Scaler b80:Saved Range", [IGet, "Document:Range"]]]
+			[ISet, "ZPlugin:Reference Scaler b81:Saved Back", zrsTick]
+			[If, [IExists, "Document:Range"], [ISet, "ZPlugin:Reference Scaler b81:Saved Range", [IGet, "Document:Range"]]]
 		]
 		[IColorSet, 255, 0, 255]
 		[IPress, "Document:Back"]
@@ -784,7 +786,7 @@
 ]
 
 [RoutineDef, ZRSRestoreBackground,
-	[VarSet, zrsTick, [IGet, "ZPlugin:Reference Scaler b80:Saved Back"]]
+	[VarSet, zrsTick, [IGet, "ZPlugin:Reference Scaler b81:Saved Back"]]
 	[VarSet, zrsOk, [IExists, "Document:Back"]]
 	[If, zrsTick <= 0, [VarSet, zrsOk, 0]]
 	[If, zrsTick >= 256, [VarSet, zrsOk, 0]]
@@ -793,7 +795,7 @@
 		[IPress, "Document:Back"]
 		[IColorSet, 255, 255, 255]
 	]
-	[If, [IExists, "Document:Range"], [ISet, "Document:Range", [IGet, "ZPlugin:Reference Scaler b80:Saved Range"]]]
+	[If, [IExists, "Document:Range"], [ISet, "Document:Range", [IGet, "ZPlugin:Reference Scaler b81:Saved Range"]]]
 ]
 
 // Finds where ZBrush keeps the model's view in memory, so the DLL can follow
@@ -803,20 +805,20 @@
 // then puts the view back and reports that. zrsResult is 1 when the DLL has locked on.
 [RoutineDef, ZRSMemProbe,
 	[VarSet, zrsResult, 0]
-	[If, [IGet, "ZPlugin:Reference Scaler b80:Anchor Scale"] > 0,
+	[If, [IGet, "ZPlugin:Reference Scaler b81:Anchor Scale"] > 0,
 		[TransformGet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
-		[VarSet, zrsArgs, [StrMerge, "start ", zrsKsx, " ", zrsKx, " ", zrsKy, " ", [IGet, "ZPlugin:Reference Scaler b80:Anchor Scale"]]]
+		[VarSet, zrsArgs, [StrMerge, "start ", zrsKsx, " ", zrsKx, " ", zrsKy, " ", [IGet, "ZPlugin:Reference Scaler b81:Anchor Scale"]]]
 		[FileExecute, zrsDll, "RSMemProbe", zrsArgs]
 		[Loop, 3,
 			[VarSet, zrsTick, zrsTick + 1]
 			[TransformSet, zrsKx + 11 * zrsTick, zrsKy + 7 * zrsTick, zrsKz, zrsKsx * (1 + 0.04 * zrsTick), zrsKsy * (1 + 0.04 * zrsTick), zrsKsz * (1 + 0.04 * zrsTick), zrsKrx, zrsKry, zrsKrz]
 			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-			[VarSet, zrsArgs, [StrMerge, "next ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [IGet, "ZPlugin:Reference Scaler b80:Anchor Scale"]]]
+			[VarSet, zrsArgs, [StrMerge, "next ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [IGet, "ZPlugin:Reference Scaler b81:Anchor Scale"]]]
 			[FileExecute, zrsDll, "RSMemProbe", zrsArgs]
 		]
 		[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx + 15, zrsKry + 25, zrsKrz]
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsArgs, [StrMerge, "next ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [IGet, "ZPlugin:Reference Scaler b80:Anchor Scale"]]]
+		[VarSet, zrsArgs, [StrMerge, "next ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [IGet, "ZPlugin:Reference Scaler b81:Anchor Scale"]]]
 		[FileExecute, zrsDll, "RSMemProbe", zrsArgs]
 		// The rotation too, so the DLL sees snaps to a view without Live.
 		[FileExecute, zrsDll, "RSRotProbe", [StrMerge, "start ", zrsRx, " ", zrsRy, " ", zrsRz]]
@@ -826,7 +828,7 @@
 		[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
 		[FileExecute, zrsDll, "RSRotProbe", [StrMerge, "last ", zrsRx, " ", zrsRy, " ", zrsRz]]
-		[VarSet, zrsArgs, [StrMerge, "last ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [IGet, "ZPlugin:Reference Scaler b80:Anchor Scale"]]]
+		[VarSet, zrsArgs, [StrMerge, "last ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [IGet, "ZPlugin:Reference Scaler b81:Anchor Scale"]]]
 		[VarSet, zrsResult, [FileExecute, zrsDll, "RSMemProbe", zrsArgs]]
 	]
 ]
@@ -897,9 +899,9 @@
 	[FileExecute, zrsDll, "RSLog", [StrMerge, zrsArgs, ", using ", zrsBestZ]]
 	[TransformSet, zrsKx, zrsKy, zrsBestZ, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
 	[If, zrsBestZ != zrsKz,
-		[ISet, "ZPlugin:Reference Scaler b80:Depth Factor", zrsBestZ / zrsKsx]
+		[ISet, "ZPlugin:Reference Scaler b81:Depth Factor", zrsBestZ / zrsKsx]
 		,
-		[ISet, "ZPlugin:Reference Scaler b80:Depth Factor", 0]
+		[ISet, "ZPlugin:Reference Scaler b81:Depth Factor", 0]
 	]
 ]
 
@@ -912,7 +914,7 @@
 // magenta, so the model stays in front.
 // Every fill uses frame0.png: importing a name that already exists replaces
 // that texture in place, so a single name keeps it the last texture.
-[IButton, "ZPlugin:Reference Scaler b80:Overlay",
+[IButton, "ZPlugin:Reference Scaler b81:Overlay",
 	"Show the reference in a click-through window over the canvas, behind the model. Press again to find the canvas again.",
 	[RoutineCall, ZRSCheckDll]
 	[FileExecute, zrsDll, "RSOverlayStop"]
@@ -921,15 +923,15 @@
 		,
 		[RoutineCall, ZRSLoadAnchor]
 		[VarSet, zrsAutoAnchored, 0]
-		[If, [IGet, "ZPlugin:Reference Scaler b80:Anchor Scale"] <= 0,
+		[If, [IGet, "ZPlugin:Reference Scaler b81:Anchor Scale"] <= 0,
 			[RoutineCall, ZRSAnchorNow]
 			[VarSet, zrsAutoAnchored, 1]
 		]
-		[If, [IGet, "ZPlugin:Reference Scaler b80:Anchor Scale"] > 0,
+		[If, [IGet, "ZPlugin:Reference Scaler b81:Anchor Scale"] > 0,
 			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-			[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b80:Anchor Scale"]]
-			[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b80:Anchor X"]]
-			[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b80:Anchor Y"]]
+			[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b81:Anchor Scale"]]
+			[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b81:Anchor X"]]
+			[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b81:Anchor Y"]]
 			,
 			[RoutineCall, ZRSBase]
 		]
@@ -1004,7 +1006,7 @@
 				[If, zrsCleared == 0, [VarSet, zrsMsg, [StrMerge, zrsMsg, "\nLayer:Clear not found, the model may show stripes."]]]
 				[If, zrsAutoAnchored, [VarSet, zrsMsg, [StrMerge, zrsMsg, "\nNo anchor was set: anchored at the current view."]]]
 				[Note, [StrMerge, zrsArgs, "\n", zrsMsg]]
-				[If, [IGet, "ZPlugin:Reference Scaler b80:Depth Factor"] != 0,
+				[If, [IGet, "ZPlugin:Reference Scaler b81:Depth Factor"] != 0,
 					[Note, [StrMerge, "Moved the model off ZBrush's back clipping plane, to depth ", zrsBestZ]]
 					,
 					[Note, [StrMerge, "Depth unchanged: the model showed at ", zrsMemFound, " / ", zrsTurn, " / ", zrsCount, " of 900 points (now / in front / behind)."]]
@@ -1022,11 +1024,11 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Overlay Off",
+[IButton, "ZPlugin:Reference Scaler b81:Overlay Off",
 	"Hide the overlay window and draw the reference on the canvas again.",
 	[FileExecute, zrsDll, "RSOverlayStop"]
 	[RoutineCall, ZRSRestoreBackground]
-	[If, [IGet, "ZPlugin:Reference Scaler b80:Anchor Scale"] > 0,
+	[If, [IGet, "ZPlugin:Reference Scaler b81:Anchor Scale"] > 0,
 		[RoutineCall, ZRSUpdate]
 		,
 		[RoutineCall, ZRSBase]
@@ -1036,7 +1038,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:Snapshot",
+[IButton, "ZPlugin:Reference Scaler b81:Snapshot",
 	"Save what the overlay captured and what it showed, to send when something looks wrong.",
 	[VarSet, zrsMsg2, "snapshot"]
 	[RoutineCall, ZRSDepthProbe]
@@ -1049,12 +1051,12 @@
 	, 0, 0.5
 ]
 
-[ISwitch, "ZPlugin:Reference Scaler b80:Diag", 0,
+[ISwitch, "ZPlugin:Reference Scaler b81:Diag", 0,
 	"Show a short popup on every Live wake-up, not just on redraws.",
 	, , 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b80:About",
+[IButton, "ZPlugin:Reference Scaler b81:About",
 	"Show which build is running and whether the helper DLL loads.",
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSVersion"]]
 	[Note, [StrMerge, "Reference Scaler ", zrsBuild, "\nDLL build ", zrsTick, " (needs ", zrsDllBuild, ")\n", [FileNameResolvePath, zrsDll]]]
@@ -1062,47 +1064,47 @@
 ]
 
 // Anchor storage. Set by Anchor; shown so the anchored values are visible.
-[ISlider, "ZPlugin:Reference Scaler b80:Anchor Scale", 0, 0.001, 0, 100000,
+[ISlider, "ZPlugin:Reference Scaler b81:Anchor Scale", 0, 0.001, 0, 100000,
 	"Model scale recorded by Anchor.",
 	, 0, 1
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b80:Anchor X", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b81:Anchor X", 0, 0.001, -100000, 100000,
 	"Model horizontal position recorded by Anchor.",
 	, 0, 0.5
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b80:Anchor Y", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b81:Anchor Y", 0, 0.001, -100000, 100000,
 	"Model vertical position recorded by Anchor.",
 	, 0, 0.5
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b80:Anchor Rot X", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b81:Anchor Rot X", 0, 0.001, -100000, 100000,
 	"View rotation recorded by Anchor. When the view is back at this rotation the offset is cleared.",
 	, 0, 0.33
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b80:Anchor Rot Y", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b81:Anchor Rot Y", 0, 0.001, -100000, 100000,
 	"View rotation recorded by Anchor.",
 	, 0, 0.33
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b80:Anchor Rot Z", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b81:Anchor Rot Z", 0, 0.001, -100000, 100000,
 	"View rotation recorded by Anchor.",
 	, 0, 0.33
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b80:Saved Back", 0, 1, 0, 16777215,
+[ISlider, "ZPlugin:Reference Scaler b81:Saved Back", 0, 1, 0, 16777215,
 	"Your document background colour, saved while the overlay uses magenta.",
 	, 0, 0.5
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b80:Saved Range", 0, 0.01, 0, 100,
+[ISlider, "ZPlugin:Reference Scaler b81:Saved Range", 0, 0.01, 0, 100,
 	"Your document background gradient range, saved while the overlay is on.",
 	, 0, 0.5
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b80:Depth Factor", 0, 0.001, -1000, 1000,
+[ISlider, "ZPlugin:Reference Scaler b81:Depth Factor", 0, 0.001, -1000, 1000,
 	"Model depth, in multiples of its scale, that keeps it off ZBrush's back clipping plane (found by Overlay, kept by Live). 0 = not changed.",
 	, 0, 1
 ]

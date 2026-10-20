@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 80;
+static const int kDllBuild = 81;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1220,13 +1220,36 @@ static int gMode = 0, gPanelLeft = 0, gMulti = 0, gMultiA = 0, gMultiB = 3, gBac
 static int gGamma = 100, gSat = 100;
 static const double kPanelShare = 0.35;  // of the canvas width
 
-// The panel in overlay pixels (PureRef).
+// The part of the document ZBrush shows (overlay pixels, x1 and y1 past the
+// end): a document larger than ZBrush's viewport has its edges under ZBrush's
+// interface. Learned from where the background (magenta) is seen; empty
+// until then, which means the whole document.
+static int gViewX0 = 0, gViewY0 = 0, gViewX1 = 0, gViewY1 = 0;
+static bool gRedrawPending = false;
+
+static void ViewportRect(int w, int h, int& x0, int& y0, int& x1, int& y1)
+{
+	if (gViewX1 > gViewX0 && gViewY1 > gViewY0) {
+		x0 = std::max(0, gViewX0);
+		y0 = std::max(0, gViewY0);
+		x1 = std::min(w, gViewX1);
+		y1 = std::min(h, gViewY1);
+	} else {
+		x0 = y0 = 0;
+		x1 = w;
+		y1 = h;
+	}
+}
+
+// The panel in overlay pixels (PureRef), at one side of the viewport.
 static void PanelRect(int w, int h, int& x0, int& y0, int& pw, int& ph)
 {
-	pw = static_cast<int>(w * kPanelShare + 0.5);
-	ph = h;
-	x0 = gPanelLeft ? 0 : w - pw;
-	y0 = 0;
+	int vx0, vy0, vx1, vy1;
+	ViewportRect(w, h, vx0, vy0, vx1, vy1);
+	pw = static_cast<int>((vx1 - vx0) * kPanelShare + 0.5);
+	ph = vy1 - vy0;
+	x0 = gPanelLeft ? vx0 : vx1 - pw;
+	y0 = vy0;
 }
 
 // Layout and image of a view slot for the panel, from the current camera.
@@ -1344,10 +1367,13 @@ static void DrawPanelCell(const OverlayState& st, int slot, int x0, int y0, int 
 	double ix, iy, iw, ih;
 	if (!ImageRectFor(vs, (*levels)[0].w, (*levels)[0].h, ix, iy, iw, ih))
 		return;
-	const double s = std::min(static_cast<double>(cw) / gRefLayer.w, static_cast<double>(ch) / gRefLayer.h);
-	const double ox = x0 + (cw - gRefLayer.w * s) * 0.5, oy = y0 + (ch - gRefLayer.h * s) * 0.5;
-	DrawLevels(gRefLayer, *levels, ox + ix * s, oy + iy * s, iw * s, ih * s, static_cast<int>(ox), static_cast<int>(oy),
-		static_cast<int>(ox + gRefLayer.w * s + 0.5), static_cast<int>(oy + gRefLayer.h * s + 0.5), 255);
+	// The viewport as Classic would show it, fitted into the cell.
+	int vx0, vy0, vx1, vy1;
+	ViewportRect(gRefLayer.w, gRefLayer.h, vx0, vy0, vx1, vy1);
+	const double vw = vx1 - vx0, vh = vy1 - vy0;
+	const double s = std::min(cw / vw, ch / vh);
+	const double ox = x0 + (cw - vw * s) * 0.5 - vx0 * s, oy = y0 + (ch - vh * s) * 0.5 - vy0 * s;
+	DrawLevels(gRefLayer, *levels, ox + ix * s, oy + iy * s, iw * s, ih * s, x0, y0, x0 + cw, y0 + ch, 255);
 }
 
 // Builds gRefLayer: what replaces the key colour (Classic: the reference,
@@ -1693,6 +1719,9 @@ static void Composite(HWND wnd, const OverlayState& st)
 	const unsigned char* ref = gRefLayer.bits;
 	unsigned char* out = gOutput.bits;
 	size_t magenta = 0, model = 0;
+	static std::vector<int> rowMagenta, colMagenta;
+	rowMagenta.assign(h, 0);
+	colMagenta.assign(w, 0);
 	for (size_t i = 0; i < n; ++i, cap += 4, ref += 4, out += 4) {
 		const int b = cap[0], g = cap[1], r = cap[2];
 		// Share of magenta: blending any grey with magenta (255, 0, 255) by t
@@ -1708,8 +1737,11 @@ static void Composite(HWND wnd, const OverlayState& st)
 			out[2] = static_cast<unsigned char>(r);
 			continue;
 		}
-		if (t > 200)
+		if (t > 200) {
 			++magenta;
+			++rowMagenta[i / w];
+			++colMagenta[i % w];
+		}
 		t = t > 230 ? 256 : (t << 8) / 255;
 		const int ob = b + (t * (ref[0] - 255) >> 8), og = g + (t * ref[1] >> 8), orr = r + (t * (ref[2] - 255) >> 8);
 		out[0] = static_cast<unsigned char>(ob < 0 ? 0 : ob > 255 ? 255 : ob);
@@ -1717,6 +1749,34 @@ static void Composite(HWND wnd, const OverlayState& st)
 		out[2] = static_cast<unsigned char>(orr < 0 ? 0 : orr > 255 ? 255 : orr);
 	}
 	gMagentaShare = n ? 100.0 * magenta / n : 0;
+	{
+		// The viewport grows to every row and column the background shows
+		// in (at least 8 pixels of it, so stray magenta in the interface
+		// does not count).
+		int x0 = w, x1 = -1, y0 = h, y1 = -1;
+		for (int x = 0; x < w; ++x)
+			if (colMagenta[x] >= 8) { x0 = std::min(x0, x); x1 = x; }
+		for (int y = 0; y < h; ++y)
+			if (rowMagenta[y] >= 8) { y0 = std::min(y0, y); y1 = y; }
+		if (x1 >= x0 && y1 >= y0) {
+			const bool had = gViewX1 > gViewX0;
+			const int nx0 = had ? std::min(gViewX0, x0) : x0, ny0 = had ? std::min(gViewY0, y0) : y0;
+			const int nx1 = had ? std::max(gViewX1, x1 + 1) : x1 + 1, ny1 = had ? std::max(gViewY1, y1 + 1) : y1 + 1;
+			if (nx0 != gViewX0 || ny0 != gViewY0 || nx1 != gViewX1 || ny1 != gViewY1) {
+				gViewX0 = nx0;
+				gViewY0 = ny0;
+				gViewX1 = nx1;
+				gViewY1 = ny1;
+				EnterCriticalSection(&gOverlayLock);
+				gRedrawPending = true;
+				LeaveCriticalSection(&gOverlayLock);
+				if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+					fprintf(f, "%lu viewport %d %d to %d %d of %d x %d\n", GetTickCount(), gViewX0, gViewY0, gViewX1, gViewY1, w, h);
+					fclose(f);
+				}
+			}
+		}
+	}
 	gModelPixels = static_cast<double>(model);
 	if (gMode == 1 && !gPanelAside) {
 		// PureRef: the panel is shown over the model, but not over ZBrush's
@@ -2225,8 +2285,6 @@ static void MemFollow()
 	LeaveCriticalSection(&gOverlayLock);
 }
 
-static bool gRedrawPending = false;
-
 // ---------------------------------------------------------------------------
 // Views: a reference image per snapped view (slots 0-5, in the Image Plane
 // plugin's order Front, Back, Right, Left, Top, Bottom). Slot 6 is the plain
@@ -2630,10 +2688,14 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 		return true;
 	const View& cv = gViews[c];
 	const View& vv = gViews[slot];
-	// C's window in its image space: centre and half size per screen axis.
-	const double centreC[2] = {(st.docW * 0.5 - cs.px) / cs.ratio + cs.ax + cs.offX,
-		(st.docH * 0.5 - cs.py) / cs.ratio + cs.ay + cs.offY};
-	const double halfC[2] = {st.docW * 0.5 / cs.ratio, st.docH * 0.5 / cs.ratio};
+	// C's window (the viewport) in its image space: centre and half size per
+	// screen axis.
+	int vx0, vy0, vx1, vy1;
+	const double kp = st.pixelsPerDoc > 0 ? st.pixelsPerDoc : 1;
+	ViewportRect(static_cast<int>(st.docW * kp + 0.5), static_cast<int>(st.docH * kp + 0.5), vx0, vy0, vx1, vy1);
+	const double midX = (vx0 + vx1) * 0.5 / kp, midY = (vy0 + vy1) * 0.5 / kp;
+	const double centreC[2] = {(midX - cs.px) / cs.ratio + cs.ax + cs.offX, (midY - cs.py) / cs.ratio + cs.ay + cs.offY};
+	const double halfC[2] = {(vx1 - vx0) * 0.5 / kp / cs.ratio, (vy1 - vy0) * 0.5 / kp / cs.ratio};
 	// The model's bounds in image space, per screen axis.
 	const double lowC[2] = {cv.u0 + ce.i0 * cv.cell, cv.v0 + ce.j0 * cv.cell};
 	const double highC[2] = {cv.u0 + (ce.i1 + 1) * cv.cell, cv.v0 + (ce.j1 + 1) * cv.cell};
@@ -2673,7 +2735,6 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 		// The band shown along the shared axis, and the model's extent
 		// across it within the band.
 		const int o = 1 - depthAxis;
-		halfV[depthAxis] = (depthAxis == 0 ? st.docW : st.docH) * 0.5 / cs.ratio * k;
 		const double origin = o == 0 ? vv.u0 : vv.v0;
 		const int n = o == 0 ? vv.gw : vv.gh;
 		const int from = std::max(0, static_cast<int>(floor((centreV[o] - halfV[o] - origin) / vv.cell)));
@@ -2692,8 +2753,8 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 	}
 	out.ratio = cs.ratio / k;
 	out.offX = out.offY = 0;
-	out.px = st.docW * 0.5 - out.ratio * (centreV[0] - out.ax);
-	out.py = st.docH * 0.5 - out.ratio * (centreV[1] - out.ay);
+	out.px = midX - out.ratio * (centreV[0] - out.ax);
+	out.py = midY - out.ratio * (centreV[1] - out.ay);
 	return true;
 }
 
@@ -2744,15 +2805,19 @@ static void SampleSilhouette(const OverlayState& st, double offX, double offY, V
 	}
 	out.assign(static_cast<size_t>(g.gw) * g.gh, 0);
 	const double k = st.pixelsPerDoc;
+	// Only the viewport: ZBrush's interface over the document's edges is not
+	// the model.
+	int vx0, vy0, vx1, vy1;
+	ViewportRect(gKeyW, gKeyH, vx0, vy0, vx1, vy1);
 	for (int j = 0; j < g.gh; ++j) {
 		const double v = g.v0 + (j + 0.5) * g.cell;
 		const int yp = static_cast<int>(floor((st.py + st.ratio * (v - st.ay - offY)) * k));
-		if (yp < 0 || yp >= gKeyH)
+		if (yp < vy0 || yp >= vy1)
 			continue;
 		for (int i = 0; i < g.gw; ++i) {
 			const double u = g.u0 + (i + 0.5) * g.cell;
 			const int xp = static_cast<int>(floor((st.px + st.ratio * (u - st.ax - offX)) * k));
-			if (xp < 0 || xp >= gKeyW)
+			if (xp < vx0 || xp >= vx1)
 				continue;
 			out[static_cast<size_t>(j) * g.gw + i] = gKeyShare[static_cast<size_t>(yp) * gKeyW + xp] < 128 ? 2 : 1;
 		}
@@ -3436,6 +3501,7 @@ static bool OverlayStep(HWND wnd)
 			// The overlay moved (recalibrated): it may be on another monitor.
 			gDup.Release();
 			gDup.failed = false;
+			gViewX0 = gViewY0 = gViewX1 = gViewY1 = 0;
 		}
 		if (!BuildRefLayer(st)) {
 			ShowWindow(wnd, SW_HIDE);
@@ -4183,6 +4249,10 @@ ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 			*field = view ? value % 6 : field == &gBackGrey ? std::min(value, 255) :
 				field == &gGamma ? std::max(20, std::min(value, 300)) : field == &gSat ? std::min(value, 200) : value != 0;
 		if (value != -2) {
+			if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				fprintf(f, "%lu display %s\n", GetTickCount(), text);
+				fclose(f);
+			}
 			SaveDisplay();
 			gRedrawPending = true;
 			if (gMode == 1)
