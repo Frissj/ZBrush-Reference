@@ -25,12 +25,13 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 23"]
+[VarDef, zrsBuild, "build 24"]
 [VarDef, zrsDll, "ReferenceScaler_Data\ReferenceScaler64.dll"]
 [VarDef, zrsDepth, -1]
 [VarDef, zrsTexBefore, -1]
 [VarDef, zrsTexAfter, -1]
 [VarDef, zrsTexMax, -1]
+[VarDef, zrsBefore, 0]
 [VarDef, zrsLive, 0]
 [VarDef, zrsFrame, 0]
 [VarDef, zrsPx, 0]
@@ -100,14 +101,14 @@
 // Works out the ratio and positions from the current model and the anchor
 // sliders, then draws. Leaves a result in zrsMsg.
 [RoutineDef, ZRSUpdate,
-	[If, [IGet, "ZPlugin:Reference Scaler b23:Anchor Scale"] <= 0,
+	[If, [IGet, "ZPlugin:Reference Scaler b24:Anchor Scale"] <= 0,
 		[VarSet, zrsMsg, "Not anchored: press Anchor first."]
 		[VarSet, zrsResult, 0]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b23:Anchor Scale"]]
-		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b23:Anchor X"]]
-		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b23:Anchor Y"]]
+		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b24:Anchor Scale"]]
+		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b24:Anchor X"]]
+		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b24:Anchor Y"]]
 		[RoutineCall, ZRSDraw]
 	]
 ]
@@ -121,7 +122,7 @@
 		[If, zrsLive,
 			[If, [IGet, Transform:Edit],
 				[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b23:Anchor Scale"]]
+				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b24:Anchor Scale"]]
 				[If, ABS(zrsRatio - zrsLastRatio) > 0.002 || ABS(zrsPx - zrsLastPx) > 0.5 || ABS(zrsPy - zrsLastPy) > 0.5,
 					[RoutineCall, ZRSUpdate]
 				]
@@ -147,9 +148,9 @@
 // ---------------------------------------------------------------------------
 // Interface
 // ---------------------------------------------------------------------------
-[ISubPalette, "ZPlugin:Reference Scaler b23"]
+[ISubPalette, "ZPlugin:Reference Scaler b24"]
 
-[IButton, "ZPlugin:Reference Scaler b23:Load Image",
+[IButton, "ZPlugin:Reference Scaler b24:Load Image",
 	"Choose the reference image and draw it behind the model, fitted to the document.",
 	[VarSet, zrsFile, [FileNameAsk, "Image (*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd)|*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd||", , "Choose reference image"]]
 	[If, [StrLength, zrsFile] == 0,
@@ -171,28 +172,28 @@
 	, 0, 1
 ]
 
-[IButton, "ZPlugin:Reference Scaler b23:Anchor",
+[IButton, "ZPlugin:Reference Scaler b24:Anchor",
 	"With the model lined up with the image, press to record this zoom and position as the 1:1 match.",
 	[If, [IGet, Transform:Edit] == 0,
 		[Note, "Put the model in Edit mode first."]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[ISet, "ZPlugin:Reference Scaler b23:Anchor Scale", zrsSx]
-		[ISet, "ZPlugin:Reference Scaler b23:Anchor X", zrsPx]
-		[ISet, "ZPlugin:Reference Scaler b23:Anchor Y", zrsPy]
+		[ISet, "ZPlugin:Reference Scaler b24:Anchor Scale", zrsSx]
+		[ISet, "ZPlugin:Reference Scaler b24:Anchor X", zrsPx]
+		[ISet, "ZPlugin:Reference Scaler b24:Anchor Y", zrsPy]
 		[Note, [StrMerge, "Anchored: model scale ", zrsSx, ", position ", zrsPx, ", ", zrsPy]]
 	]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b23:Sync",
+[IButton, "ZPlugin:Reference Scaler b24:Sync",
 	"Redraw the reference for the current zoom and position once.",
 	[RoutineCall, ZRSUpdate]
 	[Note, [StrMerge, "Sync\n", zrsMsg]]
 	, 0, 0.5
 ]
 
-[ISwitch, "ZPlugin:Reference Scaler b23:Live", 0,
+[ISwitch, "ZPlugin:Reference Scaler b24:Live", 0,
 	"Keep redrawing the reference as the camera zooms and pans.",
 	[VarSet, zrsLive, 1]
 	[RoutineCall, ZRSUpdate]
@@ -203,7 +204,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b23:Reset",
+[IButton, "ZPlugin:Reference Scaler b24:Reset",
 	"Redraw the reference fitted to the document, as Load Image does.",
 	[VarSet, zrsRatio, 1]
 	[VarSet, zrsPx, 0]
@@ -217,7 +218,7 @@
 
 // Step-by-step test of the drawing pipeline: each button does one stage and
 // reports it in its own popup (popups hold about 255 characters).
-[IButton, "ZPlugin:Reference Scaler b23:1 Render",
+[IButton, "ZPlugin:Reference Scaler b24:1 Render",
 	"Test step 1: have the DLL write frame0.png (the image fitted to the document).",
 	[VarSet, zrsArgs, [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " 1 0 0 0 0 frame0.png"]]
 	[VarSet, zrsResult, [FileExecute, zrsDll, "RSRender", zrsArgs]]
@@ -226,7 +227,7 @@
 	, 0, 0.33
 ]
 
-[IButton, "ZPlugin:Reference Scaler b23:2 Import",
+[IButton, "ZPlugin:Reference Scaler b24:2 Import",
 	"Test step 2: import frame0.png into the Texture palette and select it.",
 	[VarSet, zrsFile, [FileNameResolvePath, "ReferenceScaler_Data\frame0.png"]]
 	[RoutineCall, ZRSImport]
@@ -234,7 +235,7 @@
 	, 0, 0.33
 ]
 
-[IButton, "ZPlugin:Reference Scaler b23:3 Fill",
+[IButton, "ZPlugin:Reference Scaler b24:3 Fill",
 	"Test step 3: Color > FillLayer with the current texture, nothing else.",
 	[IPress, Color:FillLayer]
 	[VarSet, zrsTexAfter, -1]
@@ -245,24 +246,51 @@
 	, 0, 0.33
 ]
 
-[IButton, "ZPlugin:Reference Scaler b23:About",
+// Depth tests: set Layer > Displace Z to its maximum or minimum, to find which
+// way pushes the filled image behind the model. Reports the slider's range
+// and its value before and after.
+[IButton, "ZPlugin:Reference Scaler b24:4 Z Max",
+	"Test step 4: set Layer > Displace Z to its maximum.",
+	[If, [IExists, "Layer:Displace Z"],
+		[VarSet, zrsBefore, [IGet, "Layer:Displace Z"]]
+		[ISet, "Layer:Displace Z", [IGetMax, "Layer:Displace Z"]]
+		[Note, [StrMerge, "4 Z Max: Displace Z ", zrsBefore, " -> ", [IGet, "Layer:Displace Z"], "\nrange ", [IGetMin, "Layer:Displace Z"], " to ", [IGetMax, "Layer:Displace Z"], "\nIs the image now behind the model?"]]
+		,
+		[Note, "4 Z Max: Layer > Displace Z not found."]
+	]
+	, 0, 0.5
+]
+
+[IButton, "ZPlugin:Reference Scaler b24:4 Z Min",
+	"Test step 4: set Layer > Displace Z to its minimum.",
+	[If, [IExists, "Layer:Displace Z"],
+		[VarSet, zrsBefore, [IGet, "Layer:Displace Z"]]
+		[ISet, "Layer:Displace Z", [IGetMin, "Layer:Displace Z"]]
+		[Note, [StrMerge, "4 Z Min: Displace Z ", zrsBefore, " -> ", [IGet, "Layer:Displace Z"], "\nrange ", [IGetMin, "Layer:Displace Z"], " to ", [IGetMax, "Layer:Displace Z"], "\nIs the image now behind the model?"]]
+		,
+		[Note, "4 Z Min: Layer > Displace Z not found."]
+	]
+	, 0, 0.5
+]
+
+[IButton, "ZPlugin:Reference Scaler b24:About",
 	"Show which build is running and whether the helper DLL loads.",
 	[Note, [StrMerge, "Reference Scaler ", zrsBuild, "\nDLL: ", [FileNameResolvePath, zrsDll], "\nDLL check: ", [FileExecute, zrsDll, "RSVersion"]]]
 	, 0, 0.5
 ]
 
 // Anchor storage. Set by Anchor; shown so the anchored values are visible.
-[ISlider, "ZPlugin:Reference Scaler b23:Anchor Scale", 0, 0.001, 0, 100000,
+[ISlider, "ZPlugin:Reference Scaler b24:Anchor Scale", 0, 0.001, 0, 100000,
 	"Model scale recorded by Anchor.",
 	, 0, 1
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b23:Anchor X", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b24:Anchor X", 0, 0.001, -100000, 100000,
 	"Model horizontal position recorded by Anchor.",
 	, 0, 0.5
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b23:Anchor Y", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b24:Anchor Y", 0, 0.001, -100000, 100000,
 	"Model vertical position recorded by Anchor.",
 	, 0, 0.5
 ]
