@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 77;
+static const int kDllBuild = 78;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -933,30 +933,28 @@ struct Level {
 	std::vector<uint32_t> px;  // B, G, R, A
 	int w = 0, h = 0;
 };
-static std::vector<Level> gLevels;
-static std::wstring gLevelsFor;
 
 // The image the overlay shows: the showing view's (empty: none). Kept
 // apart from the canvas-fill reference so the overlay shows only view images.
 static std::string gOverlayPath;
 
-static void BuildLevels()
+// Mip levels of an image, cached for the few images on show (PureRef's
+// multiview shows two at once).
+struct ImageCache {
+	std::wstring path;
+	std::vector<Level> levels;
+	DWORD usedAt;
+};
+static std::vector<ImageCache> gImages;
+
+static bool LoadLevels(const std::wstring& path, std::vector<Level>& levels)
 {
-	if (gOverlayPath.empty()) {
-		gLevels.clear();
-		gLevelsFor.clear();
-		return;
-	}
-	const std::wstring path = Widen(gOverlayPath.c_str());
-	if (gLevelsFor == path)
-		return;
-	gLevels.clear();
-	gLevelsFor.clear();
+	levels.clear();
 	StartGdiplus();
 	Gdiplus::Bitmap* image = Gdiplus::Bitmap::FromFile(path.c_str());
 	if (!image || image->GetLastStatus() != Gdiplus::Ok || image->GetWidth() == 0) {
 		delete image;
-		return;
+		return false;
 	}
 	Level top;
 	top.w = image->GetWidth();
@@ -966,15 +964,15 @@ static void BuildLevels()
 	Gdiplus::BitmapData data;
 	if (image->LockBits(&r, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &data) != Gdiplus::Ok) {
 		delete image;
-		return;
+		return false;
 	}
 	for (int y = 0; y < top.h; ++y)
 		memcpy(&top.px[static_cast<size_t>(y) * top.w], static_cast<BYTE*>(data.Scan0) + y * data.Stride, top.w * 4);
 	image->UnlockBits(&data);
 	delete image;
-	gLevels.push_back(std::move(top));
-	while (gLevels.back().w > 16 && gLevels.back().h > 16) {
-		const Level& a = gLevels.back();
+	levels.push_back(std::move(top));
+	while (levels.back().w > 16 && levels.back().h > 16) {
+		const Level& a = levels.back();
 		Level b;
 		b.w = a.w / 2;
 		b.h = a.h / 2;
@@ -989,9 +987,32 @@ static void BuildLevels()
 				}
 				b.px[static_cast<size_t>(y) * b.w + x] = out;
 			}
-		gLevels.push_back(std::move(b));
+		levels.push_back(std::move(b));
 	}
-	gLevelsFor = path;
+	return true;
+}
+
+// The levels of the image at path (UTF-8), loading it if needed, or null.
+static const std::vector<Level>* LevelsFor(const std::string& path)
+{
+	if (path.empty())
+		return nullptr;
+	const std::wstring w = Widen(path.c_str());
+	for (ImageCache& c : gImages)
+		if (c.path == w) {
+			c.usedAt = GetTickCount();
+			return c.levels.empty() ? nullptr : &c.levels;
+		}
+	if (gImages.size() >= 4) {
+		size_t oldest = 0;
+		for (size_t i = 1; i < gImages.size(); ++i)
+			if (static_cast<int>(gImages[i].usedAt - gImages[oldest].usedAt) < 0)
+				oldest = i;
+		gImages.erase(gImages.begin() + oldest);
+	}
+	gImages.push_back({w, {}, GetTickCount()});
+	LoadLevels(w, gImages.back().levels);
+	return gImages.back().levels.empty() ? nullptr : &gImages.back().levels;
 }
 
 static int gImgW = 0, gImgH = 0;  // the shown image's size (0: none)
@@ -1000,11 +1021,11 @@ static int gImgW = 0, gImgH = 0;  // the shown image's size (0: none)
 // document and centred (as in RSRender), adjusted by Adjust Image, scaled by
 // ratio about the anchored model position and moved with the model.
 // Returns false if no image is shown.
-static bool ImageRect(const OverlayState& st, double& x0, double& y0, double& w, double& h)
+static bool ImageRectFor(const OverlayState& st, int iw, int ih, double& x0, double& y0, double& w, double& h)
 {
-	if (gImgW <= 0 || gImgH <= 0 || st.docW < 1 || st.docH < 1)
+	if (iw <= 0 || ih <= 0 || st.docW < 1 || st.docH < 1)
 		return false;
-	const double imgW = gImgW, imgH = gImgH;
+	const double imgW = iw, imgH = ih;
 	const double fit = (st.docW / imgW < st.docH / imgH) ? st.docW / imgW : st.docH / imgH;
 	const double baseW = imgW * fit * st.imgSX, baseH = imgH * fit * st.imgSY;
 	const double cx = st.docW * 0.5 + st.imgX, cy = st.docH * 0.5 + st.imgY;
@@ -1015,6 +1036,13 @@ static bool ImageRect(const OverlayState& st, double& x0, double& y0, double& w,
 	h = baseH * st.ratio * k;
 	return true;
 }
+
+// The same for the image the overlay shows (the showing view's).
+static bool ImageRect(const OverlayState& st, double& x0, double& y0, double& w, double& h)
+{
+	return ImageRectFor(st, gImgW, gImgH, x0, y0, w, h);
+}
+
 
 static void SaveAdjustToView();
 
@@ -1169,90 +1197,161 @@ static void DrawGizmo(const OverlayState& st, Buffer32& b)
 	FillBox(b, cx - 1, cy - 10, cx + 1, cy + 10, orange);
 }
 
-// Resamples the reference for the current state into gRefLayer (bilinear,
-// premultiplied, scaled by the opacity, transparent outside the image).
-// Returns false if there is nothing to show.
-static bool BuildRefLayer(const OverlayState& st)
+// Display: Classic shows the reference behind the model. PureRef shows it in
+// a panel at one side of the canvas (right unless gPanelLeft), zoomed and
+// panned with the camera as Classic would show it; with gMulti, two views
+// (gMultiA above gMultiB) share the panel. Outside the panel the background
+// shows gBackGrey.
+static int gMode = 0, gPanelLeft = 0, gMulti = 0, gMultiA = 0, gMultiB = 3, gBackGrey = 48;
+static const double kPanelShare = 0.35;  // of the canvas width
+
+// The panel in overlay pixels (PureRef).
+static void PanelRect(int w, int h, int& x0, int& y0, int& pw, int& ph)
 {
-	if (!st.visible || st.docW < 1 || st.docH < 1)
-		return false;
-	BuildLevels();
-	const int w = static_cast<int>(st.docW * st.pixelsPerDoc + 0.5);
-	const int h = static_cast<int>(st.docH * st.pixelsPerDoc + 0.5);
-	if (!gRefLayer.Resize(w, h) || !gCapture.Resize(w, h) || !gOutput.Resize(w, h))
-		return false;
-	if (gLevels.empty()) {
-		// No image (a view's image was removed): the background shows black.
-		gImgW = gImgH = 0;
-		memset(gRefLayer.bits, 0, static_cast<size_t>(w) * h * 4);
-		return true;
-	}
+	pw = static_cast<int>(w * kPanelShare + 0.5);
+	ph = h;
+	x0 = gPanelLeft ? 0 : w - pw;
+	y0 = 0;
+}
 
-	gImgW = gLevels[0].w;
-	gImgH = gLevels[0].h;
-	double x0, y0, dispW, dispH;
-	ImageRect(st, x0, y0, dispW, dispH);
+// Layout and image of a view slot for the panel, from the current camera.
+static bool ViewLayout(int slot, const OverlayState& st, OverlayState& out, std::string& path);
+static int ActiveViewSlot();
 
+// Draws an image (premultiplied, scaled by alpha) over dst, its rectangle at
+// x0, y0 and dispW x dispH, only inside the clip rectangle.
+static void DrawLevels(Buffer32& dst, const std::vector<Level>& levels, double x0, double y0, double dispW, double dispH,
+	int cx0, int cy0, int cx1, int cy1, int alphaScale)
+{
+	if (dispW <= 0 || dispH <= 0 || levels.empty())
+		return;
 	// Smallest level still at least as large as the image on screen.
 	size_t li = 0;
-	while (li + 1 < gLevels.size() && gLevels[li + 1].w >= dispW && gLevels[li + 1].h >= dispH)
+	while (li + 1 < levels.size() && levels[li + 1].w >= dispW && levels[li + 1].h >= dispH)
 		++li;
-	const Level& lv = gLevels[li];
-
+	const Level& lv = levels[li];
+	cx0 = std::max(cx0, std::max(0, static_cast<int>(floor(x0))));
+	cy0 = std::max(cy0, std::max(0, static_cast<int>(floor(y0))));
+	cx1 = std::min(cx1, std::min(dst.w, static_cast<int>(ceil(x0 + dispW))));
+	cy1 = std::min(cy1, std::min(dst.h, static_cast<int>(ceil(y0 + dispH))));
+	if (cx0 >= cx1 || cy0 >= cy1)
+		return;
 	// Per column and row: the two texels to blend and the weight (0-256) of
 	// the second, or -1 outside the image.
-	std::vector<int> cx(w), cw(w), ry(h), rw(h);
-	for (int x = 0; x < w; ++x) {
+	std::vector<int> cx(cx1 - cx0), cw(cx1 - cx0);
+	for (int x = cx0; x < cx1; ++x) {
 		const double u = (x + 0.5 - x0) / dispW * lv.w - 0.5;
-		if (u < -0.5 || u > lv.w - 0.5) { cx[x] = -1; continue; }
+		int& ix = cx[x - cx0];
+		if (u < -0.5 || u > lv.w - 0.5) { ix = -1; continue; }
 		const double fu = u < 0 ? 0 : u > lv.w - 1 ? lv.w - 1 : u;
-		cx[x] = static_cast<int>(fu);
-		cw[x] = static_cast<int>((fu - cx[x]) * 256);
+		ix = static_cast<int>(fu);
+		cw[x - cx0] = static_cast<int>((fu - ix) * 256);
 	}
-	for (int y = 0; y < h; ++y) {
+	uint32_t* out = reinterpret_cast<uint32_t*>(dst.bits);
+	for (int y = cy0; y < cy1; ++y) {
 		const double v = (y + 0.5 - y0) / dispH * lv.h - 0.5;
-		if (v < -0.5 || v > lv.h - 0.5) { ry[y] = -1; continue; }
-		const double fv = v < 0 ? 0 : v > lv.h - 1 ? lv.h - 1 : v;
-		ry[y] = static_cast<int>(fv);
-		rw[y] = static_cast<int>((fv - ry[y]) * 256);
-	}
-	const int op = st.alpha;
-	uint32_t* out = reinterpret_cast<uint32_t*>(gRefLayer.bits);
-	for (int y = 0; y < h; ++y) {
-		uint32_t* row = out + static_cast<size_t>(y) * w;
-		if (ry[y] < 0) {
-			memset(row, 0, w * 4);
+		if (v < -0.5 || v > lv.h - 0.5)
 			continue;
-		}
-		const uint32_t* r0 = &lv.px[static_cast<size_t>(ry[y]) * lv.w];
-		const uint32_t* r1 = ry[y] + 1 < lv.h ? r0 + lv.w : r0;
-		const int wy = rw[y];
-		for (int x = 0; x < w; ++x) {
-			const int ix = cx[x];
-			if (ix < 0) {
-				row[x] = 0;
+		const double fv = v < 0 ? 0 : v > lv.h - 1 ? lv.h - 1 : v;
+		const int iy = static_cast<int>(fv), wy = static_cast<int>((fv - iy) * 256);
+		const uint32_t* r0 = &lv.px[static_cast<size_t>(iy) * lv.w];
+		const uint32_t* r1 = iy + 1 < lv.h ? r0 + lv.w : r0;
+		uint32_t* row = out + static_cast<size_t>(y) * dst.w;
+		for (int x = cx0; x < cx1; ++x) {
+			const int ix = cx[x - cx0];
+			if (ix < 0)
 				continue;
-			}
 			const int ix1 = ix + 1 < lv.w ? ix + 1 : ix;
-			const int wx = cw[x];
-			uint32_t result = 0;
-			int alpha = 255;
-			for (int c = 24; c >= 0; c -= 8) {
+			const int wx = cw[x - cx0];
+			int ch[4];
+			for (int k = 0, c = 24; c >= 0; c -= 8, ++k) {
 				const int a = (r0[ix] >> c) & 255, b = (r0[ix1] >> c) & 255;
 				const int d = (r1[ix] >> c) & 255, e = (r1[ix1] >> c) & 255;
 				const int top = a * 256 + (b - a) * wx, bottom = d * 256 + (e - d) * wx;
-				int v = (top * 256 + (bottom - top) * wy) >> 16;
-				if (c == 24) {
-					alpha = v * op / 255;
-					v = alpha;
-				} else {
-					v = v * alpha / 255;  // premultiply
-				}
-				result |= static_cast<uint32_t>(v) << c;
+				ch[k] = (top * 256 + (bottom - top) * wy) >> 16;
+			}
+			const int alpha = ch[0] * alphaScale / 255;
+			// Over what is there already (premultiplied).
+			const uint32_t under = row[x];
+			uint32_t result = 0;
+			for (int k = 0, c = 24; c >= 0; c -= 8, ++k) {
+				const int src = k == 0 ? alpha : ch[k] * alpha / 255;
+				const int dv = (under >> c) & 255;
+				const int v = src + dv * (255 - alpha) / 255;
+				result |= static_cast<uint32_t>(v > 255 ? 255 : v) << c;
 			}
 			row[x] = result;
 		}
 	}
+}
+
+static void FillRect(Buffer32& b, int x0, int y0, int x1, int y1, uint32_t argb)
+{
+	x0 = std::max(x0, 0);
+	y0 = std::max(y0, 0);
+	x1 = std::min(x1, b.w);
+	y1 = std::min(y1, b.h);
+	for (int y = y0; y < y1; ++y) {
+		uint32_t* row = reinterpret_cast<uint32_t*>(b.bits) + static_cast<size_t>(y) * b.w;
+		for (int x = x0; x < x1; ++x)
+			row[x] = argb;
+	}
+}
+
+// One view in a panel cell: the canvas as Classic would show it (that view's
+// image placed by the camera), fitted into the cell.
+static void DrawPanelCell(const OverlayState& st, int slot, int x0, int y0, int cw, int ch)
+{
+	FillRect(gRefLayer, x0, y0, x0 + cw, y0 + ch, 0xFF181818u);
+	OverlayState vs;
+	std::string path;
+	if (slot < 0 || !ViewLayout(slot, st, vs, path))
+		return;
+	const std::vector<Level>* levels = LevelsFor(path);
+	if (!levels)
+		return;
+	double ix, iy, iw, ih;
+	if (!ImageRectFor(vs, (*levels)[0].w, (*levels)[0].h, ix, iy, iw, ih))
+		return;
+	const double s = std::min(static_cast<double>(cw) / gRefLayer.w, static_cast<double>(ch) / gRefLayer.h);
+	const double ox = x0 + (cw - gRefLayer.w * s) * 0.5, oy = y0 + (ch - gRefLayer.h * s) * 0.5;
+	DrawLevels(gRefLayer, *levels, ox + ix * s, oy + iy * s, iw * s, ih * s, static_cast<int>(ox), static_cast<int>(oy),
+		static_cast<int>(ox + gRefLayer.w * s + 0.5), static_cast<int>(oy + gRefLayer.h * s + 0.5), 255);
+}
+
+// Builds gRefLayer: what replaces the key colour (Classic: the reference,
+// transparent black elsewhere; PureRef: the background colour, and the panel,
+// which Composite shows over the model). Returns false if the overlay is off.
+static bool BuildRefLayer(const OverlayState& st)
+{
+	if (!st.visible || st.docW < 1 || st.docH < 1)
+		return false;
+	const int w = static_cast<int>(st.docW * st.pixelsPerDoc + 0.5);
+	const int h = static_cast<int>(st.docH * st.pixelsPerDoc + 0.5);
+	if (!gRefLayer.Resize(w, h) || !gCapture.Resize(w, h) || !gOutput.Resize(w, h))
+		return false;
+	const std::vector<Level>* levels = LevelsFor(gOverlayPath);
+	gImgW = levels ? (*levels)[0].w : 0;
+	gImgH = levels ? (*levels)[0].h : 0;
+	if (gMode == 1) {
+		const uint32_t g = static_cast<uint32_t>(gBackGrey & 255);
+		FillRect(gRefLayer, 0, 0, w, h, 0xFF000000u | g << 16 | g << 8 | g);
+		int px, py, pw, ph;
+		PanelRect(w, h, px, py, pw, ph);
+		if (gMulti) {
+			DrawPanelCell(st, gMultiA, px, py, pw, ph / 2);
+			DrawPanelCell(st, gMultiB, px, py + ph / 2, pw, ph - ph / 2);
+			FillRect(gRefLayer, px, py + ph / 2 - 1, px + pw, py + ph / 2 + 1, 0xFF505050u);
+		} else {
+			DrawPanelCell(st, ActiveViewSlot(), px, py, pw, ph);
+		}
+		return true;
+	}
+	// Classic. No image (none for this view): the background shows black.
+	memset(gRefLayer.bits, 0, static_cast<size_t>(w) * h * 4);
+	double x0, y0, dispW, dispH;
+	if (levels && ImageRect(st, x0, y0, dispW, dispH))
+		DrawLevels(gRefLayer, *levels, x0, y0, dispW, dispH, 0, 0, w, h, st.alpha);
 	return true;
 }
 
@@ -1480,7 +1579,18 @@ static void Composite(HWND wnd, const OverlayState& st)
 	}
 	gMagentaShare = n ? 100.0 * magenta / n : 0;
 	gModelPixels = static_cast<double>(model);
-	if (gAdjust)
+	if (gMode == 1) {
+		// PureRef: the panel is shown over the model.
+		int px, py, pw, ph;
+		PanelRect(w, h, px, py, pw, ph);
+		for (int y = py; y < py + ph && y < h; ++y) {
+			const uint32_t* src = reinterpret_cast<const uint32_t*>(gRefLayer.bits) + static_cast<size_t>(y) * w;
+			uint32_t* dst = reinterpret_cast<uint32_t*>(gOutput.bits) + static_cast<size_t>(y) * w;
+			for (int x = px; x < px + pw && x < w; ++x)
+				dst[x] = src[x] | 0xFF000000u;
+		}
+	}
+	if (gAdjust && gMode == 0)
 		DrawGizmo(st, gOutput);
 	Present(wnd, st, gOutput, 255);
 }
@@ -2247,6 +2357,64 @@ static void BlankView()
 	gOverlay.offX = gOverlay.offY = 0;
 	gRedrawPending = true;
 	ViewLog("snapped to a view without an image: cleared", -2);
+}
+
+static int ActiveViewSlot()
+{
+	return gActiveView;
+}
+
+static bool ViewLayout(int slot, const OverlayState& st, OverlayState& out, std::string& path)
+{
+	if (slot < 0 || slot >= kDefaultView || !gViews[slot].used || gViews[slot].scale <= 0)
+		return false;
+	const View& v = gViews[slot];
+	out = st;
+	if (gAnchorScale > 0)
+		out.ratio = st.ratio * gAnchorScale / v.scale;
+	out.ax = v.ax;
+	out.ay = v.ay;
+	out.imgSX = v.imgSX;
+	out.imgSY = v.imgSY;
+	out.imgX = v.imgX;
+	out.imgY = v.imgY;
+	if (slot != gActiveView)
+		out.offX = out.offY = 0;
+	path = v.path;
+	return true;
+}
+
+static std::wstring DisplayPath()
+{
+	return DllFolder() + L"display.txt";
+}
+
+static void SaveDisplay()
+{
+	if (FILE* f = _wfopen(DisplayPath().c_str(), L"wb")) {
+		fprintf(f, "%d %d %d %d %d %d\n", gMode, gPanelLeft, gMulti, gMultiA, gMultiB, gBackGrey);
+		fclose(f);
+	}
+}
+
+static void LoadDisplay()
+{
+	static bool loaded = false;
+	if (loaded)
+		return;
+	loaded = true;
+	if (FILE* f = _wfopen(DisplayPath().c_str(), L"rb")) {
+		int v[6];
+		if (fscanf(f, "%d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) {
+			gMode = v[0] == 1;
+			gPanelLeft = v[1] != 0;
+			gMulti = v[2] != 0;
+			gMultiA = v[3] >= 0 && v[3] < 6 ? v[3] : 0;
+			gMultiB = v[4] >= 0 && v[4] < 6 ? v[4] : 3;
+			gBackGrey = v[5] >= 0 && v[5] < 256 ? v[5] : 48;
+		}
+		fclose(f);
+	}
 }
 
 // The silhouette as currently on the canvas, in image space (doc x =
@@ -3424,6 +3592,7 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 	gOverlay.visible = true;
 	// Only a view's image is shown, once its view is snapped to.
 	LoadViews();
+	LoadDisplay();
 	BlankView();
 	LeaveCriticalSection(&gOverlayLock);
 	PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
@@ -3665,6 +3834,44 @@ ZFUNC RSOverlayResetOffset(char*, double, char*, int, char*, int, char**)
 	return had ? 1 : 0;
 }
 
+// text: "name value" sets a display setting and returns it: "mode" (0
+// Classic, 1 PureRef), "left" (PureRef panel on the left), "multi" (two
+// views in the panel), "a" and "b" (the two views, slots 0-5), "back" (the
+// grey shown around the panel). The value "-1" toggles mode, left and multi
+// and steps a and b to the next view. "name" alone returns the setting.
+ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
+{
+	char name[16] = {0};
+	int value = -2;
+	if (!text || sscanf(text, "%15s %d", name, &value) < 1)
+		return -1;
+	EnsureLock();
+	EnterCriticalSection(&gOverlayLock);
+	LoadDisplay();
+	int* field = strcmp(name, "mode") == 0 ? &gMode : strcmp(name, "left") == 0 ? &gPanelLeft :
+		strcmp(name, "multi") == 0 ? &gMulti : strcmp(name, "a") == 0 ? &gMultiA : strcmp(name, "b") == 0 ? &gMultiB :
+		strcmp(name, "back") == 0 ? &gBackGrey : nullptr;
+	float result = -1;
+	if (field) {
+		const bool view = field == &gMultiA || field == &gMultiB;
+		if (value == -1)
+			*field = view ? (*field + 1) % 6 : !*field;
+		else if (value >= 0)
+			*field = view ? value % 6 : field == &gBackGrey ? std::min(value, 255) : value != 0;
+		if (value != -2) {
+			SaveDisplay();
+			gRedrawPending = true;
+			if (gMode == 1)
+				gAdjust = false;  // Adjust Image works on the Classic view
+		}
+		result = static_cast<float>(*field);
+	}
+	LeaveCriticalSection(&gOverlayLock);
+	if (gOverlayWnd)
+		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	return result;
+}
+
 // text: "1" turns Adjust Image on, "0" off (keeping the image's size and
 // place for the showing view). Returns 1, 0 if no image is showing, -1 if
 // the overlay is not on.
@@ -3678,7 +3885,9 @@ ZFUNC RSAdjust(char* text, double, char*, int, char*, int, char**)
 	EnsureLock();
 	EnterCriticalSection(&gOverlayLock);
 	float result = 1;
-	if (on && (gActiveView < 0 || gImgW <= 0)) {
+	if (on && gMode == 1) {
+		result = -2;
+	} else if (on && (gActiveView < 0 || gImgW <= 0)) {
 		result = 0;
 	} else {
 		if (!on && gAdjust)
