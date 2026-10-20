@@ -20,9 +20,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 86"]
+[VarDef, zrsBuild, "build 87"]
 [VarDef, zrsDll, "JRef_Data\JRef64.dll"]
-[VarDef, zrsDllBuild, 86]
+[VarDef, zrsDllBuild, 87]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -825,3 +825,7 @@
 	[Note, [StrMerge, "JRef ", zrsBuild, "\nDLL build ", zrsTick, " (needs ", zrsDllBuild, ")\n", [FileNameResolvePath, zrsDll]]]
 	, 0, 0.25
 ]
+
+// Loads the DLL now, so it watches ZBrush open and save projects (and opens
+// the JRef project that belongs to each) from the start.
+[FileExecute, zrsDll, "RSProject", "has"]

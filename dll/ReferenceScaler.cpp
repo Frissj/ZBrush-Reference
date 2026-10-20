@@ -9,6 +9,8 @@
 // Build (Linux, mingw-w64): see build.sh.
 
 #include <windows.h>
+#include <tlhelp32.h>
+#include <shlwapi.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <gdiplus.h>
@@ -205,7 +207,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 86;
+static const int kDllBuild = 87;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -4594,6 +4596,8 @@ static void AnchorSlot(int slot, const double* v)
 }
 
 static void SwitchProject(const std::wstring& dir);
+static void WriteLink(const std::wstring& zpr);
+static std::wstring gCurrentZpr;  // the ZBrush project last opened or saved
 
 // Without a project, the first image loaded starts one in a JRef folder next
 // to it. The image is copied into the project ("Front.png" ...) and stored
@@ -4667,21 +4671,328 @@ static void SwitchProject(const std::wstring& dir)
 	}
 	for (int i = 0; i < kViewSlots; ++i)
 		gViews[i] = View();
-	gViewsLoaded = false;
+	// No project (a ZBrush project without one): no views until an image is
+	// loaded, which starts one.
+	gViewsLoaded = dir.empty();
 	gDisplayLoaded = false;
 	LoadViews();
 	LoadDisplay();
 	BlankView();
+	// The ZBrush project open now belongs to this one.
+	if (!dir.empty() && !gCurrentZpr.empty())
+		WriteLink(gCurrentZpr);
+}
+
+// ---------------------------------------------------------------------------
+// ZBrush projects. ZBrush's own opens and saves of .zpr files are watched (its
+// imports of CreateFileW/A and CloseHandle are pointed here), so each ZBrush
+// project gets "<project>.jref" next to it naming its JRef folder (relative to
+// the project, and absolute): opening the project again, on this computer or
+// another, reopens its references. A .zpr read only in part (Lightbox
+// thumbnails) does not count; a project without a .jref has none.
+// ---------------------------------------------------------------------------
+static CRITICAL_SECTION gZprLock;
+static bool gZprReady = false;
+struct ZprFile {
+	HANDLE handle;
+	std::wstring path;
+	bool write;
+};
+static std::vector<ZprFile> gZprFiles;
+static volatile LONG gZprCount = 0;  // gZprFiles.size(), read without the lock
+typedef HANDLE(WINAPI* CreateFileWFn)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+typedef HANDLE(WINAPI* CreateFileAFn)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+typedef BOOL(WINAPI* CloseHandleFn)(HANDLE);
+static CreateFileWFn gRealCreateFileW = nullptr;
+static CreateFileAFn gRealCreateFileA = nullptr;
+static CloseHandleFn gRealCloseHandle = nullptr;
+typedef BOOL(WINAPI* MoveFileExWFn)(LPCWSTR, LPCWSTR, DWORD);
+static MoveFileExWFn gRealMoveFileExW = nullptr;
+
+static void ProjectLog(const char* what, const std::wstring& path)
+{
+	char utf8[MAX_PATH * 3] = {0};
+	WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr);
+	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu %s %s\n", GetTickCount(), what, utf8);
+		fclose(f);
+	}
+}
+
+static bool IsZpr(const std::wstring& path)
+{
+	return path.size() > 4 && _wcsicmp(path.c_str() + path.size() - 4, L".zpr") == 0;
+}
+
+static std::wstring LinkFor(const std::wstring& zpr)
+{
+	return zpr.substr(0, zpr.size() - 4) + L".jref";
+}
+
+static std::wstring FolderOf(const std::wstring& path)
+{
+	const size_t slash = path.find_last_of(L"\\/");
+	return slash == std::wstring::npos ? L"" : path.substr(0, slash + 1);
+}
+
+static bool IsFolder(const std::wstring& path)
+{
+	const DWORD attr = GetFileAttributesW(path.c_str());
+	return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static std::string Utf8(const std::wstring& w)
+{
+	char utf8[MAX_PATH * 3] = {0};
+	WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr);
+	return utf8;
+}
+
+// The JRef folder a link file names: relative to the link first (the
+// project moved with its references), then absolute. Empty if neither.
+static std::wstring ReadLink(const std::wstring& link)
+{
+	FILE* f = _wfopen(link.c_str(), L"rb");
+	if (!f)
+		return L"";
+	char lines[3][1024] = {{0}};
+	for (int i = 0; i < 3 && fgets(lines[i], sizeof(lines[i]), f); ++i) {
+		size_t n = strlen(lines[i]);
+		while (n && (lines[i][n - 1] == '\n' || lines[i][n - 1] == '\r'))
+			lines[i][--n] = 0;
+	}
+	fclose(f);
+	if (strcmp(lines[0], "JRef link") != 0)
+		return L"";
+	std::wstring dir = FolderOf(link) + Widen(lines[1]);
+	if (lines[1][0] && IsFolder(dir))
+		return dir.back() == L'\\' ? dir : dir + L'\\';
+	dir = Widen(lines[2]);
+	if (lines[2][0] && IsFolder(dir))
+		return dir.back() == L'\\' ? dir : dir + L'\\';
+	return L"";
+}
+
+static void WriteLink(const std::wstring& zpr)
+{
+	if (gProjectDir.empty())
+		return;
+	wchar_t rel[MAX_PATH] = {0};
+	const std::wstring from = FolderOf(zpr);
+	if (!PathRelativePathToW(rel, from.c_str(), FILE_ATTRIBUTE_DIRECTORY, gProjectDir.c_str(), FILE_ATTRIBUTE_DIRECTORY))
+		rel[0] = 0;
+	std::wstring r = rel;
+	if (r.size() > 1 && r[0] == L'.' && (r[1] == L'\\' || r[1] == L'/'))
+		r = r.substr(2);
+	while (!r.empty() && (r[0] == L'\\' || r[0] == L'/'))
+		r = r.substr(1);
+	if (FILE* f = _wfopen(LinkFor(zpr).c_str(), L"wb")) {
+		fprintf(f, "JRef link\n%s\n%s\n", Utf8(r).c_str(), Utf8(gProjectDir).c_str());
+		fclose(f);
+		ProjectLog("project linked to", zpr);
+	}
+}
+
+// ZBrush loaded (read in full) or saved a project.
+static void ZprDone(const std::wstring& zpr, bool write)
+{
+	EnsureLock();
+	EnterCriticalSection(&gOverlayLock);
+	gCurrentZpr = zpr;
+	if (write) {
+		WriteLink(zpr);
+	} else {
+		const std::wstring dir = ReadLink(LinkFor(zpr));
+		ProjectLog(dir.empty() ? "zbrush project opened, no JRef project:" : "zbrush project opened:", zpr);
+		if (!dir.empty() && _wcsicmp(dir.c_str(), gProjectDir.c_str()) != 0) {
+			SwitchProject(dir);
+		} else if (dir.empty() && !gProjectDir.empty()) {
+			// Another model: no references until one is loaded for it.
+			SwitchProject(L"");
+		}
+	}
+	LeaveCriticalSection(&gOverlayLock);
+	if (gOverlayWnd)
+		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+}
+
+static void TrackZpr(HANDLE h, const std::wstring& path, DWORD access, DWORD disposition)
+{
+	if (h == INVALID_HANDLE_VALUE || !IsZpr(path))
+		return;
+	const bool write = (access & (GENERIC_WRITE | FILE_WRITE_DATA)) != 0 || disposition == CREATE_ALWAYS || disposition == CREATE_NEW;
+	wchar_t full[MAX_PATH] = {0};
+	const std::wstring p = GetFullPathNameW(path.c_str(), MAX_PATH, full, nullptr) ? std::wstring(full) : path;
+	EnterCriticalSection(&gZprLock);
+	gZprFiles.push_back({h, p, write});
+	gZprCount = static_cast<LONG>(gZprFiles.size());
+	LeaveCriticalSection(&gZprLock);
+	ProjectLog(write ? "zpr opened for writing" : "zpr opened for reading", p);
+}
+
+static HANDLE WINAPI HookCreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition,
+	DWORD flags, HANDLE templ)
+{
+	const HANDLE h = gRealCreateFileW(name, access, share, sa, disposition, flags, templ);
+	if (name)
+		TrackZpr(h, name, access, disposition);
+	return h;
+}
+
+static HANDLE WINAPI HookCreateFileA(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition,
+	DWORD flags, HANDLE templ)
+{
+	const HANDLE h = gRealCreateFileA(name, access, share, sa, disposition, flags, templ);
+	if (name) {
+		wchar_t w[MAX_PATH] = {0};
+		MultiByteToWideChar(CP_ACP, 0, name, -1, w, MAX_PATH);
+		TrackZpr(h, w, access, disposition);
+	}
+	return h;
+}
+
+static BOOL WINAPI HookCloseHandle(HANDLE h)
+{
+	if (gZprCount == 0)
+		return gRealCloseHandle(h);
+	ZprFile done = {nullptr, L"", false};
+	bool found = false, full = false;
+	EnterCriticalSection(&gZprLock);
+	for (size_t i = 0; i < gZprFiles.size(); ++i)
+		if (gZprFiles[i].handle == h) {
+			done = gZprFiles[i];
+			gZprFiles.erase(gZprFiles.begin() + i);
+			gZprCount = static_cast<LONG>(gZprFiles.size());
+			found = true;
+			break;
+		}
+	LeaveCriticalSection(&gZprLock);
+	if (found && !done.write) {
+		// Read in full: the file position has reached its end.
+		LARGE_INTEGER size = {}, pos = {}, zero = {};
+		full = GetFileSizeEx(h, &size) && SetFilePointerEx(h, zero, &pos, FILE_CURRENT) && size.QuadPart > 0 &&
+			pos.QuadPart >= size.QuadPart * 9 / 10;
+		char what[96];
+		snprintf(what, sizeof(what), "zpr closed after reading %lld of %lld bytes:", static_cast<long long>(pos.QuadPart),
+			static_cast<long long>(size.QuadPart));
+		ProjectLog(what, done.path);
+	}
+	const BOOL result = gRealCloseHandle(h);
+	if (found && (done.write || full))
+		ZprDone(done.path, done.write);
+	return result;
+}
+
+// A save written to a temporary file and then renamed to the .zpr.
+static BOOL WINAPI HookMoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags)
+{
+	const BOOL ok = gRealMoveFileExW(from, to, flags);
+	if (ok && to && IsZpr(to)) {
+		wchar_t full[MAX_PATH] = {0};
+		ProjectLog("zpr written by renaming to", to);
+		ZprDone(GetFullPathNameW(to, MAX_PATH, full, nullptr) ? std::wstring(full) : std::wstring(to), true);
+	}
+	return ok;
+}
+
+static BOOL WINAPI HookMoveFileW(LPCWSTR from, LPCWSTR to)
+{
+	return HookMoveFileExW(from, to, MOVEFILE_COPY_ALLOWED);
+}
+
+// Points every module's imports of CreateFileW/A and CloseHandle (from
+// kernel32 or kernelbase) at the hooks, except system modules other than
+// the C runtimes ZBrush may read files through.
+static void PatchImports(HMODULE module, const void* const* from, const void* const* to, int count)
+{
+	BYTE* base = reinterpret_cast<BYTE*>(module);
+	const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+		return;
+	const IMAGE_NT_HEADERS* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+	const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	if (!dir.VirtualAddress || !dir.Size)
+		return;
+	for (const IMAGE_IMPORT_DESCRIPTOR* d = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); d->Name; ++d) {
+		for (IMAGE_THUNK_DATA* t = reinterpret_cast<IMAGE_THUNK_DATA*>(base + d->FirstThunk); t->u1.Function; ++t) {
+			for (int i = 0; i < count; ++i) {
+				if (!from[i] || reinterpret_cast<const void*>(t->u1.Function) != from[i])
+					continue;
+				DWORD old;
+				if (VirtualProtect(&t->u1.Function, sizeof(t->u1.Function), PAGE_READWRITE, &old)) {
+					t->u1.Function = reinterpret_cast<ULONG_PTR>(to[i]);
+					VirtualProtect(&t->u1.Function, sizeof(t->u1.Function), old, &old);
+				}
+			}
+		}
+	}
+}
+
+static void InstallZprHooks()
+{
+	if (gZprReady)
+		return;
+	gZprReady = true;
+	InitializeCriticalSection(&gZprLock);
+	HMODULE k32 = GetModuleHandleW(L"kernel32.dll"), kb = GetModuleHandleW(L"kernelbase.dll");
+	gRealCreateFileW = reinterpret_cast<CreateFileWFn>(GetProcAddress(k32, "CreateFileW"));
+	gRealCreateFileA = reinterpret_cast<CreateFileAFn>(GetProcAddress(k32, "CreateFileA"));
+	gRealCloseHandle = reinterpret_cast<CloseHandleFn>(GetProcAddress(k32, "CloseHandle"));
+	gRealMoveFileExW = reinterpret_cast<MoveFileExWFn>(GetProcAddress(k32, "MoveFileExW"));
+	if (!gRealCreateFileW || !gRealCreateFileA || !gRealCloseHandle || !gRealMoveFileExW)
+		return;
+	auto at = [](HMODULE m, const char* name) { return m ? reinterpret_cast<const void*>(GetProcAddress(m, name)) : nullptr; };
+	const void* from[10] = {at(k32, "CreateFileW"), at(k32, "CreateFileA"), at(k32, "CloseHandle"), at(k32, "MoveFileExW"),
+		at(k32, "MoveFileW"), at(kb, "CreateFileW"), at(kb, "CreateFileA"), at(kb, "CloseHandle"), at(kb, "MoveFileExW"),
+		at(kb, "MoveFileW")};
+	const void* to[10] = {reinterpret_cast<const void*>(&HookCreateFileW), reinterpret_cast<const void*>(&HookCreateFileA),
+		reinterpret_cast<const void*>(&HookCloseHandle), reinterpret_cast<const void*>(&HookMoveFileExW),
+		reinterpret_cast<const void*>(&HookMoveFileW), reinterpret_cast<const void*>(&HookCreateFileW),
+		reinterpret_cast<const void*>(&HookCreateFileA), reinterpret_cast<const void*>(&HookCloseHandle),
+		reinterpret_cast<const void*>(&HookMoveFileExW), reinterpret_cast<const void*>(&HookMoveFileW)};
+	wchar_t sys[MAX_PATH] = {0};
+	GetWindowsDirectoryW(sys, MAX_PATH);
+	const size_t sysLen = wcslen(sys);
+	HMODULE self = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		reinterpret_cast<LPCWSTR>(&InstallZprHooks), &self);
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+	if (snap == INVALID_HANDLE_VALUE)
+		return;
+	MODULEENTRY32W me = {sizeof(me)};
+	int patched = 0;
+	for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me)) {
+		if (me.hModule == self)
+			continue;
+		const bool system = sysLen && _wcsnicmp(me.szExePath, sys, sysLen) == 0;
+		const bool runtime = _wcsicmp(me.szModule, L"ucrtbase.dll") == 0 || _wcsicmp(me.szModule, L"msvcrt.dll") == 0 ||
+			_wcsnicmp(me.szModule, L"msvcp", 5) == 0;
+		if (system && !runtime)
+			continue;
+		PatchImports(me.hModule, from, to, 10);
+		++patched;
+	}
+	CloseHandle(snap);
+	char what[64];
+	snprintf(what, sizeof(what), "watching ZBrush's project files (%d modules), window:", patched);
+	HWND zb = nullptr;
+	EnumWindows(FindZBrushWindow, reinterpret_cast<LPARAM>(&zb));
+	wchar_t title[512] = {0};
+	if (zb)
+		GetWindowTextW(zb, title, 512);
+	ProjectLog(what, title);
 }
 
 // text: "open path", path being a project's project.jref (or any file in its
-// folder): makes it the project. "has" returns 1 if a project is open.
-// Returns 1, or -1 if the folder does not exist.
+// folder, or a ZBrush project's .jref link): makes it the project. "has"
+// returns 1 if a project is open. Returns 1, or -1 if the folder does not
+// exist.
 ZFUNC RSProject(char* text, double, char*, int, char*, int, char**)
 {
 	if (!text)
 		return -1;
 	EnsureLock();
+	InstallZprHooks();
 	if (strncmp(text, "has", 3) == 0) {
 		ProjectFolder();
 		return gProjectDir.empty() ? 0 : 1;
@@ -4698,8 +5009,9 @@ ZFUNC RSProject(char* text, double, char*, int, char*, int, char**)
 	if (attr == INVALID_FILE_ATTRIBUTES)
 		return -1;
 	if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+		const std::wstring linked = ReadLink(path);
 		const size_t slash = path.find_last_of(L'\\');
-		path = slash == std::wstring::npos ? L"" : path.substr(0, slash);
+		path = !linked.empty() ? linked : slash == std::wstring::npos ? L"" : path.substr(0, slash);
 	}
 	if (path.empty())
 		return -1;
