@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 82;
+static const int kDllBuild = 83;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -697,6 +697,10 @@ static bool ZBrushInFront()
 // does not see them): drag inside it to move it, drag a corner (or drag with
 // the right button) to scale it about its centre.
 static volatile bool gAdjust = false;
+// Mouse buttons held, and when one last went down or up (the camera only
+// turns while one is held, or in the snap animation just after).
+static volatile LONG gButtonsDown = 0;
+static volatile DWORD gLastButtonAt = 0;
 static volatile bool gAdjustEscape = false;  // Esc pressed: the overlay turns Adjust Image off
 static bool AdjustMouse(WPARAM wp, POINT pt);
 
@@ -706,6 +710,13 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 		return CallNextHookEx(gMouseHook, code, wp, lp);
 	const MSLLHOOKSTRUCT* m = reinterpret_cast<const MSLLHOOKSTRUCT*>(lp);
 	++gHookEvents;
+	if (wp != WM_MOUSEMOVE && wp != WM_MOUSEWHEEL && wp != WM_MOUSEHWHEEL) {
+		gLastButtonAt = GetTickCount();
+		if (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)
+			++gButtonsDown;
+		else if ((wp == WM_LBUTTONUP || wp == WM_RBUTTONUP || wp == WM_MBUTTONUP) && gButtonsDown > 0)
+			--gButtonsDown;
+	}
 	const bool alt = gAltDown, ctrl = gCtrlDown;
 	EnterCriticalSection(&gOverlayLock);
 	if (gAdjust) {
@@ -2350,7 +2361,7 @@ static std::wstring ViewsPath()
 static std::wstring MaskPath(int i)
 {
 	wchar_t name[32];
-	swprintf(name, 32, L"view%d_mask.bin", i);
+	swprintf(name, 32, L"view%d_outline.bin", i);  // (view%d_mask.bin: before build 83, with the interface in it)
 	return DllFolder() + name;
 }
 
@@ -2926,7 +2937,10 @@ static void RunViewJob(const OverlayState& st)
 	gViewShiftX = fx * v.cell;
 	gViewShiftY = fy * v.cell;
 	EnterCriticalSection(&gOverlayLock);
-	if (best >= 0.6) {
+	if (abs(bx) >= rx - 2 || abs(by) >= ry - 2) {
+		// At the end of the search: no real match.
+		ViewLog("match at the edge of the search, not moved", slot);
+	} else if (best >= 0.6) {
 		gOverlay.offX = gViewShiftX;
 		gOverlay.offY = gViewShiftY;
 		ViewLog("matched", slot);
@@ -3299,19 +3313,35 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 {
 	std::vector<int> codes;
 	bool any = false;
-	for (RotCand& c : gRotCands) {
+	// The camera turns only while a mouse button is held or in the snap
+	// animation just after: a copy that changes with the buttons up and idle
+	// follows something else (the brush under the cursor) and is dropped.
+	const bool idle = gButtonsDown == 0 && !gGesture.active && GetTickCount() - gLastButtonAt > 2000;
+	for (size_t ci = 0; ci < gRotCands.size(); ++ci) {
+		RotCand& c = gRotCands[ci];
 		double m[9];
 		if (!RotRead(c, m))
 			continue;
-		bool moved = false;
+		bool moved = false, step = false;
 		for (int i = 0; i < 9; ++i) {
 			// Changes this small are ZBrush easing the end of a snap: the
 			// view counts as still.
 			if (fabs(m[i] - c.m[i]) > 5e-4)
-				any = true;
+				step = true;
 			if (fabs(m[i] - c.settled[i]) > 1e-4)
 				moved = true;
 		}
+		if (step && idle) {
+			if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				fprintf(f, "%lu rotation copy %zu changed with the mouse buttons up: not the camera, dropped (%zu left)\n",
+					GetTickCount(), ci, gRotCands.size() - 1);
+				fclose(f);
+			}
+			gRotCands.erase(gRotCands.begin() + ci);
+			--ci;
+			continue;
+		}
+		any = any || step;
 		memcpy(c.m, m, sizeof(m));
 		if (sinceSettled && !moved)
 			continue;
