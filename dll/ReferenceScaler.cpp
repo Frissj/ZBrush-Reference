@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 73;
+static const int kDllBuild = 74;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -2680,6 +2680,16 @@ static void RotFollow()
 	LeaveCriticalSection(&gOverlayLock);
 }
 
+// Each view's rotation as ZBrush keeps it (RotCode of the matrix). Front
+// (identity), Left and Right were read from ZBrush (nav_log: Left
+// [0 0 -1; 0 1 0; 1 0 0]); Back, Top and Bottom follow from them.
+static const int kViewCodes[6] = {16484, 3360, 9202, 10642, 11786, 7898};  // Front Back Right Left Top Bottom
+
+static bool AtView(const std::vector<int>& codes, int slot)
+{
+	return slot >= 0 && slot < 6 && std::find(codes.begin(), codes.end(), kViewCodes[slot]) != codes.end();
+}
+
 static void AddCodes(View& v, const std::vector<int>& codes)
 {
 	for (int c : codes)
@@ -2735,18 +2745,10 @@ static int ViewTickCodes(const std::vector<int>& codes)
 		gViewAway = true;  // turning freely leaves the reference as it is
 		return -1;
 	}
-	int slot = -1, best = 0;
-	for (int i = 0; i < kDefaultView; ++i) {
-		if (!gViews[i].used)
-			continue;
-		int shared = 0;
-		for (int c : codes)
-			shared += std::find(gViews[i].codes.begin(), gViews[i].codes.end(), c) != gViews[i].codes.end();
-		if (shared > best) {
-			best = shared;
+	int slot = -1;
+	for (int i = 0; i < kDefaultView; ++i)
+		if (gViews[i].used && AtView(codes, i))
 			slot = i;
-		}
-	}
 	int result = slot;
 	if (slot < 0) {
 		gViewAway = true;
@@ -3554,6 +3556,32 @@ ZFUNC RSViewTick(char* text, double, char*, int, char*, int, char**)
 	return static_cast<float>(result);
 }
 
+// text: "peek" or "go". The view snapped to now, from the rotation read
+// from memory: "peek" returns its slot if it has an image (else -1), "go"
+// shows it as RSViewTick does. -3 if the rotation was not found.
+ZFUNC RSViewNow(char* text, double, char*, int, char*, int, char**)
+{
+	if (!gRotLocked)
+		return -3;
+	EnsureLock();
+	EnterCriticalSection(&gOverlayLock);
+	LoadViews();
+	const std::vector<int> codes = RotCodes();
+	int result = -1;
+	if (text && strcmp(text, "go") == 0) {
+		gViewAway = true;
+		result = ViewTickCodes(codes);
+		for (RotCand& c : gRotCands)
+			memcpy(c.settled, c.m, sizeof(c.m));
+	} else {
+		for (int i = 0; i < kDefaultView; ++i)
+			if (gViews[i].used && AtView(codes, i))
+				result = i;
+	}
+	LeaveCriticalSection(&gOverlayLock);
+	return static_cast<float>(result);
+}
+
 // text: "rx ry rz". 1 if every angle is a multiple of 90 degrees (a
 // snapped view), else 0.
 ZFUNC RSViewSnapped(char* text, double, char*, int, char*, int, char**)
@@ -3624,7 +3652,8 @@ static void AnchorSlot(int slot, const double* v)
 
 // text: the image's full path, for the slot given to RSViewPrep. The view
 // is anchored at the current zoom and position and shown, fitted to the
-// document. Returns 1, -1 if the image cannot be read, -2 without RSViewPrep.
+// document. Returns 1 (shown), 2 (kept: not snapped to that view now), -1 if
+// the image cannot be read, -2 without RSViewPrep.
 ZFUNC RSViewImage(char* text, double, char*, int, char*, int, char**)
 {
 	if (gPrepSlot < 0)
@@ -3634,17 +3663,34 @@ ZFUNC RSViewImage(char* text, double, char*, int, char*, int, char**)
 	EnsureLock();
 	EnterCriticalSection(&gOverlayLock);
 	LoadViews();
-	gViews[gPrepSlot].path = text;
-	gViews[gPrepSlot].imgSX = gViews[gPrepSlot].imgSY = 1;
-	gViews[gPrepSlot].codes.clear();
-	gViews[gPrepSlot].imgX = gViews[gPrepSlot].imgY = 0;
-	AnchorSlot(gPrepSlot, gPrep);
+	View& w = gViews[gPrepSlot];
+	w.path = text;
+	w.imgSX = w.imgSY = 1;
+	w.imgX = w.imgY = 0;
+	// Shown (and the model's outline recorded) now only when snapped to that
+	// view; otherwise kept until it is snapped to.
+	const bool here = !gRotLocked || AtView(CurrentRotCodes(), gPrepSlot);
+	float result = 1;
+	if (here) {
+		AnchorSlot(gPrepSlot, gPrep);
+	} else {
+		w.used = true;
+		w.scale = gPrep[0];
+		w.ax = gPrep[1];
+		w.ay = gPrep[2];
+		w.mask.clear();
+		w.gw = 0;
+		SaveMask(gPrepSlot);
+		SaveViews();
+		ViewLog("image stored for later", gPrepSlot);
+		result = 2;
+	}
 	gPrepSlot = -1;
 	LeaveCriticalSection(&gOverlayLock);
 	if (gOverlayWnd)
 		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
 	WaitViewRecord();
-	return 1;
+	return result;
 }
 
 // text: "slot scale x y rx ry rz": Anchor pressed while a view is showing.
