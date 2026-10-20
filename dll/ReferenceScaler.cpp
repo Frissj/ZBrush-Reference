@@ -174,3 +174,46 @@ ZFUNC RSRender(char* text, double, char*, int, char*, int, char**)
 		return -4;
 	return 1;
 }
+
+// Settings snapshot, for comparing ZBrush state before and after another
+// plugin runs (which resets the script's variables). Values are kept in
+// snapshot.txt next to the DLL as "id value" lines.
+static std::wstring SnapshotPath()
+{
+	return DllFolder() + L"snapshot.txt";
+}
+
+// text: "clear" empties the snapshot; otherwise "id value" appends a value.
+ZFUNC RSPut(char* text, double, char*, int, char*, int, char**)
+{
+	if (!text)
+		return -1;
+	const bool clear = strcmp(text, "clear") == 0;
+	FILE* f = _wfopen(SnapshotPath().c_str(), clear ? L"wb" : L"ab");
+	if (!f)
+		return -2;
+	if (!clear)
+		fprintf(f, "%s\n", text);
+	fclose(f);
+	return 1;
+}
+
+// text: "id". Returns the last value stored for id, or -99999 if none.
+ZFUNC RSGet(char* text, double, char*, int, char*, int, char**)
+{
+	if (!text)
+		return -99999;
+	const int want = atoi(text);
+	FILE* f = _wfopen(SnapshotPath().c_str(), L"rb");
+	if (!f)
+		return -99999;
+	float result = -99999;
+	int id;
+	double value;
+	while (fscanf(f, "%d %lf", &id, &value) == 2) {
+		if (id == want)
+			result = static_cast<float>(value);
+	}
+	fclose(f);
+	return result;
+}
