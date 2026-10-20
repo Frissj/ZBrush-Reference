@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 69;
+static const int kDllBuild = 70;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -2352,6 +2352,216 @@ static void WaitViewRecord()
 }
 
 
+// ---------------------------------------------------------------------------
+// ZBrush's rotation, read from memory like the zoom and pan, so the DLL
+// sees snaps to a view itself (ZScript's Live loop does not keep running).
+// The Overlay press sets two rotated test views and back (RSRotProbe); the
+// three angles as TransformGet reports them are searched for side by side,
+// as floats or doubles, in degrees or radians.
+// ---------------------------------------------------------------------------
+struct RotCand {
+	uintptr_t addr;
+	bool isDouble;
+	double unit;  // 1 for degrees, pi / 180 for radians
+	double last[3];
+	DWORD changedAt;
+};
+static std::vector<RotCand> gRotCands;
+static int gRotNarrowings = 0;
+static bool gRotLocked = false;
+static double gRotNow[3] = {0, 0, 0};
+static DWORD gRotChangedAt = 0;
+static bool gRotSettled = true;
+
+static bool RotMatch(double v, double deg, double unit)
+{
+	const double t = deg * unit;
+	return fabs(v - t) <= (0.0051 + fabs(deg) * 1e-5) * unit + 1e-6;
+}
+
+static bool RotRead(const RotCand& c, double out[3])
+{
+	unsigned char b[24];
+	const size_t n = c.isDouble ? 24 : 12;
+	SIZE_T got = 0;
+	if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(c.addr), b, n, &got) || got != n)
+		return false;
+	for (int i = 0; i < 3; ++i) {
+		double v;
+		if (c.isDouble) {
+			memcpy(&v, b + i * 8, 8);
+		} else {
+			float f;
+			memcpy(&f, b + i * 4, 4);
+			v = f;
+		}
+		if (v != v)
+			return false;
+		out[i] = v / c.unit;
+	}
+	return true;
+}
+
+static void RotScan(const double r[3])
+{
+	gRotCands.clear();
+	gRotNarrowings = 0;
+	const DWORD t0 = GetTickCount();
+	HMODULE self = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		reinterpret_cast<LPCWSTR>(&RotScan), &self);
+	const NT_TIB* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+	const uintptr_t stackLow = reinterpret_cast<uintptr_t>(tib->StackLimit) & ~static_cast<uintptr_t>(0xfffff);
+	const uintptr_t stackHigh = reinterpret_cast<uintptr_t>(tib->StackBase);
+	std::vector<unsigned char> buf(1 << 22);
+	const uintptr_t bufLo = reinterpret_cast<uintptr_t>(buf.data()), bufHi = bufLo + buf.size();
+	const double units[2] = {1.0, 3.14159265358979323846 / 180.0};
+	size_t scanned = 0;
+	MEMORY_BASIC_INFORMATION mbi;
+	uintptr_t addr = 0;
+	while (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == sizeof(mbi)) {
+		const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+		const uintptr_t next = base + mbi.RegionSize;
+		const DWORD prot = mbi.Protect & 0xff;
+		const bool writable = prot == PAGE_READWRITE || prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READWRITE;
+		if (mbi.State == MEM_COMMIT && writable && !(mbi.Protect & PAGE_GUARD) &&
+			(mbi.Type == MEM_PRIVATE || mbi.Type == MEM_IMAGE) && mbi.AllocationBase != self &&
+			!(stackLow < next && base < stackHigh) && !OwnThreadStack(base, next)) {
+			// Chunks overlap by 24 bytes so a triple across a boundary is found.
+			for (uintptr_t chunk = base; chunk < next; chunk += buf.size() - 24) {
+				const size_t len = next - chunk < buf.size() ? next - chunk : buf.size();
+				SIZE_T got = 0;
+				if (chunk < bufHi && bufLo < chunk + len)
+					continue;
+				if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(chunk), buf.data(), len, &got))
+					continue;
+				scanned += got;
+				for (size_t i = 0; i + 12 <= got; i += 4)
+					for (double u : units) {
+						float f[3];
+						memcpy(f, &buf[i], 12);
+						if (RotMatch(f[0], r[0], u) && RotMatch(f[1], r[1], u) && RotMatch(f[2], r[2], u) && gRotCands.size() < 100000)
+							gRotCands.push_back({chunk + i, false, u, {r[0], r[1], r[2]}, 0});
+						if (i % 8 == 0 && i + 24 <= got) {
+							double d[3];
+							memcpy(d, &buf[i], 24);
+							if (RotMatch(d[0], r[0], u) && RotMatch(d[1], r[1], u) && RotMatch(d[2], r[2], u) && gRotCands.size() < 100000)
+								gRotCands.push_back({chunk + i, true, u, {r[0], r[1], r[2]}, 0});
+						}
+					}
+				if (len < buf.size())
+					break;
+			}
+		}
+		if (next <= addr)
+			break;
+		addr = next;
+	}
+	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu rotation scan for %.3f %.3f %.3f: %zu MB in %lu ms, %zu found\n", GetTickCount(), r[0], r[1], r[2],
+			scanned >> 20, GetTickCount() - t0, gRotCands.size());
+		fclose(f);
+	}
+}
+
+static void RotNarrow(const double r[3])
+{
+	std::vector<RotCand> keep;
+	for (const RotCand& c : gRotCands) {
+		double v[3];
+		if (RotRead(c, v) && fabs(v[0] - r[0]) < 0.0052 + fabs(r[0]) * 1e-5 && fabs(v[1] - r[1]) < 0.0052 + fabs(r[1]) * 1e-5 &&
+				fabs(v[2] - r[2]) < 0.0052 + fabs(r[2]) * 1e-5) {
+			keep.push_back(c);
+			memcpy(keep.back().last, v, sizeof(v));
+		}
+	}
+	gRotCands.swap(keep);
+	++gRotNarrowings;
+}
+
+// The rotation now: of the candidates, the one that changed last. Returns
+// false if none can be read.
+static bool RotValue(double out[3])
+{
+	const DWORD now = GetTickCount();
+	int best = -1;
+	for (size_t i = 0; i < gRotCands.size(); ++i) {
+		RotCand& c = gRotCands[i];
+		double v[3];
+		if (!RotRead(c, v))
+			continue;
+		if (v[0] != c.last[0] || v[1] != c.last[1] || v[2] != c.last[2]) {
+			memcpy(c.last, v, sizeof(v));
+			c.changedAt = now;
+		}
+		if (best < 0 || static_cast<int>(c.changedAt - gRotCands[best].changedAt) > 0)
+			best = static_cast<int>(i);
+	}
+	if (best < 0)
+		return false;
+	memcpy(out, gRotCands[best].last, 3 * sizeof(double));
+	return true;
+}
+
+static int ViewTickLocked(double rx, double ry, double rz);
+
+// Each overlay frame: when the rotation has changed and then held still for
+// 200 ms (a snap's animation has finished), the view is looked up as Live
+// used to (RSViewTick).
+static void RotFollow()
+{
+	if (!gRotLocked)
+		return;
+	EnterCriticalSection(&gOverlayLock);
+	double r[3];
+	if (RotValue(r)) {
+		const DWORD now = GetTickCount();
+		if (r[0] != gRotNow[0] || r[1] != gRotNow[1] || r[2] != gRotNow[2]) {
+			memcpy(gRotNow, r, sizeof(r));
+			gRotChangedAt = now;
+			gRotSettled = false;
+		} else if (!gRotSettled && !gGesture.active && now - gRotChangedAt >= 200) {
+			gRotSettled = true;
+			const int result = ViewTickLocked(r[0], r[1], r[2]);
+			if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				fprintf(f, "%lu rotation settled at %.3f %.3f %.3f: view %d\n", now, r[0], r[1], r[2], result);
+				fclose(f);
+			}
+		}
+	}
+	LeaveCriticalSection(&gOverlayLock);
+}
+
+// The view's rotation, from Live or the rotation read from memory. When the
+// view is snapped to a slot's rotation after being away from it (or to
+// another slot), that slot is shown and the model's silhouette matched.
+// Snapped to a view without an image (while some view has one), the
+// reference is cleared. Returns 10 + slot when it activated one, the slot if
+// it was already showing, -2 when it cleared, or -1. Caller holds the lock.
+static int ViewTickLocked(double rx, double ry, double rz)
+{
+	const int slot = MatchView(rx, ry, rz);
+	int result = slot;
+	if (slot < 0) {
+		gViewAway = true;
+		// Turning freely leaves the reference as it is.
+		bool snapped = true;
+		for (double a : {rx, ry, rz})
+			if (AngleDiff(a, 90 * floor(a / 90 + 0.5)) > 0.5)
+				snapped = false;
+		if (snapped && AnyViewImage() && gActiveView != -2) {
+			BlankView();
+			result = -2;
+		}
+	} else if (slot != gActiveView || gViewAway) {
+		ActivateView(slot);
+		result = 10 + slot;
+	}
+	if ((result >= 10 || result == -2) && gOverlayWnd)
+		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	return result;
+}
+
 // One pass of the overlay loop: rebuilds the reference if its layout
 // changed, captures, composites and presents. Returns false when idle.
 static bool OverlayStep(HWND wnd)
@@ -2362,6 +2572,7 @@ static bool OverlayStep(HWND wnd)
 	static int fpsFrames = 0;
 	ClassifyGesture();
 	MemFollow();
+	RotFollow();
 	EnterCriticalSection(&gOverlayLock);
 	const OverlayState st = gOverlay;
 	const bool redraw = gRedrawPending;
@@ -2922,6 +3133,7 @@ ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 	case 36: return static_cast<float>(gViewShiftY);
 	case 37: return static_cast<float>(gActiveView);
 	case 38: return gAdjust ? 1 : 0;
+	case 39: return gRotLocked ? static_cast<float>(gRotCands.size()) : 0;
 	case 27: case 28: case 29: case 30: case 31: return static_cast<float>(gScanStats[which - 27]);
 	case 18: return static_cast<float>(gGesture.mode + 10 * gGesture.scaleSegments + 100 * gGesture.active);
 	}
@@ -2943,6 +3155,14 @@ ZFUNC RSOverlaySet(char* text, double, char*, int, char*, int, char**)
 	if (!gOverlayWnd)
 		return -2;
 	EnterCriticalSection(&gOverlayLock);
+	// The DLL switches views on its own, so the script's anchor sliders can
+	// be another view's: the showing view's anchor is the one that counts.
+	if (gActiveView >= 0 && gActiveView < kViewSlots && gViews[gActiveView].used && gViews[gActiveView].scale > 0) {
+		if (sx > 0)
+			r = sx / gViews[gActiveView].scale;
+		ax = gViews[gActiveView].ax;
+		ay = gViews[gActiveView].ay;
+	}
 	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
 		fprintf(f, "%lu set %.5f %.2f %.2f dragging %d unreported %d shown %.5f %.2f %.2f\n", GetTickCount(),
 			r, px, py, gGesture.active, gPending.done ? gPendingCount : 0, gOverlay.ratio, gOverlay.px, gOverlay.py);
@@ -3010,6 +3230,38 @@ ZFUNC RSMemProbe(char* text, double, char*, int, char*, int, char**)
 	const bool locked = gMemLocked;
 	LeaveCriticalSection(&gOverlayLock);
 	return locked ? 1 : 0;
+}
+
+// text: "start|next|last rx ry rz", the rotation TransformGet reports at
+// each of the Overlay press's test views. "start" searches memory for it,
+// the others keep the locations that changed to match. Returns how many
+// locations are left; after "last", 1 or more means the rotation is read.
+ZFUNC RSRotProbe(char* text, double, char*, int, char*, int, char**)
+{
+	char mode[16] = {0};
+	double r[3];
+	if (!text || sscanf(text, "%15s %lf %lf %lf", mode, &r[0], &r[1], &r[2]) != 4)
+		return -1;
+	EnsureLock();
+	EnterCriticalSection(&gOverlayLock);
+	if (strcmp(mode, "start") == 0) {
+		gRotLocked = false;
+		RotScan(r);
+	} else {
+		RotNarrow(r);
+	}
+	if (strcmp(mode, "last") == 0) {
+		gRotLocked = !gRotCands.empty() && gRotNarrowings >= 2;
+		memcpy(gRotNow, r, sizeof(r));
+		gRotSettled = true;
+	}
+	const size_t n = gRotCands.size();
+	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu rotation %s %.3f %.3f %.3f: %zu left, locked %d\n", GetTickCount(), mode, r[0], r[1], r[2], n, gRotLocked);
+		fclose(f);
+	}
+	LeaveCriticalSection(&gOverlayLock);
+	return static_cast<float>(n);
 }
 
 // Saves what the overlay last captured (snap_capture.png, the canvas as
@@ -3089,28 +3341,8 @@ ZFUNC RSViewTick(char* text, double, char*, int, char*, int, char**)
 		return -1;
 	EnsureLock();
 	EnterCriticalSection(&gOverlayLock);
-	const int slot = MatchView(rx, ry, rz);
-	int result = slot;
-	if (slot < 0) {
-		gViewAway = true;
-		// Snapped (every angle a multiple of 90) to a view with no image,
-		// while some view has one: clear the reference. Turning freely
-		// leaves it as it is.
-		bool snapped = true;
-		for (double a : {rx, ry, rz})
-			if (AngleDiff(a, 90 * floor(a / 90 + 0.5)) > 0.5)
-				snapped = false;
-		if (snapped && AnyViewImage() && gActiveView != -2) {
-			BlankView();
-			result = -2;
-		}
-	} else if (slot != gActiveView || gViewAway) {
-		ActivateView(slot);
-		result = 10 + slot;
-	}
+	const int result = ViewTickLocked(rx, ry, rz);
 	LeaveCriticalSection(&gOverlayLock);
-	if ((result >= 10 || result == -2) && gOverlayWnd)
-		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
 	return static_cast<float>(result);
 }
 
