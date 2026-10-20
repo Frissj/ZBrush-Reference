@@ -24,7 +24,7 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 43"]
+[VarDef, zrsBuild, "build 44"]
 [VarDef, zrsDll, "ReferenceScaler_Data\ReferenceScaler64.dll"]
 [VarDef, zrsLive, 0]
 [VarDef, zrsPx, 0]
@@ -94,25 +94,41 @@
 // not make it current; the newest texture is the last one), fills the canvas
 // with it and restores the model in Edit mode in front of it. Leaves a result
 // in zrsMsg; zrsResult is 1 on success.
+// While the overlay is showing, ZRSShow only moves the overlay and leaves the
+// canvas cleared. The Overlay button draws the reference on the canvas so the
+// DLL can find it on screen, then clears the canvas with a black frame.
+//
+// Imports the frame at zrsFile, selects it, fills the canvas with it and
+// puts the model back in Edit mode in front of it.
+[RoutineDef, ZRSFill,
+	[FileNameSetNext, [StrMerge, "!:", zrsFile]]
+	[IPress, Texture:Import]
+	[ISet, "Texture:Item Info", [IGetMax, "Texture:Item Info"]]
+	[TransformGet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
+	[IPress, Color:FillLayer]
+	[RoutineCall, ZRSRestore]
+]
+
 [RoutineDef, ZRSShow,
 	[VarSet, zrsResult, 0]
 	[If, [IGet, Transform:Edit] == 0,
 		[VarSet, zrsMsg, "Put the model in Edit mode first."]
 		,
-		[VarSet, zrsArgs, [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " ", zrsRatio, " ", zrsPx]]
-		[VarSet, zrsArgs, [StrMerge, zrsArgs, " ", zrsPy, " ", zrsAx, " ", zrsAy]]
-		[VarSet, zrsArgs, [StrMerge, zrsArgs, " frame0.png"]]
-		[VarSet, zrsResult, [FileExecute, zrsDll, "RSRender", zrsArgs]]
+		[If, [FileExecute, zrsDll, "RSOverlayInfo", "4"],
+			[VarSet, zrsResult, 1]
+			,
+			[VarSet, zrsArgs, [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " ", zrsRatio, " ", zrsPx]]
+			[VarSet, zrsArgs, [StrMerge, zrsArgs, " ", zrsPy, " ", zrsAx, " ", zrsAy]]
+			[VarSet, zrsArgs, [StrMerge, zrsArgs, " frame0.png"]]
+			[VarSet, zrsResult, [FileExecute, zrsDll, "RSRender", zrsArgs]]
+			[If, zrsResult == 1,
+				[VarSet, zrsFile, [FileNameResolvePath, "ReferenceScaler_Data\frame0.png"]]
+				[RoutineCall, ZRSFill]
+			]
+		]
 		[If, zrsResult != 1,
 			[VarSet, zrsMsg, [StrMerge, "Render failed (", zrsResult, "). -3 means no image: press Load Image.\nArgs: ", zrsArgs]]
 			,
-			[VarSet, zrsFile, [FileNameResolvePath, "ReferenceScaler_Data\frame0.png"]]
-			[FileNameSetNext, [StrMerge, "!:", zrsFile]]
-			[IPress, Texture:Import]
-			[ISet, "Texture:Item Info", [IGetMax, "Texture:Item Info"]]
-			[TransformGet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
-			[IPress, Color:FillLayer]
-			[RoutineCall, ZRSRestore]
 			[VarSet, zrsLastRatio, zrsRatio]
 			[VarSet, zrsLastPx, zrsPx]
 			[VarSet, zrsLastPy, zrsPy]
@@ -126,14 +142,14 @@
 // Works out the ratio and positions from the current model and the anchor
 // sliders, then shows the frame. Leaves a result in zrsMsg.
 [RoutineDef, ZRSUpdate,
-	[If, [IGet, "ZPlugin:Reference Scaler b43:Anchor Scale"] <= 0,
+	[If, [IGet, "ZPlugin:Reference Scaler b44:Anchor Scale"] <= 0,
 		[VarSet, zrsMsg, "Not anchored: line the model up with the image and press Anchor first."]
 		[VarSet, zrsResult, 0]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b43:Anchor Scale"]]
-		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b43:Anchor X"]]
-		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b43:Anchor Y"]]
+		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b44:Anchor Scale"]]
+		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b44:Anchor X"]]
+		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b44:Anchor Y"]]
 		[RoutineCall, ZRSShow]
 	]
 ]
@@ -148,15 +164,15 @@
 			[VarSet, zrsTick, zrsTick + 1]
 			[If, [IGet, Transform:Edit],
 				[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b43:Anchor Scale"]]
+				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b44:Anchor Scale"]]
 				[If, ABS(zrsRatio - zrsLastRatio) > 0.002 || ABS(zrsPx - zrsLastPx) > 0.5 || ABS(zrsPy - zrsLastPy) > 0.5,
 					[RoutineCall, ZRSUpdate]
-					[If, [IGet, "ZPlugin:Reference Scaler b43:Diag"] || zrsResult != 1, [Note, [StrMerge, "Live tick ", zrsTick, ": redrew, result ", zrsResult, "\n", zrsMsg], , 1]]
+					[If, [IGet, "ZPlugin:Reference Scaler b44:Diag"] || zrsResult != 1, [Note, [StrMerge, "Live tick ", zrsTick, ": redrew, result ", zrsResult, "\n", zrsMsg], , 1]]
 					,
-					[If, [IGet, "ZPlugin:Reference Scaler b43:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": no change (ratio ", zrsRatio, ")"], , 0.5]]
+					[If, [IGet, "ZPlugin:Reference Scaler b44:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": no change (ratio ", zrsRatio, ")"], , 0.5]]
 				]
 				,
-				[If, [IGet, "ZPlugin:Reference Scaler b43:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": model not in Edit mode"], , 0.5]]
+				[If, [IGet, "ZPlugin:Reference Scaler b44:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": model not in Edit mode"], , 0.5]]
 			]
 			[SleepAgain, 0.5, 9]
 		]
@@ -169,7 +185,7 @@
 // image must have been shown (Load Image or Sync) first. It starts with the
 // last drawn frame's zoom and position.
 [RoutineDef, ZRSOverlayOn,
-	[VarSet, zrsArgs, [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " ", [IGet, "ZPlugin:Reference Scaler b43:Overlay Opacity"] * 2.55]]
+	[VarSet, zrsArgs, [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " ", [IGet, "ZPlugin:Reference Scaler b44:Overlay Opacity"] * 2.55]]
 	[VarSet, zrsResult, [FileExecute, zrsDll, "RSOverlayStart", zrsArgs]]
 	[VarSet, zrsOx, [FileExecute, zrsDll, "RSOverlayInfo", "0"]]
 	[VarSet, zrsOy, [FileExecute, zrsDll, "RSOverlayInfo", "1"]]
@@ -180,9 +196,9 @@
 // ---------------------------------------------------------------------------
 // Interface
 // ---------------------------------------------------------------------------
-[ISubPalette, "ZPlugin:Reference Scaler b43"]
+[ISubPalette, "ZPlugin:Reference Scaler b44"]
 
-[IButton, "ZPlugin:Reference Scaler b43:Load Image",
+[IButton, "ZPlugin:Reference Scaler b44:Load Image",
 	"Choose the reference image and show it behind the model, fitted to the document.",
 	[VarSet, zrsFile, [FileNameAsk, "Image (*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd)|*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd||", , "Choose reference image"]]
 	[If, [StrLength, zrsFile] == 0,
@@ -200,35 +216,35 @@
 	, 0, 1
 ]
 
-[IButton, "ZPlugin:Reference Scaler b43:Anchor",
+[IButton, "ZPlugin:Reference Scaler b44:Anchor",
 	"With the model lined up with the image, press to record this zoom and position as the 1:1 match.",
 	[If, [IGet, Transform:Edit] == 0,
 		[Note, "Put the model in Edit mode first."]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[ISet, "ZPlugin:Reference Scaler b43:Anchor Scale", zrsSx]
-		[ISet, "ZPlugin:Reference Scaler b43:Anchor X", zrsPx]
-		[ISet, "ZPlugin:Reference Scaler b43:Anchor Y", zrsPy]
+		[ISet, "ZPlugin:Reference Scaler b44:Anchor Scale", zrsSx]
+		[ISet, "ZPlugin:Reference Scaler b44:Anchor X", zrsPx]
+		[ISet, "ZPlugin:Reference Scaler b44:Anchor Y", zrsPy]
 		[Note, [StrMerge, "Anchored: model scale ", zrsSx, ", position ", zrsPx, ", ", zrsPy]]
 	]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b43:Sync",
+[IButton, "ZPlugin:Reference Scaler b44:Sync",
 	"Redraw the reference for the current zoom and position once.",
 	[RoutineCall, ZRSUpdate]
 	[If, zrsResult != 1, [Note, zrsMsg], [Note, [StrMerge, "Sync: ", zrsMsg], , 1]]
 	, 0, 0.5
 ]
 
-[ISwitch, "ZPlugin:Reference Scaler b43:Live", 0,
+[ISwitch, "ZPlugin:Reference Scaler b44:Live", 0,
 	"Keep redrawing the reference as the camera zooms and pans.",
 	[VarSet, zrsLive, 1]
 	[RoutineCall, ZRSUpdate]
 	[If, zrsResult != 1,
 		[Note, [StrMerge, "Live could not start: ", zrsMsg]]
 		[VarSet, zrsLive, 0]
-		[ISet, "ZPlugin:Reference Scaler b43:Live", 0]
+		[ISet, "ZPlugin:Reference Scaler b44:Live", 0]
 		,
 		[VarSet, zrsTick, 0]
 		[Note, "Live on: zoom or pan, and the reference follows when you release the mouse.", , 2]
@@ -240,7 +256,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b43:Reset",
+[IButton, "ZPlugin:Reference Scaler b44:Reset",
 	"Show the reference fitted to the document again, unscaled.",
 	[RoutineCall, ZRSBase]
 	[RoutineCall, ZRSShow]
@@ -248,52 +264,73 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b43:Overlay",
-	"Stage 1 test: show the reference in a click-through window over the canvas (it covers the model for now). Press again to find the canvas again.",
-	[RoutineCall, ZRSOverlayOn]
-	[If, zrsResult > 0,
-		[Note, [StrMerge, "Overlay on: found the canvas at ", zrsOx, ", ", zrsOy, ", ", zrsZoom, " screen px per document px (", zrsTick, "% matched)"]]
+[IButton, "ZPlugin:Reference Scaler b44:Overlay",
+	"Stage 1 test: show the reference only in a click-through window over the canvas (it covers the model for now). Press again to find the canvas again.",
+	[FileExecute, zrsDll, "RSOverlayStop"]
+	[If, [IGet, "ZPlugin:Reference Scaler b44:Anchor Scale"] > 0,
+		[RoutineCall, ZRSUpdate]
 		,
-		[VarSet, zrsMsg, "-3: no frame drawn yet, press Load Image or Sync first.\n-4: screen capture failed.\n-5: the image was not found on screen."]
-		[Note, [StrMerge, "Overlay failed (", zrsResult, "). Best match ", zrsTick, "% at ", zrsOx, ", ", zrsOy, "\n", zrsMsg]]
+		[RoutineCall, ZRSBase]
+		[RoutineCall, ZRSShow]
+	]
+	[If, zrsResult != 1,
+		[Note, zrsMsg]
+		,
+		[RoutineCall, ZRSOverlayOn]
+		[If, zrsResult > 0,
+			[FileExecute, zrsDll, "RSBlank", [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " blank.png"]]
+			[VarSet, zrsFile, [FileNameResolvePath, "ReferenceScaler_Data\blank.png"]]
+			[RoutineCall, ZRSFill]
+			[Note, [StrMerge, "Overlay on: found the canvas at ", zrsOx, ", ", zrsOy, ", ", zrsZoom, " screen px per document px (", zrsTick, "% matched)"]]
+			,
+			[VarSet, zrsMsg, "-3: no frame drawn yet, press Load Image or Sync first.\n-4: screen capture failed.\n-5: the image was not found on screen."]
+			[Note, [StrMerge, "Overlay failed (", zrsResult, "). Best match ", zrsTick, "% at ", zrsOx, ", ", zrsOy, "\n", zrsMsg]]
+		]
 	]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b43:Overlay Off",
-	"Hide the overlay window.",
-	[Note, [StrMerge, "Overlay off (", [FileExecute, zrsDll, "RSOverlayStop"], ")"], , 1]
+[IButton, "ZPlugin:Reference Scaler b44:Overlay Off",
+	"Hide the overlay window and draw the reference on the canvas again.",
+	[FileExecute, zrsDll, "RSOverlayStop"]
+	[If, [IGet, "ZPlugin:Reference Scaler b44:Anchor Scale"] > 0,
+		[RoutineCall, ZRSUpdate]
+		,
+		[RoutineCall, ZRSBase]
+		[RoutineCall, ZRSShow]
+	]
+	[Note, [StrMerge, "Overlay off. ", zrsMsg], , 1]
 	, 0, 0.5
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b43:Overlay Opacity", 50, 1, 0, 100,
+[ISlider, "ZPlugin:Reference Scaler b44:Overlay Opacity", 50, 1, 0, 100,
 	"Opacity of the overlay window, in percent. Press Overlay again after changing it.",
 	, 0, 0.5
 ]
 
-[ISwitch, "ZPlugin:Reference Scaler b43:Diag", 0,
+[ISwitch, "ZPlugin:Reference Scaler b44:Diag", 0,
 	"Show a short popup on every Live wake-up, not just on redraws.",
 	, , 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b43:About",
+[IButton, "ZPlugin:Reference Scaler b44:About",
 	"Show which build is running and whether the helper DLL loads.",
 	[Note, [StrMerge, "Reference Scaler ", zrsBuild, "\nDLL check: ", [FileExecute, zrsDll, "RSVersion"], " (1 = ok)"]]
 	, 0, 0.5
 ]
 
 // Anchor storage. Set by Anchor; shown so the anchored values are visible.
-[ISlider, "ZPlugin:Reference Scaler b43:Anchor Scale", 0, 0.001, 0, 100000,
+[ISlider, "ZPlugin:Reference Scaler b44:Anchor Scale", 0, 0.001, 0, 100000,
 	"Model scale recorded by Anchor.",
 	, 0, 1
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b43:Anchor X", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b44:Anchor X", 0, 0.001, -100000, 100000,
 	"Model horizontal position recorded by Anchor.",
 	, 0, 0.5
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b43:Anchor Y", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b44:Anchor Y", 0, 0.001, -100000, 100000,
 	"Model vertical position recorded by Anchor.",
 	, 0, 0.5
 ]

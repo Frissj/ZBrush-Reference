@@ -188,6 +188,24 @@ ZFUNC RSRender(char* text, double, char*, int, char*, int, char**)
 	return 1;
 }
 
+// text: "docW docH frameName". Writes an all-black document-sized frame, used
+// to clear the canvas while the overlay shows the reference. Returns 1, -1 for
+// bad arguments, -4 if the frame cannot be written.
+ZFUNC RSBlank(char* text, double, char*, int, char*, int, char**)
+{
+	double docW, docH;
+	char frameName[256] = {0};
+	if (!text || sscanf(text, "%lf %lf %255s", &docW, &docH, frameName) != 3 || docW < 1 || docH < 1 || docW > 16384 || docH > 16384)
+		return -1;
+	StartGdiplus();
+	Gdiplus::Bitmap frame(static_cast<INT>(docW), static_cast<INT>(docH), PixelFormat24bppRGB);
+	{
+		Gdiplus::Graphics g(&frame);
+		g.Clear(Gdiplus::Color(255, 0, 0, 0));
+	}
+	return WritePng(DllFolder() + Widen(frameName), frame) ? 1 : -4;
+}
+
 // Settings snapshot, for comparing ZBrush state before and after another
 // plugin runs (which resets the script's variables). Values are kept in
 // snapshot.txt next to the DLL as "id value" lines.
@@ -723,7 +741,7 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 
 // text: "0" screen X of the document's top-left corner, "1" screen Y, "2"
 // screen pixels per document pixel (x1000), "3" percent matched, from the
-// last RSOverlayStart.
+// last RSOverlayStart; "4" 1 if the overlay is showing, else 0.
 ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 {
 	const int which = text ? atoi(text) : -1;
@@ -732,6 +750,7 @@ ZFUNC RSOverlayInfo(char* text, double, char*, int, char*, int, char**)
 	case 1: return static_cast<float>(gCalibration.screenY);
 	case 2: return static_cast<float>(floor(gCalibration.pixelsPerDoc * 1000 + 0.5));
 	case 3: return static_cast<float>(floor(gCalibration.percent));
+	case 4: return gOverlayWnd && gOverlay.visible ? 1 : 0;
 	}
 	return -1;
 }
