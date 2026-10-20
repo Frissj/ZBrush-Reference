@@ -6,9 +6,9 @@
 // ReferenceScaler64.dll renders the reference, scaled and placed for the
 // current zoom, into a document-sized PNG. The plugin imports it, selects it
 // and paints it in with Color > FillLayer (with the model in Edit mode this
-// paints behind it, and X-ray works). ZBrush does not redraw the model over
-// the fill by itself, so the method chosen with the Redraw slider runs after
-// every fill.
+// paints behind it, and X-ray works). The fill drops the model out of Edit
+// mode, so after every fill the tool is drawn again and Edit turned back on
+// with the saved transform.
 //
 // Install: keep the ReferenceScaler_Data folder next to this file, then
 // ZScript > Load > pick this file. The buttons appear under
@@ -24,7 +24,7 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 37"]
+[VarDef, zrsBuild, "build 38"]
 [VarDef, zrsDll, "ReferenceScaler_Data\ReferenceScaler64.dll"]
 [VarDef, zrsLive, 0]
 [VarDef, zrsPx, 0]
@@ -47,16 +47,17 @@
 [VarDef, zrsFile, ""]
 [VarDef, zrsMsg, ""]
 [VarDef, zrsTick, 0]
-[VarDef, zrsWay, 0]
-[VarDef, zrsFlip, 0]
-[VarDef, zrsStep, 0]
-[VarDef, zrsC0, 0]
-[VarDef, zrsPick, 0]
-[VarDef, zrsTx, 0]
-[VarDef, zrsTy, 0]
-[VarDef, zrsRes, ""]
-[VarDef, zrsFirst, -1]
-[VarDef, zrsFrameCol, 0]
+[VarDef, zrsEditFill, -1]
+[VarDef, zrsEditAfter, -1]
+[VarDef, zrsKx, 0]
+[VarDef, zrsKy, 0]
+[VarDef, zrsKz, 0]
+[VarDef, zrsKsx, 0]
+[VarDef, zrsKsy, 0]
+[VarDef, zrsKsz, 0]
+[VarDef, zrsKrx, 0]
+[VarDef, zrsKry, 0]
+[VarDef, zrsKrz, 0]
 
 // Sets the variables for the base layout: the image fitted to the document,
 // unscaled (ratio 1, model position = anchor position).
@@ -68,36 +69,26 @@
 	[VarSet, zrsAy, 0]
 ]
 
-// Makes ZBrush redraw the model over a fresh fill, using the method picked
-// with the Redraw slider:
-// 0 none, 1 IUpdate, 2 Draw > Persp pressed twice, 3 canvas panned 1 pixel
-// (alternating direction), 4 model rotated 0.5 degrees (alternating),
-// 5 current tool reselected, 6 Edit pressed twice, 7 canvas zoom set to itself.
-[RoutineDef, ZRSRedraw,
-	[VarSet, zrsWay, [IGet, "ZPlugin:Reference Scaler b37:Redraw"]]
-	[VarSet, zrsFlip, 1 - zrsFlip]
-	[If, zrsWay == 1, [IUpdate, 1]]
-	[If, zrsWay == 2,
-		[IPress, Draw:Persp]
-		[IPress, Draw:Persp]
-	]
-	[If, zrsWay == 3, [CanvasPanSet, [CanvasPanGetH] + zrsFlip * 2 - 1, [CanvasPanGetV]]]
-	[If, zrsWay == 4,
-		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[TransformSet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy + zrsFlip - 0.5, zrsRz]
-	]
-	[If, zrsWay == 5, [ISet, "Tool:Item Info", [IGet, "Tool:Item Info"]]]
-	[If, zrsWay == 6,
+// FillLayer drops the model out of Edit mode (it is baked into the canvas and
+// painted over). ZRSRestore puts it back: if Edit is off after the fill, it
+// draws the current tool at the model's saved position with a canvas drag in
+// Draw mode,
+// turns Edit on and restores the transform saved before the fill (zrsK*).
+[RoutineDef, ZRSRestore,
+	[VarSet, zrsEditFill, [IGet, Transform:Edit]]
+	[If, zrsEditFill == 0,
+		[IPress, Transform:Draw]
+		[CanvasClick, zrsKx, zrsKy, zrsKx + 40, zrsKy + 40]
 		[IPress, Transform:Edit]
-		[IPress, Transform:Edit]
+		[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
 	]
-	[If, zrsWay == 7, [CanvasZoomSet, [CanvasZoomGet]]]
+	[VarSet, zrsEditAfter, [IGet, Transform:Edit]]
 ]
 
 // Renders frame0.png with the DLL for zrsRatio, model position (zrsPx, zrsPy)
 // and anchor position (zrsAx, zrsAy), imports it, selects it (an import does
 // not make it current; the newest texture is the last one), fills the canvas
-// behind the model with it and runs the chosen redraw method. Leaves a result
+// with it and restores the model in Edit mode in front of it. Leaves a result
 // in zrsMsg; zrsResult is 1 on success.
 [RoutineDef, ZRSShow,
 	[VarSet, zrsResult, 0]
@@ -115,12 +106,14 @@
 			[FileNameSetNext, [StrMerge, "!:", zrsFile]]
 			[IPress, Texture:Import]
 			[ISet, "Texture:Item Info", [IGetMax, "Texture:Item Info"]]
+			[TransformGet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
 			[IPress, Color:FillLayer]
-			[RoutineCall, ZRSRedraw]
+			[RoutineCall, ZRSRestore]
 			[VarSet, zrsLastRatio, zrsRatio]
 			[VarSet, zrsLastPx, zrsPx]
 			[VarSet, zrsLastPy, zrsPy]
 			[VarSet, zrsMsg, [StrMerge, "Shown at ratio ", zrsRatio, ", model at ", zrsPx, ", ", zrsPy]]
+			[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nEdit after fill ", zrsEditFill, ", after restore ", zrsEditAfter]]
 		]
 	]
 ]
@@ -128,14 +121,14 @@
 // Works out the ratio and positions from the current model and the anchor
 // sliders, then shows the frame. Leaves a result in zrsMsg.
 [RoutineDef, ZRSUpdate,
-	[If, [IGet, "ZPlugin:Reference Scaler b37:Anchor Scale"] <= 0,
+	[If, [IGet, "ZPlugin:Reference Scaler b38:Anchor Scale"] <= 0,
 		[VarSet, zrsMsg, "Not anchored: line the model up with the image and press Anchor first."]
 		[VarSet, zrsResult, 0]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b37:Anchor Scale"]]
-		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b37:Anchor X"]]
-		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b37:Anchor Y"]]
+		[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b38:Anchor Scale"]]
+		[VarSet, zrsAx, [IGet, "ZPlugin:Reference Scaler b38:Anchor X"]]
+		[VarSet, zrsAy, [IGet, "ZPlugin:Reference Scaler b38:Anchor Y"]]
 		[RoutineCall, ZRSShow]
 	]
 ]
@@ -150,60 +143,27 @@
 			[VarSet, zrsTick, zrsTick + 1]
 			[If, [IGet, Transform:Edit],
 				[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b37:Anchor Scale"]]
+				[VarSet, zrsRatio, zrsSx / [IGet, "ZPlugin:Reference Scaler b38:Anchor Scale"]]
 				[If, ABS(zrsRatio - zrsLastRatio) > 0.002 || ABS(zrsPx - zrsLastPx) > 0.5 || ABS(zrsPy - zrsLastPy) > 0.5,
 					[RoutineCall, ZRSUpdate]
 					[Note, [StrMerge, "Live tick ", zrsTick, ": redrew, result ", zrsResult, "\n", zrsMsg], , 1]
 					,
-					[If, [IGet, "ZPlugin:Reference Scaler b37:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": no change (ratio ", zrsRatio, ")"], , 0.5]]
+					[If, [IGet, "ZPlugin:Reference Scaler b38:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": no change (ratio ", zrsRatio, ")"], , 0.5]]
 				]
 				,
-				[If, [IGet, "ZPlugin:Reference Scaler b37:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": model not in Edit mode"], , 0.5]]
+				[If, [IGet, "ZPlugin:Reference Scaler b38:Diag"], [Note, [StrMerge, "Live tick ", zrsTick, ": model not in Edit mode"], , 0.5]]
 			]
 			[SleepAgain, 0.5, 9]
 		]
 	, 9]
 ]
 
-// Auto Test: fills with the frame and runs redraw method zrsStep (0 to 7),
-// pausing after each so ZBrush can redraw, then reads the canvas pixel at the
-// model's centre. Method 0 (no redraw) is the baseline for "covered by the
-// image"; a later method whose pixel differs drew the model back on top (V),
-// one that matches left it covered (C). The frame's own colour at that point
-// is shown next to the baseline to confirm it really is the image.
-[RoutineDef, ZRSTestFill,
-	[ISet, "ZPlugin:Reference Scaler b37:Redraw", zrsStep]
-	[If, [IGet, "ZPlugin:Reference Scaler b37:Anchor Scale"] > 0,
-		[RoutineCall, ZRSUpdate]
-		,
-		[RoutineCall, ZRSBase]
-		[RoutineCall, ZRSShow]
-	]
-]
-
-[RoutineDef, ZRSTestStep,
-	[VarSet, zrsPick, [PixolPick, 0, zrsTx, zrsTy]]
-	[If, zrsStep == 0,
-		[VarSet, zrsC0, zrsPick]
-		[VarSet, zrsFrameCol, [FileExecute, zrsDll, "RSPixel", [StrMerge, zrsTx, " ", zrsTy, " frame0.png"]]]
-		[VarSet, zrsRes, [StrMerge, "Baseline ", zrsPick, ", frame ", zrsFrameCol, "\n"]]
-		,
-		[If, ABS(zrsPick - zrsC0) > 0.5,
-			[VarSet, zrsRes, [StrMerge, zrsRes, zrsStep, ":V "]]
-			[If, zrsFirst < 0, [VarSet, zrsFirst, zrsStep]]
-			,
-			[VarSet, zrsRes, [StrMerge, zrsRes, zrsStep, ":C "]]
-		]
-	]
-	[VarSet, zrsStep, zrsStep + 1]
-]
-
 // ---------------------------------------------------------------------------
 // Interface
 // ---------------------------------------------------------------------------
-[ISubPalette, "ZPlugin:Reference Scaler b37"]
+[ISubPalette, "ZPlugin:Reference Scaler b38"]
 
-[IButton, "ZPlugin:Reference Scaler b37:Load Image",
+[IButton, "ZPlugin:Reference Scaler b38:Load Image",
 	"Choose the reference image and show it behind the model, fitted to the document.",
 	[VarSet, zrsFile, [FileNameAsk, "Image (*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd)|*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.psd||", , "Choose reference image"]]
 	[If, [StrLength, zrsFile] == 0,
@@ -215,71 +175,41 @@
 			,
 			[RoutineCall, ZRSBase]
 			[RoutineCall, ZRSShow]
-			[If, zrsResult != 1, [Note, zrsMsg]]
+			[Note, [StrMerge, "Load Image\n", zrsMsg]]
 		]
 	]
 	, 0, 1
 ]
 
-[IButton, "ZPlugin:Reference Scaler b37:Anchor",
+[IButton, "ZPlugin:Reference Scaler b38:Anchor",
 	"With the model lined up with the image, press to record this zoom and position as the 1:1 match.",
 	[If, [IGet, Transform:Edit] == 0,
 		[Note, "Put the model in Edit mode first."]
 		,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[ISet, "ZPlugin:Reference Scaler b37:Anchor Scale", zrsSx]
-		[ISet, "ZPlugin:Reference Scaler b37:Anchor X", zrsPx]
-		[ISet, "ZPlugin:Reference Scaler b37:Anchor Y", zrsPy]
+		[ISet, "ZPlugin:Reference Scaler b38:Anchor Scale", zrsSx]
+		[ISet, "ZPlugin:Reference Scaler b38:Anchor X", zrsPx]
+		[ISet, "ZPlugin:Reference Scaler b38:Anchor Y", zrsPy]
 		[Note, [StrMerge, "Anchored: model scale ", zrsSx, ", position ", zrsPx, ", ", zrsPy]]
 	]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b37:Sync",
-	"Redraw the reference for the current zoom and position once, using the Redraw method.",
+[IButton, "ZPlugin:Reference Scaler b38:Sync",
+	"Redraw the reference for the current zoom and position once.",
 	[RoutineCall, ZRSUpdate]
 	[If, zrsResult != 1, [Note, zrsMsg], [Note, [StrMerge, "Sync: ", zrsMsg], , 1]]
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b37:Auto Test",
-	"Try every redraw method (0-7) automatically and set Redraw to the first one that draws the model over the fill.",
-	[If, [IGet, Transform:Edit] == 0,
-		[Note, "Put the model in Edit mode first."]
-		,
-		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsTx, zrsPx]
-		[VarSet, zrsTy, zrsPy]
-		[VarSet, zrsStep, 0]
-		[VarSet, zrsFirst, -1]
-		[VarSet, zrsRes, ""]
-		[RoutineCall, ZRSTestFill]
-		[If, zrsResult != 1,
-			[Note, zrsMsg]
-			,
-			[Sleep, 0.4,
-				[RoutineCall, ZRSTestStep]
-				[If, zrsStep <= 7,
-					[RoutineCall, ZRSTestFill]
-					[SleepAgain, 0.4]
-					,
-					[If, zrsFirst >= 0, [ISet, "ZPlugin:Reference Scaler b37:Redraw", zrsFirst], [ISet, "ZPlugin:Reference Scaler b37:Redraw", 0]]
-					[Note, [StrMerge, "Auto Test (V = model drawn on top, C = covered)\n", zrsRes, "\nRedraw set to ", [IGet, "ZPlugin:Reference Scaler b37:Redraw"]]]
-				]
-			]
-		]
-	]
-	, 0, 1
-]
-
-[ISwitch, "ZPlugin:Reference Scaler b37:Live", 0,
+[ISwitch, "ZPlugin:Reference Scaler b38:Live", 0,
 	"Keep redrawing the reference as the camera zooms and pans.",
 	[VarSet, zrsLive, 1]
 	[RoutineCall, ZRSUpdate]
 	[If, zrsResult != 1,
 		[Note, [StrMerge, "Live could not start: ", zrsMsg]]
 		[VarSet, zrsLive, 0]
-		[ISet, "ZPlugin:Reference Scaler b37:Live", 0]
+		[ISet, "ZPlugin:Reference Scaler b38:Live", 0]
 		,
 		[VarSet, zrsTick, 0]
 		[Note, "Live on: zoom or pan, and the reference follows when you release the mouse.", , 2]
@@ -291,7 +221,7 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b37:Reset",
+[IButton, "ZPlugin:Reference Scaler b38:Reset",
 	"Show the reference fitted to the document again, unscaled.",
 	[RoutineCall, ZRSBase]
 	[RoutineCall, ZRSShow]
@@ -299,34 +229,29 @@
 	, 0, 0.5
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b37:Redraw", 0, 1, 0, 7,
-	"How to make ZBrush redraw the model after each fill: 0 none, 1 IUpdate, 2 Persp twice, 3 pan 1px, 4 rotate 0.5, 5 reselect tool, 6 Edit twice, 7 zoom to itself.",
-	, 0, 1
-]
-
-[ISwitch, "ZPlugin:Reference Scaler b37:Diag", 0,
+[ISwitch, "ZPlugin:Reference Scaler b38:Diag", 0,
 	"Show a short popup on every Live wake-up, not just on redraws.",
 	, , 0, 0.5
 ]
 
-[IButton, "ZPlugin:Reference Scaler b37:About",
+[IButton, "ZPlugin:Reference Scaler b38:About",
 	"Show which build is running and whether the helper DLL loads.",
 	[Note, [StrMerge, "Reference Scaler ", zrsBuild, "\nDLL check: ", [FileExecute, zrsDll, "RSVersion"], " (1 = ok)"]]
 	, 0, 0.5
 ]
 
 // Anchor storage. Set by Anchor; shown so the anchored values are visible.
-[ISlider, "ZPlugin:Reference Scaler b37:Anchor Scale", 0, 0.001, 0, 100000,
+[ISlider, "ZPlugin:Reference Scaler b38:Anchor Scale", 0, 0.001, 0, 100000,
 	"Model scale recorded by Anchor.",
 	, 0, 1
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b37:Anchor X", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b38:Anchor X", 0, 0.001, -100000, 100000,
 	"Model horizontal position recorded by Anchor.",
 	, 0, 0.5
 ]
 
-[ISlider, "ZPlugin:Reference Scaler b37:Anchor Y", 0, 0.001, -100000, 100000,
+[ISlider, "ZPlugin:Reference Scaler b38:Anchor Y", 0, 0.001, -100000, 100000,
 	"Model vertical position recorded by Anchor.",
 	, 0, 0.5
 ]
