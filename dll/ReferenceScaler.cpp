@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 78;
+static const int kDllBuild = 79;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1203,6 +1203,9 @@ static void DrawGizmo(const OverlayState& st, Buffer32& b)
 // (gMultiA above gMultiB) share the panel. Outside the panel the background
 // shows gBackGrey.
 static int gMode = 0, gPanelLeft = 0, gMulti = 0, gMultiA = 0, gMultiB = 3, gBackGrey = 48;
+// The reference's gamma and saturation, in percent (100 leaves it as is),
+// from the plugin's sliders (not saved: the sliders start at 100).
+static int gGamma = 100, gSat = 100;
 static const double kPanelShare = 0.35;  // of the canvas width
 
 // The panel in overlay pixels (PureRef).
@@ -1216,6 +1219,7 @@ static void PanelRect(int w, int h, int& x0, int& y0, int& pw, int& ph)
 
 // Layout and image of a view slot for the panel, from the current camera.
 static bool ViewLayout(int slot, const OverlayState& st, OverlayState& out, std::string& path);
+static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out, std::string& path);
 static int ActiveViewSlot();
 
 // Draws an image (premultiplied, scaled by alpha) over dst, its rectangle at
@@ -1236,6 +1240,12 @@ static void DrawLevels(Buffer32& dst, const std::vector<Level>& levels, double x
 	cy1 = std::min(cy1, std::min(dst.h, static_cast<int>(ceil(y0 + dispH))));
 	if (cx0 >= cx1 || cy0 >= cy1)
 		return;
+	// Gamma (on the unpremultiplied colour) and saturation.
+	const bool adjust = gGamma != 100 || gSat != 100;
+	unsigned char gammaLut[256];
+	for (int i = 0; i < 256; ++i)
+		gammaLut[i] = static_cast<unsigned char>(255 * pow(i / 255.0, 100.0 / gGamma) + 0.5);
+	const int sat = gSat * 256 / 100;
 	// Per column and row: the two texels to blend and the weight (0-256) of
 	// the second, or -1 outside the image.
 	std::vector<int> cx(cx1 - cx0), cw(cx1 - cx0);
@@ -1269,6 +1279,15 @@ static void DrawLevels(Buffer32& dst, const std::vector<Level>& levels, double x
 				const int d = (r1[ix] >> c) & 255, e = (r1[ix1] >> c) & 255;
 				const int top = a * 256 + (b - a) * wx, bottom = d * 256 + (e - d) * wx;
 				ch[k] = (top * 256 + (bottom - top) * wy) >> 16;
+			}
+			if (adjust && ch[0] > 0) {
+				const int a = ch[0];
+				const int luma = (ch[1] * 77 + ch[2] * 150 + ch[3] * 29) >> 8;
+				for (int k = 1; k < 4; ++k) {
+					int v = luma + (((ch[k] - luma) * sat) >> 8);
+					v = v < 0 ? 0 : v > a ? a : v;
+					ch[k] = a == 255 ? gammaLut[v] : gammaLut[v * 255 / a] * a / 255;
+				}
 			}
 			const int alpha = ch[0] * alphaScale / 255;
 			// Over what is there already (premultiplied).
@@ -1305,7 +1324,7 @@ static void DrawPanelCell(const OverlayState& st, int slot, int x0, int y0, int 
 	FillRect(gRefLayer, x0, y0, x0 + cw, y0 + ch, 0xFF181818u);
 	OverlayState vs;
 	std::string path;
-	if (slot < 0 || !ViewLayout(slot, st, vs, path))
+	if (slot < 0 || !MultiviewLayout(slot, st, vs, path))
 		return;
 	const std::vector<Level>* levels = LevelsFor(path);
 	if (!levels)
@@ -1541,6 +1560,64 @@ static bool Capture(const OverlayState& st)
 // on the model.
 static const int kModelBelow = 12;
 
+// ZBrush's other windows (popups, menus, notes) on screen, which the PureRef
+// panel must not cover. Refreshed every 100 ms; each change is logged.
+static std::vector<RECT> gUiRects;
+
+struct UiScan {
+	HWND main;
+	std::vector<RECT> rects;
+	std::string desc;
+};
+
+static BOOL CALLBACK CollectUiWindow(HWND wnd, LPARAM param)
+{
+	UiScan* scan = reinterpret_cast<UiScan*>(param);
+	DWORD pid = 0;
+	GetWindowThreadProcessId(wnd, &pid);
+	if (pid != GetCurrentProcessId() || wnd == gOverlayWnd || wnd == scan->main || !IsWindowVisible(wnd))
+		return TRUE;
+	RECT r;
+	if (!GetWindowRect(wnd, &r) || r.right <= r.left || r.bottom <= r.top)
+		return TRUE;
+	scan->rects.push_back(r);
+	char cls[64] = {0}, line[160];
+	GetClassNameA(wnd, cls, sizeof(cls));
+	snprintf(line, sizeof(line), " [%s %ld %ld %ld %ld]", cls, r.left, r.top, r.right, r.bottom);
+	scan->desc += line;
+	return TRUE;
+}
+
+static void RefreshUiRects()
+{
+	static DWORD at = 0;
+	static std::string lastDesc = "-";
+	const DWORD now = GetTickCount();
+	if (now - at < 100)
+		return;
+	at = now;
+	UiScan scan;
+	scan.main = nullptr;
+	EnumWindows(FindZBrushWindow, reinterpret_cast<LPARAM>(&scan.main));
+	EnumWindows(CollectUiWindow, reinterpret_cast<LPARAM>(&scan));
+	std::string children;
+	if (scan.main) {
+		UiScan kids;
+		kids.main = nullptr;
+		EnumChildWindows(scan.main, CollectUiWindow, reinterpret_cast<LPARAM>(&kids));
+		children = kids.desc;
+	}
+	gUiRects = scan.rects;
+	const std::string desc = scan.desc + " | children" + children;
+	if (desc != lastDesc) {
+		lastDesc = desc;
+		if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			fprintf(f, "%lu zbrush windows:%s\n", now, desc.c_str());
+			fclose(f);
+		}
+	}
+}
+
 // Builds the opaque output from gCapture: each pixel's share of magenta is
 // replaced by the reference (gRefLayer, black where there is none).
 static void Composite(HWND wnd, const OverlayState& st)
@@ -1580,14 +1657,24 @@ static void Composite(HWND wnd, const OverlayState& st)
 	gMagentaShare = n ? 100.0 * magenta / n : 0;
 	gModelPixels = static_cast<double>(model);
 	if (gMode == 1) {
-		// PureRef: the panel is shown over the model.
+		// PureRef: the panel is shown over the model, but not over ZBrush's
+		// popups and menus.
 		int px, py, pw, ph;
 		PanelRect(w, h, px, py, pw, ph);
+		const int sx = static_cast<int>(st.screenX), sy = static_cast<int>(st.screenY);
 		for (int y = py; y < py + ph && y < h; ++y) {
 			const uint32_t* src = reinterpret_cast<const uint32_t*>(gRefLayer.bits) + static_cast<size_t>(y) * w;
 			uint32_t* dst = reinterpret_cast<uint32_t*>(gOutput.bits) + static_cast<size_t>(y) * w;
-			for (int x = px; x < px + pw && x < w; ++x)
-				dst[x] = src[x] | 0xFF000000u;
+			for (int x = px; x < px + pw && x < w; ++x) {
+				bool ui = false;
+				for (const RECT& r : gUiRects)
+					if (x + sx >= r.left && x + sx < r.right && y + sy >= r.top && y + sy < r.bottom) {
+						ui = true;
+						break;
+					}
+				if (!ui)
+					dst[x] = src[x] | 0xFF000000u;
+			}
 		}
 	}
 	if (gAdjust && gMode == 0)
@@ -2094,6 +2181,11 @@ static bool gRedrawPending = false;
 // ---------------------------------------------------------------------------
 static const int kViewSlots = 7, kDefaultView = 6;
 
+// Each view's rotation as ZBrush keeps it (RotCode of the matrix). Front
+// (identity), Left and Right were read from ZBrush (nav_log: Left
+// [0 0 -1; 0 1 0; 1 0 0]); Back, Top and Bottom follow from them.
+static const int kViewCodes[6] = {16484, 3360, 9202, 10642, 11786, 7898};  // Front Back Right Left Top Bottom
+
 struct View {
 	bool used = false;
 	double rx = 0, ry = 0, rz = 0, scale = 0, ax = 0, ay = 0;
@@ -2381,6 +2473,165 @@ static bool ViewLayout(int slot, const OverlayState& st, OverlayState& out, std:
 	if (slot != gActiveView)
 		out.offX = out.offY = 0;
 	path = v.path;
+	return true;
+}
+
+// The model's extent in a view's silhouette (image space): its bounds, and
+// per grid row and column the first and last model cell (-1 if none).
+struct MaskExtent {
+	const unsigned char* data = nullptr;
+	size_t size = 0;
+	unsigned sum = 0;
+	bool ok = false;
+	int i0 = 0, i1 = 0, j0 = 0, j1 = 0;
+	std::vector<int> rowMin, rowMax, colMin, colMax;
+};
+static MaskExtent gExtents[kViewSlots];
+
+static const MaskExtent& ExtentFor(int slot)
+{
+	const View& v = gViews[slot];
+	MaskExtent& e = gExtents[slot];
+	unsigned sum = 0;
+	for (size_t i = 0; i < v.mask.size(); i += 97)
+		sum = sum * 31 + v.mask[i];
+	if (e.data == v.mask.data() && e.size == v.mask.size() && e.sum == sum)
+		return e;
+	e = MaskExtent();
+	e.data = v.mask.data();
+	e.size = v.mask.size();
+	e.sum = sum;
+	if (v.gw <= 0 || v.gh <= 0 || v.mask.size() != static_cast<size_t>(v.gw) * v.gh || v.cell <= 0)
+		return e;
+	e.rowMin.assign(v.gh, -1);
+	e.rowMax.assign(v.gh, -1);
+	e.colMin.assign(v.gw, -1);
+	e.colMax.assign(v.gw, -1);
+	e.i0 = v.gw;
+	e.j0 = v.gh;
+	e.i1 = e.j1 = -1;
+	for (int j = 0; j < v.gh; ++j)
+		for (int i = 0; i < v.gw; ++i) {
+			if (v.mask[static_cast<size_t>(j) * v.gw + i] != 2)
+				continue;
+			if (e.rowMin[j] < 0) e.rowMin[j] = i;
+			e.rowMax[j] = i;
+			if (e.colMin[i] < 0) e.colMin[i] = j;
+			e.colMax[i] = j;
+			e.i0 = std::min(e.i0, i);
+			e.i1 = std::max(e.i1, i);
+			e.j0 = std::min(e.j0, j);
+			e.j1 = std::max(e.j1, j);
+		}
+	e.ok = e.i1 > e.i0 && e.j1 > e.j0;
+	return e;
+}
+
+// A view's screen axes in the model's frame, from its rotation (kViewCodes):
+// d[0] screen right, d[1] screen down, d[2] towards the camera.
+static void ViewAxes(int slot, double d[3][3])
+{
+	int code = kViewCodes[slot];
+	double m[9];
+	for (int i = 0; i < 9; ++i, code /= 3)
+		m[i] = code % 3 - 1;
+	for (int c = 0; c < 3; ++c) {
+		d[0][c] = m[c];
+		d[1][c] = -m[3 + c];
+		d[2][c] = m[6 + c];
+	}
+}
+
+// Multiview: a view other than the one being looked at (C, the showing
+// view) shows the same part of the model. Both views' silhouettes (recorded
+// when their images were lined up with the model) give the model's extent
+// in each image, so an axis the two views share (height, between Front and
+// Left) maps across: the same place along the model, zoomed alike. Along the
+// axis that is depth for C (across, in Left seen from Front), the part being
+// looked at is centred: the model's extent there within the band shown, so
+// zoomed into the face, the side view shows the head. Without both
+// silhouettes the view is placed by the camera as Classic would show it.
+static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out, std::string& path)
+{
+	if (!ViewLayout(slot, st, out, path))
+		return false;
+	const int c = gActiveView;
+	if (c < 0 || c >= kDefaultView || c == slot || !gViews[c].used)
+		return true;
+	OverlayState cs;
+	std::string cpath;
+	if (!ViewLayout(c, st, cs, cpath) || cs.ratio <= 0)
+		return true;
+	const MaskExtent& ce = ExtentFor(c);
+	const MaskExtent& ve = ExtentFor(slot);
+	if (!ce.ok || !ve.ok)
+		return true;
+	const View& cv = gViews[c];
+	const View& vv = gViews[slot];
+	// C's window in its image space: centre and half size per screen axis.
+	const double centreC[2] = {(st.docW * 0.5 - cs.px) / cs.ratio + cs.ax + cs.offX,
+		(st.docH * 0.5 - cs.py) / cs.ratio + cs.ay + cs.offY};
+	const double halfC[2] = {st.docW * 0.5 / cs.ratio, st.docH * 0.5 / cs.ratio};
+	// The model's bounds in image space, per screen axis.
+	const double lowC[2] = {cv.u0 + ce.i0 * cv.cell, cv.v0 + ce.j0 * cv.cell};
+	const double highC[2] = {cv.u0 + (ce.i1 + 1) * cv.cell, cv.v0 + (ce.j1 + 1) * cv.cell};
+	const double lowV[2] = {vv.u0 + ve.i0 * vv.cell, vv.v0 + ve.j0 * vv.cell};
+	const double highV[2] = {vv.u0 + (ve.i1 + 1) * vv.cell, vv.v0 + (ve.j1 + 1) * vv.cell};
+	double dc[3][3], dv[3][3];
+	ViewAxes(c, dc);
+	ViewAxes(slot, dv);
+	double centreV[2] = {0, 0}, halfV[2] = {0, 0};
+	int depthAxis = -1;
+	double k = 0;
+	for (int a = 0; a < 2; ++a) {
+		int b = -1;
+		double sign = 0;
+		for (int t = 0; t < 3; ++t) {
+			const double dot = dv[a][0] * dc[t][0] + dv[a][1] * dc[t][1] + dv[a][2] * dc[t][2];
+			if (fabs(dot) > 0.5) { b = t; sign = dot; }
+		}
+		if (b == 2 || b < 0) {
+			depthAxis = a;
+			continue;
+		}
+		double f = (centreC[b] - lowC[b]) / (highC[b] - lowC[b]);
+		if (sign < 0)
+			f = 1 - f;
+		centreV[a] = lowV[a] + f * (highV[a] - lowV[a]);
+		const double ka = (highV[a] - lowV[a]) / (highC[b] - lowC[b]);
+		if (k <= 0)
+			k = ka;
+		halfV[a] = halfC[b];
+	}
+	if (k <= 0)
+		return true;
+	for (int a = 0; a < 2; ++a)
+		halfV[a] *= k;
+	if (depthAxis >= 0) {
+		// The band shown along the shared axis, and the model's extent
+		// across it within the band.
+		const int o = 1 - depthAxis;
+		halfV[depthAxis] = (depthAxis == 0 ? st.docW : st.docH) * 0.5 / cs.ratio * k;
+		const double origin = o == 0 ? vv.u0 : vv.v0;
+		const int n = o == 0 ? vv.gw : vv.gh;
+		const int from = std::max(0, static_cast<int>(floor((centreV[o] - halfV[o] - origin) / vv.cell)));
+		const int to = std::min(n - 1, static_cast<int>(floor((centreV[o] + halfV[o] - origin) / vv.cell)));
+		const std::vector<int>& mins = o == 0 ? ve.colMin : ve.rowMin;
+		const std::vector<int>& maxs = o == 0 ? ve.colMax : ve.rowMax;
+		int lo = -1, hi = -1;
+		for (int i = from; i <= to; ++i)
+			if (mins[i] >= 0) {
+				lo = lo < 0 ? mins[i] : std::min(lo, mins[i]);
+				hi = std::max(hi, maxs[i]);
+			}
+		const double across = depthAxis == 0 ? vv.u0 : vv.v0;
+		centreV[depthAxis] = lo >= 0 ? across + (lo + hi + 1) * 0.5 * vv.cell
+			: (lowV[depthAxis] + highV[depthAxis]) * 0.5;
+	}
+	out.ratio = cs.ratio / k;
+	out.offX = out.offY = 0;
+	out.px = st.docW * 0.5 - out.ratio * (centreV[0] - out.ax);
+	out.py = st.docH * 0.5 - out.ratio * (centreV[1] - out.ay);
 	return true;
 }
 
@@ -3000,11 +3251,6 @@ static void RotFollow()
 	LeaveCriticalSection(&gOverlayLock);
 }
 
-// Each view's rotation as ZBrush keeps it (RotCode of the matrix). Front
-// (identity), Left and Right were read from ZBrush (nav_log: Left
-// [0 0 -1; 0 1 0; 1 0 0]); Back, Top and Bottom follow from them.
-static const int kViewCodes[6] = {16484, 3360, 9202, 10642, 11786, 7898};  // Front Back Right Left Top Bottom
-
 static bool AtView(const std::vector<int>& codes, int slot)
 {
 	return slot >= 0 && slot < 6 && std::find(codes.begin(), codes.end(), kViewCodes[slot]) != codes.end();
@@ -3096,6 +3342,7 @@ static bool OverlayStep(HWND wnd)
 	ClassifyGesture();
 	MemFollow();
 	RotFollow();
+	RefreshUiRects();
 	EnterCriticalSection(&gOverlayLock);
 	const OverlayState st = gOverlay;
 	const bool redraw = gRedrawPending;
@@ -3837,7 +4084,8 @@ ZFUNC RSOverlayResetOffset(char*, double, char*, int, char*, int, char**)
 // text: "name value" sets a display setting and returns it: "mode" (0
 // Classic, 1 PureRef), "left" (PureRef panel on the left), "multi" (two
 // views in the panel), "a" and "b" (the two views, slots 0-5), "back" (the
-// grey shown around the panel). The value "-1" toggles mode, left and multi
+// grey shown around the panel), "gamma" and "sat" (the reference's gamma
+// and saturation in percent). The value "-1" toggles mode, left and multi
 // and steps a and b to the next view. "name" alone returns the setting.
 ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 {
@@ -3850,14 +4098,16 @@ ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 	LoadDisplay();
 	int* field = strcmp(name, "mode") == 0 ? &gMode : strcmp(name, "left") == 0 ? &gPanelLeft :
 		strcmp(name, "multi") == 0 ? &gMulti : strcmp(name, "a") == 0 ? &gMultiA : strcmp(name, "b") == 0 ? &gMultiB :
-		strcmp(name, "back") == 0 ? &gBackGrey : nullptr;
+		strcmp(name, "back") == 0 ? &gBackGrey : strcmp(name, "gamma") == 0 ? &gGamma : strcmp(name, "sat") == 0 ? &gSat : nullptr;
 	float result = -1;
 	if (field) {
 		const bool view = field == &gMultiA || field == &gMultiB;
-		if (value == -1)
+		const bool level = field == &gBackGrey || field == &gGamma || field == &gSat;
+		if (value == -1 && !level)
 			*field = view ? (*field + 1) % 6 : !*field;
 		else if (value >= 0)
-			*field = view ? value % 6 : field == &gBackGrey ? std::min(value, 255) : value != 0;
+			*field = view ? value % 6 : field == &gBackGrey ? std::min(value, 255) :
+				field == &gGamma ? std::max(20, std::min(value, 300)) : field == &gSat ? std::min(value, 200) : value != 0;
 		if (value != -2) {
 			SaveDisplay();
 			gRedrawPending = true;
