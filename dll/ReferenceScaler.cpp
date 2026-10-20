@@ -170,7 +170,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 76;
+static const int kDllBuild = 77;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -2445,6 +2445,12 @@ struct RotCand {
 	double m[9];
 	DWORD changedAt;
 	double settled[9];  // m when the view was last looked up
+	bool unit;          // stored as a pure rotation (not scaled by the zoom)
+	double m1[9], m2[9];  // at the first and second test views
+	// How it relates to the reference copy (see RotRelate): -1 not known,
+	// else bit 0 transposed, bits 1-3 and 4-6 the signs of the diagonal
+	// matrices on its left and right.
+	int rel;
 };
 static std::vector<RotCand> gRotCands;
 static int gRotNarrowings = 0;
@@ -2492,6 +2498,25 @@ static void RotFromBytes(const unsigned char* b, bool isDouble, int stride, doub
 		}
 }
 
+// Divides out a uniform scale: ZBrush's drawing matrix is the rotation times
+// the zoom (build 76's search only took unit rows and found a copy that is
+// not updated when the view goes back to front). False unless the three
+// rows have the same length.
+static bool Unscale(double* m)
+{
+	double n[3];
+	for (int r = 0; r < 3; ++r) {
+		n[r] = sqrt(m[r * 3] * m[r * 3] + m[r * 3 + 1] * m[r * 3 + 1] + m[r * 3 + 2] * m[r * 3 + 2]);
+		if (!(n[r] > 1e-6 && n[r] < 1e9))
+			return false;
+	}
+	if (fabs(n[1] / n[0] - 1) > 2e-3 || fabs(n[2] / n[0] - 1) > 2e-3)
+		return false;
+	for (int i = 0; i < 9; ++i)
+		m[i] /= n[i / 3];
+	return true;
+}
+
 static bool RotRead(const RotCand& c, double* m)
 {
 	unsigned char b[11 * 8];
@@ -2503,7 +2528,7 @@ static bool RotRead(const RotCand& c, double* m)
 	for (int i = 0; i < 9; ++i)
 		if (m[i] != m[i])
 			return false;
-	return IsRotation(m);
+	return Unscale(m) && IsRotation(m);
 }
 
 // The traces (sum of the diagonal) a rotation by these Euler angles can have,
@@ -2578,7 +2603,7 @@ static void RotScan(const double* deg)
 						const size_t sz = isDouble ? 8 : 4;
 						if (isDouble && (i % 8 != 0 || i + 11 * 8 > got))
 							continue;
-						// Quick test first: the first row is a unit vector.
+						// Quick test first: the first row has a sensible length.
 						double r0[3];
 						for (int c = 0; c < 3; ++c) {
 							if (isDouble) {
@@ -2590,7 +2615,7 @@ static void RotScan(const double* deg)
 							}
 						}
 						const double n0 = r0[0] * r0[0] + r0[1] * r0[1] + r0[2] * r0[2];
-						if (!(fabs(n0 - 1) < 2e-3))
+						if (!(n0 > 1e-12 && n0 < 1e18))
 							continue;
 						++rows;
 						for (int stride = 3; stride <= 4; ++stride) {
@@ -2598,17 +2623,24 @@ static void RotScan(const double* deg)
 								continue;
 							double m[9];
 							RotFromBytes(&buf[i], isDouble != 0, stride, m);
-							if (!IsRotation(m) || RotCode(m) >= 0 || gRotCands.size() >= 200000)
+							if (!Unscale(m) || !IsRotation(m) || RotCode(m) >= 0 || gRotCands.size() >= 200000)
 								continue;
-							const double tr = m[0] + m[4] + m[8];
+							// With any axis flipped (a copy may be in screen
+							// coordinates), its diagonal entries change sign.
 							bool angle = false;
-							for (double t : traces)
-								if (fabs(tr - t) < 3e-3)
-									angle = true;
+							for (int flips = 0; flips < 8 && !angle; ++flips) {
+								const double tr = (flips & 1 ? -m[0] : m[0]) + (flips & 2 ? -m[4] : m[4]) + (flips & 4 ? -m[8] : m[8]);
+								for (double t : traces)
+									if (fabs(tr - t) < 3e-3)
+										angle = true;
+							}
 							if (!angle)
 								continue;
-							RotCand c = {chunk + i, isDouble != 0, stride, {}, 0, {}};
+							double raw[9];
+							RotFromBytes(&buf[i], isDouble != 0, stride, raw);
+							RotCand c = {chunk + i, isDouble != 0, stride, {}, 0, {}, fabs(sqrt(raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]) - 1) < 2e-3, {}, {}, -1};
 							memcpy(c.m, m, sizeof(m));
+							memcpy(c.m1, m, sizeof(m));
 							gRotCands.push_back(c);
 						}
 					}
@@ -2622,7 +2654,7 @@ static void RotScan(const double* deg)
 		addr = next;
 	}
 	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
-		fprintf(f, "%lu rotation matrix scan: %zu MB in %lu ms, %zu unit rows, %zu rotations by this angle found%s\n", GetTickCount(),
+		fprintf(f, "%lu rotation matrix scan: %zu MB in %lu ms, %zu rows tried, %zu rotations by this angle found%s\n", GetTickCount(),
 			scanned >> 20, GetTickCount() - t0, rows, gRotCands.size(), gRotCands.size() >= 200000 ? " (FULL)" : "");
 		fclose(f);
 	}
@@ -2643,9 +2675,61 @@ static void RotNarrow()
 			continue;
 		keep.push_back(c);
 		memcpy(keep.back().m, m, sizeof(m));
+		if (gRotNarrowings == 0)
+			memcpy(keep.back().m2, m, sizeof(m));
 	}
 	gRotCands.swap(keep);
 	++gRotNarrowings;
+}
+
+// Applies a relation: D1 * (transposed?) m * D2, the signs from rel.
+static void RotApply(int rel, const double* m, double* out)
+{
+	for (int r = 0; r < 3; ++r)
+		for (int c = 0; c < 3; ++c) {
+			const double v = rel & 1 ? m[c * 3 + r] : m[r * 3 + c];
+			const double s1 = (rel >> (1 + r)) & 1 ? -1 : 1, s2 = (rel >> (4 + c)) & 1 ? -1 : 1;
+			out[r * 3 + c] = s1 * v * s2;
+		}
+}
+
+// Every copy is put in the reference copy's layout before its view is
+// looked up: the views' codes (kViewCodes) were read from a pure rotation
+// copy, and ZBrush's other copies (such as its drawing matrix) may be
+// transposed or have axes flipped. The relation is the one that turns the
+// copy into the reference at both test views. Copies with none are not used.
+static void RotRelate()
+{
+	int ref = -1;
+	for (size_t i = 0; i < gRotCands.size(); ++i)
+		if (gRotCands[i].unit && ref < 0)
+			ref = static_cast<int>(i);
+	if (ref < 0 && !gRotCands.empty())
+		ref = 0;
+	for (RotCand& c : gRotCands) {
+		c.rel = -1;
+		if (ref < 0)
+			continue;
+		const RotCand& r = gRotCands[ref];
+		for (int rel = 0; rel < 128 && c.rel < 0; ++rel) {
+			double a[9], b[9];
+			RotApply(rel, c.m1, a);
+			RotApply(rel, c.m2, b);
+			bool same = true;
+			for (int i = 0; i < 9; ++i)
+				if (fabs(a[i] - r.m1[i]) > 3e-3 || fabs(b[i] - r.m2[i]) > 3e-3)
+					same = false;
+			if (same)
+				c.rel = rel;
+		}
+	}
+	if (FILE* f = _wfopen((DllFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu rotation copies:", GetTickCount());
+		for (const RotCand& c : gRotCands)
+			fprintf(f, " [%s %s stride %d relation %d]", c.unit ? "pure" : "scaled", c.isDouble ? "double" : "float", c.stride, c.rel);
+		fprintf(f, "\n");
+		fclose(f);
+	}
 }
 
 // Reads every candidate. Returns the codes of the ones that are snapped
@@ -2673,7 +2757,11 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 		memcpy(c.m, m, sizeof(m));
 		if (sinceSettled && !moved)
 			continue;
-		const int code = RotCode(m);
+		if (c.rel < 0)
+			continue;
+		double canon[9];
+		RotApply(c.rel, m, canon);
+		const int code = RotCode(canon);
 		if (code >= 0 && std::find(codes.begin(), codes.end(), code) == codes.end())
 			codes.push_back(code);
 	}
@@ -3522,6 +3610,7 @@ ZFUNC RSRotProbe(char* text, double, char*, int, char*, int, char**)
 	}
 	if (strcmp(mode, "last") == 0) {
 		gRotLocked = !gRotCands.empty() && gRotNarrowings >= 2;
+		RotRelate();
 		// The Overlay press looks the current view up itself once its
 		// popups are closed (they would get into the outline match).
 		RotCodes();
