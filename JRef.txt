@@ -21,9 +21,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 89"]
+[VarDef, zrsBuild, "build 90"]
 [VarDef, zrsDll, "JRef_Data\JRef64.dll"]
-[VarDef, zrsDllBuild, 89]
+[VarDef, zrsDllBuild, 90]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]

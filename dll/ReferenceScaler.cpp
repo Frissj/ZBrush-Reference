@@ -236,7 +236,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 89;
+static const int kDllBuild = 90;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -4928,6 +4928,106 @@ static BOOL WINAPI HookMoveFileW(LPCWSTR from, LPCWSTR to)
 	return HookMoveFileExW(from, to, MOVEFILE_COPY_ALLOWED);
 }
 
+// The other ways a save can put a finished file in place of the project
+// (saving over the open project, rather than Save As to a new name).
+static void ZprWrittenTo(const char* how, LPCWSTR to)
+{
+	if (!to || !IsZpr(to))
+		return;
+	wchar_t full[MAX_PATH] = {0};
+	ProjectLog(how, to);
+	ZprDone(GetFullPathNameW(to, MAX_PATH, full, nullptr) ? std::wstring(full) : std::wstring(to), true);
+}
+
+static void ZprWrittenToA(const char* how, LPCSTR to)
+{
+	if (!to)
+		return;
+	wchar_t w[MAX_PATH] = {0};
+	MultiByteToWideChar(CP_ACP, 0, to, -1, w, MAX_PATH);
+	ZprWrittenTo(how, w);
+}
+
+typedef BOOL(WINAPI* MoveFileExAFn)(LPCSTR, LPCSTR, DWORD);
+typedef BOOL(WINAPI* MoveFileProgressWFn)(LPCWSTR, LPCWSTR, LPPROGRESS_ROUTINE, LPVOID, DWORD);
+typedef BOOL(WINAPI* ReplaceFileWFn)(LPCWSTR, LPCWSTR, LPCWSTR, DWORD, LPVOID, LPVOID);
+typedef BOOL(WINAPI* ReplaceFileAFn)(LPCSTR, LPCSTR, LPCSTR, DWORD, LPVOID, LPVOID);
+typedef BOOL(WINAPI* CopyFileWFn)(LPCWSTR, LPCWSTR, BOOL);
+typedef BOOL(WINAPI* CopyFileExWFn)(LPCWSTR, LPCWSTR, LPPROGRESS_ROUTINE, LPVOID, LPBOOL, DWORD);
+typedef BOOL(WINAPI* SetFileInfoFn)(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD);
+static MoveFileExAFn gRealMoveFileExA = nullptr;
+static MoveFileProgressWFn gRealMoveFileProgressW = nullptr;
+static ReplaceFileWFn gRealReplaceFileW = nullptr;
+static ReplaceFileAFn gRealReplaceFileA = nullptr;
+static CopyFileWFn gRealCopyFileW = nullptr;
+static CopyFileExWFn gRealCopyFileExW = nullptr;
+static SetFileInfoFn gRealSetFileInfo = nullptr;
+
+static BOOL WINAPI HookMoveFileExA(LPCSTR from, LPCSTR to, DWORD flags)
+{
+	const BOOL ok = gRealMoveFileExA(from, to, flags);
+	if (ok)
+		ZprWrittenToA("zpr written by renaming (A) to", to);
+	return ok;
+}
+
+static BOOL WINAPI HookMoveFileA(LPCSTR from, LPCSTR to)
+{
+	return HookMoveFileExA(from, to, MOVEFILE_COPY_ALLOWED);
+}
+
+static BOOL WINAPI HookMoveFileProgressW(LPCWSTR from, LPCWSTR to, LPPROGRESS_ROUTINE progress, LPVOID data, DWORD flags)
+{
+	const BOOL ok = gRealMoveFileProgressW(from, to, progress, data, flags);
+	if (ok)
+		ZprWrittenTo("zpr written by moving to", to);
+	return ok;
+}
+
+static BOOL WINAPI HookReplaceFileW(LPCWSTR replaced, LPCWSTR replacement, LPCWSTR backup, DWORD flags, LPVOID ex, LPVOID res)
+{
+	const BOOL ok = gRealReplaceFileW(replaced, replacement, backup, flags, ex, res);
+	if (ok)
+		ZprWrittenTo("zpr written by replacing", replaced);
+	return ok;
+}
+
+static BOOL WINAPI HookReplaceFileA(LPCSTR replaced, LPCSTR replacement, LPCSTR backup, DWORD flags, LPVOID ex, LPVOID res)
+{
+	const BOOL ok = gRealReplaceFileA(replaced, replacement, backup, flags, ex, res);
+	if (ok)
+		ZprWrittenToA("zpr written by replacing (A)", replaced);
+	return ok;
+}
+
+static BOOL WINAPI HookCopyFileW(LPCWSTR from, LPCWSTR to, BOOL failIfExists)
+{
+	const BOOL ok = gRealCopyFileW(from, to, failIfExists);
+	if (ok)
+		ZprWrittenTo("zpr written by copying to", to);
+	return ok;
+}
+
+static BOOL WINAPI HookCopyFileExW(LPCWSTR from, LPCWSTR to, LPPROGRESS_ROUTINE progress, LPVOID data, LPBOOL cancel, DWORD flags)
+{
+	const BOOL ok = gRealCopyFileExW(from, to, progress, data, cancel, flags);
+	if (ok)
+		ZprWrittenTo("zpr written by copying (ex) to", to);
+	return ok;
+}
+
+// A rename through the file's handle (FileRenameInfo, FileRenameInfoEx).
+static BOOL WINAPI HookSetFileInfo(HANDLE h, FILE_INFO_BY_HANDLE_CLASS cls, LPVOID info, DWORD size)
+{
+	const BOOL ok = gRealSetFileInfo(h, cls, info, size);
+	if (ok && info && (cls == FileRenameInfo || static_cast<int>(cls) == 22) && size >= sizeof(FILE_RENAME_INFO)) {
+		const FILE_RENAME_INFO* r = static_cast<const FILE_RENAME_INFO*>(info);
+		const std::wstring to(r->FileName, r->FileNameLength / sizeof(wchar_t));
+		ZprWrittenTo("zpr written by renaming its handle to", to.c_str());
+	}
+	return ok;
+}
+
 // Points every module's imports of CreateFileW/A and CloseHandle (from
 // kernel32 or kernelbase) at the hooks, except system modules other than
 // the C runtimes ZBrush may read files through.
@@ -4969,15 +5069,42 @@ static void InstallZprHooks()
 	gRealMoveFileExW = reinterpret_cast<MoveFileExWFn>(GetProcAddress(k32, "MoveFileExW"));
 	if (!gRealCreateFileW || !gRealCreateFileA || !gRealCloseHandle || !gRealMoveFileExW)
 		return;
+	gRealMoveFileExA = reinterpret_cast<MoveFileExAFn>(GetProcAddress(k32, "MoveFileExA"));
+	gRealMoveFileProgressW = reinterpret_cast<MoveFileProgressWFn>(GetProcAddress(k32, "MoveFileWithProgressW"));
+	gRealReplaceFileW = reinterpret_cast<ReplaceFileWFn>(GetProcAddress(k32, "ReplaceFileW"));
+	gRealReplaceFileA = reinterpret_cast<ReplaceFileAFn>(GetProcAddress(k32, "ReplaceFileA"));
+	gRealCopyFileW = reinterpret_cast<CopyFileWFn>(GetProcAddress(k32, "CopyFileW"));
+	gRealCopyFileExW = reinterpret_cast<CopyFileExWFn>(GetProcAddress(k32, "CopyFileExW"));
+	gRealSetFileInfo = reinterpret_cast<SetFileInfoFn>(GetProcAddress(k32, "SetFileInformationByHandle"));
 	auto at = [](HMODULE m, const char* name) { return m ? reinterpret_cast<const void*>(GetProcAddress(m, name)) : nullptr; };
-	const void* from[10] = {at(k32, "CreateFileW"), at(k32, "CreateFileA"), at(k32, "CloseHandle"), at(k32, "MoveFileExW"),
-		at(k32, "MoveFileW"), at(kb, "CreateFileW"), at(kb, "CreateFileA"), at(kb, "CloseHandle"), at(kb, "MoveFileExW"),
-		at(kb, "MoveFileW")};
-	const void* to[10] = {reinterpret_cast<const void*>(&HookCreateFileW), reinterpret_cast<const void*>(&HookCreateFileA),
-		reinterpret_cast<const void*>(&HookCloseHandle), reinterpret_cast<const void*>(&HookMoveFileExW),
-		reinterpret_cast<const void*>(&HookMoveFileW), reinterpret_cast<const void*>(&HookCreateFileW),
-		reinterpret_cast<const void*>(&HookCreateFileA), reinterpret_cast<const void*>(&HookCloseHandle),
-		reinterpret_cast<const void*>(&HookMoveFileExW), reinterpret_cast<const void*>(&HookMoveFileW)};
+	// Each function as kernel32 and kernelbase export it, and its hook (one
+	// whose real function is missing is left alone).
+	const struct { const char* name; const void* hook; bool real; } hooks[] = {
+		{"CreateFileW", reinterpret_cast<const void*>(&HookCreateFileW), true},
+		{"CreateFileA", reinterpret_cast<const void*>(&HookCreateFileA), true},
+		{"CloseHandle", reinterpret_cast<const void*>(&HookCloseHandle), true},
+		{"MoveFileExW", reinterpret_cast<const void*>(&HookMoveFileExW), true},
+		{"MoveFileW", reinterpret_cast<const void*>(&HookMoveFileW), true},
+		{"MoveFileExA", reinterpret_cast<const void*>(&HookMoveFileExA), gRealMoveFileExA != nullptr},
+		{"MoveFileA", reinterpret_cast<const void*>(&HookMoveFileA), gRealMoveFileExA != nullptr},
+		{"MoveFileWithProgressW", reinterpret_cast<const void*>(&HookMoveFileProgressW), gRealMoveFileProgressW != nullptr},
+		{"ReplaceFileW", reinterpret_cast<const void*>(&HookReplaceFileW), gRealReplaceFileW != nullptr},
+		{"ReplaceFileA", reinterpret_cast<const void*>(&HookReplaceFileA), gRealReplaceFileA != nullptr},
+		{"CopyFileW", reinterpret_cast<const void*>(&HookCopyFileW), gRealCopyFileW != nullptr},
+		{"CopyFileExW", reinterpret_cast<const void*>(&HookCopyFileExW), gRealCopyFileExW != nullptr},
+		{"SetFileInformationByHandle", reinterpret_cast<const void*>(&HookSetFileInfo), gRealSetFileInfo != nullptr},
+	};
+	const void* from[32] = {nullptr};
+	const void* to[32] = {nullptr};
+	int count = 0;
+	for (const auto& h : hooks) {
+		if (!h.real)
+			continue;
+		from[count] = at(k32, h.name);
+		to[count++] = h.hook;
+		from[count] = at(kb, h.name);
+		to[count++] = h.hook;
+	}
 	wchar_t sys[MAX_PATH] = {0};
 	GetWindowsDirectoryW(sys, MAX_PATH);
 	const size_t sysLen = wcslen(sys);
@@ -4997,7 +5124,7 @@ static void InstallZprHooks()
 			_wcsnicmp(me.szModule, L"msvcp", 5) == 0;
 		if (system && !runtime)
 			continue;
-		PatchImports(me.hModule, from, to, 10);
+		PatchImports(me.hModule, from, to, count);
 		++patched;
 	}
 	CloseHandle(snap);
@@ -5111,6 +5238,8 @@ ZFUNC RSViewImage(char* text, double, char*, int, char*, int, char**)
 	LoadViews();
 	View& w = gViews[gPrepSlot];
 	w.path = ProjectImage(gPrepSlot, text);
+	if (!gCurrentZpr.empty())
+		WriteLink(gCurrentZpr);
 	w.imgSX = w.imgSY = 1;
 	w.imgX = w.imgY = 0;
 	// Shown (and the model's outline recorded) now only when snapped to that
