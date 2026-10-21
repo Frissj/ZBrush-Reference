@@ -5,10 +5,10 @@
 // side (PureRef), following ZBrush's zoom, pan and view snaps, which the DLL
 // reads from ZBrush's memory.
 //
-// Install: put JRef.zsc (ZBrush writes it next to this file when this file is
-// loaded with ZScript > Load) and the JRef_Data folder into ZBrush's
-// ZStartup\ZPlugs64 folder; JRef then loads every time ZBrush starts, in
-// ZPlugin > JRef. Where JRef_Data cannot be written, the DLL writes its frames,
+// Install: load this file once with ZScript > Load. ZBrush writes JRef.zsc
+// next to it, and JRef copies JRef.zsc into ZBrush's ZStartup\ZPlugs64 folder
+// and JRef_Data into a folder there; JRef then loads every time ZBrush
+// starts, in ZPlugin > JRef. Where JRef_Data cannot be written, the DLL writes its frames,
 // log and settings to C:\Users\Public\Documents\JRef instead.
 //
 // A project's views, outlines and settings live in a JRef folder next to the
@@ -21,9 +21,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 90"]
+[VarDef, zrsBuild, "build 91"]
 [VarDef, zrsDll, "JRef_Data\JRef64.dll"]
-[VarDef, zrsDllBuild, 90]
+[VarDef, zrsDllBuild, 91]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -259,37 +259,31 @@
 	]
 ]
 
-// The key colour as the document background (Document > Back, gradient Range
-// 0) on a cleared canvas: unlike filled pixels it has no depth, so the model
-// can never go behind it. The user's background is saved by the DLL and put
-// back by Overlay Off.
+// Clears the canvas layer (the model is not drawn after a fill) and gives
+// the DLL the canvas as it then shows, only the document's own background:
+// the reference replaces what still matches it. The background is not
+// changed, so a project saved with the overlay on looks as it always does.
 [RoutineDef, ZRSKeyBackground,
-	[If, [IExists, "Document:Back"],
-		[VarSet, zrsTick, [IGet, "Document:Back"]]
-		[If, zrsTick != 16711935,
-			[FileExecute, zrsDll, "RSValue", [StrMerge, "back ", zrsTick]]
-			[If, [IExists, "Document:Range"], [FileExecute, zrsDll, "RSValue", [StrMerge, "range ", [IGet, "Document:Range"]]]]
-		]
-		[IColorSet, 255, 0, 255]
-		[IPress, "Document:Back"]
-		[If, [IExists, "Document:Range"], [ISet, "Document:Range", 0]]
-		[IColorSet, 255, 255, 255]
-	]
 	[VarSet, zrsCleared, [IExists, "Layer:Clear"]]
 	[If, zrsCleared, [IPress, "Layer:Clear"]]
+	[Sleep, 0.5, [VarSet, zrsTick, 0]]
+	[VarSet, zrsTick, [FileExecute, zrsDll, "RSBackground"]]
 ]
 
+// Projects saved by builds before 91 have the magenta key colour as their
+// background: this puts back the one saved then (grey 48 if none was).
 [RoutineDef, ZRSRestoreBackground,
-	[VarSet, zrsTick, [FileExecute, zrsDll, "RSValue", "back"]]
 	[VarSet, zrsOk, [IExists, "Document:Back"]]
-	[If, zrsTick <= 0, [VarSet, zrsOk, 0]]
-	[If, zrsTick >= 256, [VarSet, zrsOk, 0]]
+	[If, zrsOk, [If, [IGet, "Document:Back"] != 16711935, [VarSet, zrsOk, 0]]]
+	[VarSet, zrsTick, [FileExecute, zrsDll, "RSValue", "back"]]
+	[If, zrsTick <= 0, [VarSet, zrsTick, 48]]
+	[If, zrsTick >= 256, [VarSet, zrsTick, 48]]
 	[If, zrsOk,
 		[IColorSet, zrsTick, zrsTick, zrsTick]
 		[IPress, "Document:Back"]
 		[IColorSet, 255, 255, 255]
+		[If, [IExists, "Document:Range"], [ISet, "Document:Range", [FileExecute, zrsDll, "RSValue", "range"]]]
 	]
-	[If, [IExists, "Document:Range"], [ISet, "Document:Range", [FileExecute, zrsDll, "RSValue", "range"]]]
 ]
 
 // Finds where ZBrush keeps the model's view in memory, so the DLL can follow
@@ -344,14 +338,16 @@
 ]
 
 // Counts in zrsCount how many points of a 30 x 30 grid over the document
-// ZBrush has drawn something other than the key colour at (the model).
+// ZBrush has drawn the model at (anything other than what the empty top left
+// corner holds).
 [RoutineDef, ZRSCountModel,
 	[VarSet, zrsCount, 0]
+	[VarSet, zrsN, [PixolPick, 0, 1, 1]]
 	[VarSet, zrsMult, [IGet, Document:Height] / 60]
 	[Loop, 30,
 		[VarSet, zrsTry, [IGet, Document:Width] / 60]
 		[Loop, 30,
-			[If, [PixolPick, 0, zrsTry, zrsMult] != 16711935, [VarSet, zrsCount, zrsCount + 1]]
+			[If, [PixolPick, 0, zrsTry, zrsMult] != zrsN, [VarSet, zrsCount, zrsCount + 1]]
 			[VarSet, zrsTry, zrsTry + [IGet, Document:Width] / 30]
 		]
 		[VarSet, zrsMult, zrsMult + [IGet, Document:Height] / 30]
@@ -476,6 +472,7 @@
 		[Note, "Put the model in Edit mode first."]
 		,
 		[Note, "JRef: starting the overlay...", "ZPlugin:JRef:Overlay", 0.5]
+		[RoutineCall, ZRSRestoreBackground]
 		[VarSet, zrsAutoAnchored, 0]
 		[If, [FileExecute, zrsDll, "RSAnchorGet", "0"] <= 0,
 			[RoutineCall, ZRSAnchorNow]
@@ -533,13 +530,7 @@
 				[Sleep, 0.5, [VarSet, zrsTick, 0]]
 				[VarSet, zrsMsg2, "overlay ready"]
 				[RoutineCall, ZRSDepthProbe]
-				[VarSet, zrsTick, [FileExecute, zrsDll, "RSOverlayInfo", "32"]]
-				[If, zrsTick < 5,
-					[FileExecute, zrsDll, "RSBlank", [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " frame0.png 255 0 255"]]
-					[RoutineCall, ZRSFramePath]
-					[RoutineCall, ZRSFill]
-					[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nBackground colour did not turn magenta (", zrsTick, "%): using a fill, the model may clip."]]
-				]
+				[If, zrsDebug, [If, [FileExecute, zrsDll, "RSOverlayInfo", "32"] < 5, [Note, "The background was not captured: the reference will not show behind the model."]]]
 				[VarSet, zrsTick, 0]
 				[RoutineCall, ZRSMemProbe]
 				[VarSet, zrsSetResult, zrsResult]
@@ -588,7 +579,7 @@
 ]
 
 [IButton, "ZPlugin:JRef:Overlay Off",
-	"Hide the overlay and give the document its own background back.",
+	"Hide the overlay.",
 	[FileExecute, zrsDll, "RSOverlayStop"]
 	[RoutineCall, ZRSRestoreBackground]
 	[Note, "Overlay off.", , 1]
@@ -862,3 +853,10 @@
 // Loads the DLL now, so it watches ZBrush open and save projects (and opens
 // the JRef project that belongs to each) from the start.
 [FileExecute, zrsDll, "RSProject", "has"]
+
+// Loaded with ZScript > Load from anywhere else: installs itself into
+// ZBrush's ZStartup\ZPlugs64 folder, so it loads every time ZBrush starts.
+[VarSet, zrsTick, [FileExecute, zrsDll, "RSInstall"]]
+[If, zrsTick == 1, [Note, "JRef is installed: it now loads every time ZBrush starts (ZPlugin > JRef)."]]
+[If, zrsTick == -1, [Note, "JRef could not copy itself into ZBrush's ZStartup\ZPlugs64 folder: Windows did not allow writing there."]]
+[If, zrsTick == -3, [Note, "JRef.zsc was not found next to the JRef_Data folder, so JRef could not install itself. Load JRef.txt once more."]]

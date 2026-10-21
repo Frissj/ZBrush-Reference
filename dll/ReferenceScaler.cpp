@@ -10,6 +10,7 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <winternl.h>
 #include <shlwapi.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -236,7 +237,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 90;
+static const int kDllBuild = 91;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -514,14 +515,13 @@ static BOOL CALLBACK FindZBrushWindow(HWND wnd, LPARAM param)
 	return TRUE;
 }
 
-// Stage 2 (keying): the canvas is filled with the key colour, magenta, so
-// the model is the only thing drawn on it that is not magenta. The overlay
+// Stage 2 (keying): the canvas is captured once with only the document's
+// background on it (RSBackground), so the model is what no longer matches
+// that capture. The overlay
 // is excluded from screen capture (SetWindowDisplayAffinity), captures the
 // screen under itself every time the desktop changes (DXGI desktop
 // duplication, or BitBlt where that is unavailable), and shows an opaque copy
-// of it with each pixel's share of magenta replaced by the reference: the
-// model, its edges and X-ray come out right, and magenta never reaches the
-// screen. The copy is at most a frame behind what ZBrush drew.
+// of it with the background replaced by the reference. The copy is at most a frame behind what ZBrush drew.
 //
 // If capture exclusion is unavailable (older Windows) or does not work (a
 // test at start sees the overlay in its own capture), it falls back to
@@ -1493,9 +1493,10 @@ static bool BuildRefLayer(const OverlayState& st)
 	gImgH = levels ? (*levels)[0].h : 0;
 	if (gMode == 1) {
 		const uint32_t g = static_cast<uint32_t>(gBackGrey & 255);
-		FillRect(gRefLayer, 0, 0, w, h, 0xFF000000u | g << 16 | g << 8 | g);
+		memset(gRefLayer.bits, 0, static_cast<size_t>(w) * h * 4);
 		int px, py, pw, ph;
 		PanelRect(w, h, px, py, pw, ph);
+		FillRect(gRefLayer, px, py, px + pw, py + ph, 0xFF000000u | g << 16 | g << 8 | g);
 		if (gMulti) {
 			const int hw = pw / 2, hh = ph / 2;
 			DrawPanelCell(st, gCells[0], px, py, hw, hh);
@@ -1509,7 +1510,7 @@ static bool BuildRefLayer(const OverlayState& st)
 		}
 		return true;
 	}
-	// Classic. No image (none for this view): the background shows black.
+	// Classic. No image (none for this view): the document's background shows.
 	memset(gRefLayer.bits, 0, static_cast<size_t>(w) * h * 4);
 	double x0, y0, dispW, dispH;
 	if (levels && ImageRect(st, x0, y0, dispW, dispH))
@@ -1657,7 +1658,14 @@ struct Duplicator {
 };
 
 static Duplicator gDup;
-static double gMagentaShare = 0;  // percent of the overlay that was key colour
+static double gMagentaShare = 0;  // percent of the overlay that was background
+// The canvas with only the document's background on it (no model), as
+// captured by RSBackground: where the capture still matches it, the
+// background shows and the reference replaces it. ZBrush's own background is
+// left as it is, so nothing of the overlay is saved with a project.
+static std::vector<uint32_t> gBg;
+static int gBgW = 0, gBgH = 0;
+static volatile LONG gBgWanted = 0;
 static double gModelPixels = 0;   // pixels of the overlay that were not
 static int gCaptureMethod = 0;  // 1 desktop duplication, 0 BitBlt
 static double gFps = 0;
@@ -1811,8 +1819,8 @@ static bool UpdatePanelAside(const OverlayState& st)
 	return before != gPanelAside;
 }
 
-// Builds the opaque output from gCapture: each pixel's share of magenta is
-// replaced by the reference (gRefLayer, black where there is none).
+// Builds the opaque output from gCapture: the background is replaced by the
+// reference (gRefLayer, where it has one).
 static void Composite(HWND wnd, const OverlayState& st)
 {
 	const int w = gOutput.w, h = gOutput.h;
@@ -1827,12 +1835,25 @@ static void Composite(HWND wnd, const OverlayState& st)
 	static std::vector<int> rowMagenta, colMagenta;
 	rowMagenta.assign(h, 0);
 	colMagenta.assign(w, 0);
+	// Background: the pixel and its four neighbours as in the background
+	// capture (within 3 per channel), so a pixel of the model that happens to
+	// have the background's colour there is not taken for it.
+	static std::vector<unsigned char> same;
+	same.assign(n, 0);
+	if (gBgW == w && gBgH == h && gBg.size() == n) {
+		const uint32_t* c = reinterpret_cast<const uint32_t*>(gCapture.bits);
+		for (size_t i = 0; i < n; ++i) {
+			const uint32_t a = c[i], b = gBg[i];
+			same[i] = abs(static_cast<int>(a & 255) - static_cast<int>(b & 255)) <= 3 &&
+				abs(static_cast<int>(a >> 8 & 255) - static_cast<int>(b >> 8 & 255)) <= 3 &&
+				abs(static_cast<int>(a >> 16 & 255) - static_cast<int>(b >> 16 & 255)) <= 3;
+		}
+	}
 	for (size_t i = 0; i < n; ++i, cap += 4, ref += 4, out += 4) {
 		const int b = cap[0], g = cap[1], r = cap[2];
-		// Share of magenta: blending any grey with magenta (255, 0, 255) by t
-		// raises R and B above G by t * 255.
-		const int mn = r < b ? r : b;
-		int t = mn > g ? mn - g : 0;
+		const int x = static_cast<int>(i % w), y = static_cast<int>(i / w);
+		int t = same[i] && (x == 0 || same[i - 1]) && (x == w - 1 || same[i + 1]) && (y == 0 || same[i - w]) &&
+			(y == h - 1 || same[i + w]) ? 255 : 0;
 		gKeyShare[i] = static_cast<unsigned char>(t);
 		out[3] = 255;
 		if (t < kModelBelow) {
@@ -1848,11 +1869,14 @@ static void Composite(HWND wnd, const OverlayState& st)
 		}
 		if (t > 200)
 			++magenta;
-		t = t > 230 ? 256 : (t << 8) / 255;
-		const int ob = b + (t * (ref[0] - 255) >> 8), og = g + (t * ref[1] >> 8), orr = r + (t * (ref[2] - 255) >> 8);
-		out[0] = static_cast<unsigned char>(ob < 0 ? 0 : ob > 255 ? 255 : ob);
-		out[1] = static_cast<unsigned char>(og < 0 ? 0 : og > 255 ? 255 : og);
-		out[2] = static_cast<unsigned char>(orr < 0 ? 0 : orr > 255 ? 255 : orr);
+		// The reference (premultiplied) over the background; in PureRef the
+		// background stays (the panel is drawn below).
+		const int a = gMode == 0 ? ref[3] : 0;
+		const int ob = (a ? ref[0] : 0) + b * (255 - a) / 255, og = (a ? ref[1] : 0) + g * (255 - a) / 255,
+			orr = (a ? ref[2] : 0) + r * (255 - a) / 255;
+		out[0] = static_cast<unsigned char>(ob > 255 ? 255 : ob);
+		out[1] = static_cast<unsigned char>(og > 255 ? 255 : og);
+		out[2] = static_cast<unsigned char>(orr > 255 ? 255 : orr);
 	}
 	gMagentaShare = n ? 100.0 * magenta / n : 0;
 	if (gViewX1 > gViewX0 && gViewY1 > gViewY0) {
@@ -3696,6 +3720,7 @@ static bool OverlayStep(HWND wnd)
 			gDup.Release();
 			gDup.failed = false;
 			gViewX0 = gViewY0 = gViewX1 = gViewY1 = 0;
+			gBg.clear();
 			gGizmoBottom = 0;
 		}
 		if (!BuildRefLayer(st)) {
@@ -3715,7 +3740,16 @@ static bool OverlayStep(HWND wnd)
 		return false;
 	}
 	const bool aside = UpdatePanelAside(st);
-	if (Capture(st) || layoutChanged || aside) {
+	bool changed = Capture(st);
+	if (gBgWanted) {
+		gBgW = gCapture.w;
+		gBgH = gCapture.h;
+		const uint32_t* c = reinterpret_cast<const uint32_t*>(gCapture.bits);
+		gBg.assign(c, c + static_cast<size_t>(gBgW) * gBgH);
+		gBgWanted = 0;
+		changed = true;
+	}
+	if (changed || layoutChanged || aside) {
 		Composite(wnd, st);
 		gLastFrameAt = GetTickCount();
 		++fpsFrames;
@@ -4403,6 +4437,25 @@ ZFUNC RSSnapshot(char*, double, char*, int, char*, int, char**)
 	return 1;
 }
 
+// Takes the canvas as it is now (the layer cleared, the model not drawn:
+// only the document's background) as the background the reference replaces.
+// Returns 1, or 0 if the overlay is not capturing.
+ZFUNC RSBackground(char*, double, char*, int, char*, int, char**)
+{
+	if (!gOverlayWnd)
+		return 0;
+	gBgWanted = 1;
+	for (int i = 0; i < 100 && gBgWanted; ++i)
+		Sleep(20);
+	if (gBgWanted) {
+		gBgWanted = 0;
+		return 0;
+	}
+	if (gOverlayWnd)
+		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+	return 1;
+}
+
 // Clears the rotation offset (the view is back at the anchored rotation).
 // Returns 1 if there was one, else 0.
 ZFUNC RSOverlayResetOffset(char*, double, char*, int, char*, int, char**)
@@ -4727,6 +4780,8 @@ struct ZprFile {
 	HANDLE handle;
 	std::wstring path;
 	bool write;
+	LONGLONG readEnd;  // furthest byte read (reads at an offset do not move the file position)
+	bool mapped;       // read through a file mapping
 };
 static std::vector<ZprFile> gZprFiles;
 static volatile LONG gZprCount = 0;  // gZprFiles.size(), read without the lock
@@ -4844,18 +4899,22 @@ static void ZprDone(const std::wstring& zpr, bool write)
 		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
 }
 
-static void TrackZpr(HANDLE h, const std::wstring& path, DWORD access, DWORD disposition)
+static void TrackZprAs(HANDLE h, const std::wstring& path, bool write)
 {
-	if (h == INVALID_HANDLE_VALUE || !IsZpr(path))
+	if (h == INVALID_HANDLE_VALUE || !h || !IsZpr(path))
 		return;
-	const bool write = (access & (GENERIC_WRITE | FILE_WRITE_DATA)) != 0 || disposition == CREATE_ALWAYS || disposition == CREATE_NEW;
 	wchar_t full[MAX_PATH] = {0};
 	const std::wstring p = GetFullPathNameW(path.c_str(), MAX_PATH, full, nullptr) ? std::wstring(full) : path;
 	EnterCriticalSection(&gZprLock);
-	gZprFiles.push_back({h, p, write});
+	gZprFiles.push_back({h, p, write, 0, false});
 	gZprCount = static_cast<LONG>(gZprFiles.size());
 	LeaveCriticalSection(&gZprLock);
 	ProjectLog(write ? "zpr opened for writing" : "zpr opened for reading", p);
+}
+
+static void TrackZpr(HANDLE h, const std::wstring& path, DWORD access, DWORD disposition)
+{
+	TrackZprAs(h, path, (access & (GENERIC_WRITE | FILE_WRITE_DATA)) != 0 || disposition == CREATE_ALWAYS || disposition == CREATE_NEW);
 }
 
 static HANDLE WINAPI HookCreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition,
@@ -4879,12 +4938,12 @@ static HANDLE WINAPI HookCreateFileA(LPCSTR name, DWORD access, DWORD share, LPS
 	return h;
 }
 
-static BOOL WINAPI HookCloseHandle(HANDLE h)
+// A handle is about to be closed: true (with what to do after the close in
+// done and full) if it is a tracked .zpr.
+static bool ZprClosing(HANDLE h, ZprFile& done, bool& full)
 {
-	if (gZprCount == 0)
-		return gRealCloseHandle(h);
-	ZprFile done = {nullptr, L"", false};
-	bool found = false, full = false;
+	bool found = false;
+	full = false;
 	EnterCriticalSection(&gZprLock);
 	for (size_t i = 0; i < gZprFiles.size(); ++i)
 		if (gZprFiles[i].handle == h) {
@@ -4898,13 +4957,25 @@ static BOOL WINAPI HookCloseHandle(HANDLE h)
 	if (found && !done.write) {
 		// Read in full: the file position has reached its end.
 		LARGE_INTEGER size = {}, pos = {}, zero = {};
-		full = GetFileSizeEx(h, &size) && SetFilePointerEx(h, zero, &pos, FILE_CURRENT) && size.QuadPart > 0 &&
-			pos.QuadPart >= size.QuadPart * 9 / 10;
-		char what[96];
-		snprintf(what, sizeof(what), "zpr closed after reading %lld of %lld bytes:", static_cast<long long>(pos.QuadPart),
-			static_cast<long long>(size.QuadPart));
+		if (GetFileSizeEx(h, &size) && SetFilePointerEx(h, zero, &pos, FILE_CURRENT) && size.QuadPart > 0) {
+			const LONGLONG end = std::max(pos.QuadPart, done.readEnd);
+			full = end >= size.QuadPart * 9 / 10 || (done.mapped && done.readEnd == 0);
+		}
+		char what[128];
+		snprintf(what, sizeof(what), "zpr closed after reading %lld (furthest %lld%s) of %lld bytes:", static_cast<long long>(pos.QuadPart),
+			static_cast<long long>(done.readEnd), done.mapped ? ", mapped" : "", static_cast<long long>(size.QuadPart));
 		ProjectLog(what, done.path);
 	}
+	return found;
+}
+
+static BOOL WINAPI HookCloseHandle(HANDLE h)
+{
+	if (gZprCount == 0)
+		return gRealCloseHandle(h);
+	ZprFile done;
+	bool full = false;
+	const bool found = ZprClosing(h, done, full);
 	const BOOL result = gRealCloseHandle(h);
 	if (found && (done.write || full))
 		ZprDone(done.path, done.write);
@@ -5028,6 +5099,237 @@ static BOOL WINAPI HookSetFileInfo(HANDLE h, FILE_INFO_BY_HANDLE_CLASS cls, LPVO
 	return ok;
 }
 
+// ---------------------------------------------------------------------------
+// The same, one level down: ntdll's NtCreateFile, NtOpenFile, NtReadFile,
+// NtCreateSection, NtSetInformationFile and NtClose, which every way of
+// opening, reading, renaming and closing a file ends in (whichever module or
+// runtime ZBrush uses). Each is a system call stub, "mov r10, rcx; mov eax,
+// n" (8 bytes) then the call; its first 5 bytes become a jump to the hook (by
+// way of a relay page near ntdll), and the hook calls the stub through a copy
+// of those 8 bytes that jumps back to the rest.
+// ---------------------------------------------------------------------------
+typedef NTSTATUS(NTAPI* NtCreateFileFn)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG,
+	ULONG, ULONG, PVOID, ULONG);
+typedef NTSTATUS(NTAPI* NtOpenFileFn)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
+typedef NTSTATUS(NTAPI* NtReadFileFn)(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+typedef NTSTATUS(NTAPI* NtCreateSectionFn)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+typedef NTSTATUS(NTAPI* NtSetInformationFileFn)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+typedef NTSTATUS(NTAPI* NtCloseFn)(HANDLE);
+static NtCreateFileFn gNtCreateFile = nullptr;
+static NtOpenFileFn gNtOpenFile = nullptr;
+static NtReadFileFn gNtReadFile = nullptr;
+static NtCreateSectionFn gNtCreateSection = nullptr;
+static NtSetInformationFileFn gNtSetInformationFile = nullptr;
+static NtCloseFn gNtClose = nullptr;
+
+// The file a call names: "\??\C:\..." as a Win32 path, joined to its root
+// directory if it has one. Empty unless it is a .zpr.
+static std::wstring NtZprPath(POBJECT_ATTRIBUTES attr)
+{
+	if (!attr || !attr->ObjectName || !attr->ObjectName->Buffer)
+		return L"";
+	std::wstring name(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(wchar_t));
+	if (!IsZpr(name))
+		return L"";
+	if (name.compare(0, 8, L"\\??\\UNC\\") == 0)
+		name = L"\\\\" + name.substr(8);
+	else if (name.compare(0, 4, L"\\??\\") == 0 || name.compare(0, 4, L"\\\\?\\") == 0)
+		name = name.substr(4);
+	if (attr->RootDirectory) {
+		wchar_t root[MAX_PATH] = {0};
+		const DWORD n = GetFinalPathNameByHandleW(attr->RootDirectory, root, MAX_PATH, FILE_NAME_NORMALIZED);
+		if (n && n < MAX_PATH) {
+			std::wstring r = root;
+			if (r.compare(0, 4, L"\\\\?\\") == 0)
+				r = r.substr(4);
+			if (!r.empty() && r.back() != L'\\')
+				r += L'\\';
+			name = r + name;
+		}
+	}
+	return name;
+}
+
+static bool NtWrites(ACCESS_MASK access, ULONG disposition)
+{
+	// FILE_SUPERSEDE 0, FILE_CREATE 2, FILE_OVERWRITE 4, FILE_OVERWRITE_IF 5.
+	return (access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0 || disposition == 0 || disposition == 2 ||
+		disposition == 4 || disposition == 5;
+}
+
+static NTSTATUS NTAPI HookNtCreateFile(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES attr, PIO_STATUS_BLOCK io,
+	PLARGE_INTEGER alloc, ULONG attrs, ULONG share, ULONG disposition, ULONG options, PVOID ea, ULONG eaLen)
+{
+	const NTSTATUS st = gNtCreateFile(h, access, attr, io, alloc, attrs, share, disposition, options, ea, eaLen);
+	if (st >= 0 && h) {
+		const std::wstring path = NtZprPath(attr);
+		if (!path.empty())
+			TrackZprAs(*h, path, NtWrites(access, disposition));
+	}
+	return st;
+}
+
+static NTSTATUS NTAPI HookNtOpenFile(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES attr, PIO_STATUS_BLOCK io, ULONG share,
+	ULONG options)
+{
+	const NTSTATUS st = gNtOpenFile(h, access, attr, io, share, options);
+	if (st >= 0 && h) {
+		const std::wstring path = NtZprPath(attr);
+		if (!path.empty())
+			TrackZprAs(*h, path, NtWrites(access, 1));
+	}
+	return st;
+}
+
+static NTSTATUS NTAPI HookNtReadFile(HANDLE h, HANDLE ev, PVOID apc, PVOID ctx, PIO_STATUS_BLOCK io, PVOID buf, ULONG len,
+	PLARGE_INTEGER offset, PULONG key)
+{
+	const NTSTATUS st = gNtReadFile(h, ev, apc, ctx, io, buf, len, offset, key);
+	if (gZprCount && st >= 0 && offset && offset->QuadPart >= 0) {
+		EnterCriticalSection(&gZprLock);
+		for (ZprFile& z : gZprFiles)
+			if (z.handle == h)
+				z.readEnd = std::max(z.readEnd, offset->QuadPart + static_cast<LONGLONG>(len));
+		LeaveCriticalSection(&gZprLock);
+	}
+	return st;
+}
+
+static NTSTATUS NTAPI HookNtCreateSection(PHANDLE section, ACCESS_MASK access, POBJECT_ATTRIBUTES attr, PLARGE_INTEGER size,
+	ULONG protect, ULONG attrs, HANDLE file)
+{
+	const NTSTATUS st = gNtCreateSection(section, access, attr, size, protect, attrs, file);
+	if (gZprCount && st >= 0 && file) {
+		EnterCriticalSection(&gZprLock);
+		for (ZprFile& z : gZprFiles)
+			if (z.handle == file)
+				z.mapped = true;
+		LeaveCriticalSection(&gZprLock);
+	}
+	return st;
+}
+
+static NTSTATUS NTAPI HookNtSetInformationFile(HANDLE h, PIO_STATUS_BLOCK io, PVOID info, ULONG len, ULONG cls)
+{
+	const NTSTATUS st = gNtSetInformationFile(h, io, info, len, cls);
+	// FileRenameInformation 10, FileRenameInformationEx 65; the same layout
+	// as FILE_RENAME_INFO.
+	if (st >= 0 && info && (cls == 10 || cls == 65) && len >= sizeof(FILE_RENAME_INFO)) {
+		const FILE_RENAME_INFO* r = static_cast<const FILE_RENAME_INFO*>(info);
+		UNICODE_STRING name = {static_cast<USHORT>(r->FileNameLength), static_cast<USHORT>(r->FileNameLength),
+			const_cast<PWSTR>(r->FileName)};
+		OBJECT_ATTRIBUTES attr = {};
+		attr.Length = sizeof(attr);
+		attr.RootDirectory = r->RootDirectory;
+		attr.ObjectName = &name;
+		const std::wstring to = NtZprPath(&attr);
+		if (!to.empty())
+			ZprWrittenTo("zpr written by renaming to", to.c_str());
+	}
+	return st;
+}
+
+static NTSTATUS NTAPI HookNtClose(HANDLE h)
+{
+	if (gZprCount == 0)
+		return gNtClose(h);
+	ZprFile done;
+	bool full = false;
+	const bool found = ZprClosing(h, done, full);
+	const NTSTATUS st = gNtClose(h);
+	if (found && (done.write || full))
+		ZprDone(done.path, done.write);
+	return st;
+}
+
+// A page within 2 GB of ntdll, for the relays and the copied stub starts.
+static BYTE* NearPage(BYTE* target)
+{
+	SYSTEM_INFO si;
+	GetSystemInfo(&si);
+	const ULONG_PTR gran = si.dwAllocationGranularity;
+	ULONG_PTR base = reinterpret_cast<ULONG_PTR>(target) & ~(gran - 1);
+	for (ULONG_PTR d = gran; d < 0x70000000ull; d += gran) {
+		for (int sign = -1; sign <= 1; sign += 2) {
+			const ULONG_PTR at = sign < 0 ? base - d : base + d;
+			if (sign < 0 && d > base)
+				continue;
+			if (void* p = VirtualAlloc(reinterpret_cast<void*>(at), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE))
+				return static_cast<BYTE*>(p);
+		}
+	}
+	return nullptr;
+}
+
+static void PutJump(BYTE* at, const void* to)
+{
+	// jmp [rip+0]; dq to
+	at[0] = 0xFF;
+	at[1] = 0x25;
+	memset(at + 2, 0, 4);
+	memcpy(at + 6, &to, 8);
+}
+
+// Hooks ntdll's stub name with hook; real gets a way to call the stub.
+// False (nothing changed) if the stub does not start as expected.
+static bool HookStub(HMODULE ntdll, const char* name, const void* hook, void** real, BYTE*& page)
+{
+	BYTE* fn = reinterpret_cast<BYTE*>(GetProcAddress(ntdll, name));
+	if (!fn || !page)
+		return false;
+	if (!(fn[0] == 0x4C && fn[1] == 0x8B && fn[2] == 0xD1 && fn[3] == 0xB8))
+		return false;
+	BYTE* copy = page;    // the first 8 bytes, then a jump to the rest
+	BYTE* relay = page + 32;  // the jump to the hook
+	const LONGLONG rel = relay - (fn + 5);
+	if (rel > 0x7FFFFFFFll || rel < -0x80000000ll)
+		return false;
+	memcpy(copy, fn, 8);
+	PutJump(copy + 8, fn + 8);
+	PutJump(relay, hook);
+	DWORD old;
+	if (!VirtualProtect(fn, 8, PAGE_EXECUTE_READWRITE, &old))
+		return false;
+	*real = copy;
+	BYTE jmp[5] = {0xE9};
+	const int32_t r32 = static_cast<int32_t>(rel);
+	memcpy(jmp + 1, &r32, 4);
+	memcpy(fn, jmp, 5);
+	VirtualProtect(fn, 8, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), fn, 8);
+	page += 64;
+	return true;
+}
+
+// Installs all six or none (any stub not as expected); true if installed.
+static bool InstallNtHooks()
+{
+	HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+	if (!ntdll)
+		return false;
+	const char* names[6] = {"NtCreateFile", "NtOpenFile", "NtReadFile", "NtCreateSection", "NtSetInformationFile", "NtClose"};
+	for (const char* n : names) {
+		const BYTE* fn = reinterpret_cast<const BYTE*>(GetProcAddress(ntdll, n));
+		if (!fn || !(fn[0] == 0x4C && fn[1] == 0x8B && fn[2] == 0xD1 && fn[3] == 0xB8)) {
+			ProjectLog("ntdll stub not as expected, watching imports instead:", Widen(n));
+			return false;
+		}
+	}
+	BYTE* page = NearPage(reinterpret_cast<BYTE*>(GetProcAddress(ntdll, "NtClose")));
+	if (!page)
+		return false;
+	// NtClose last: the others must be in place before closes are watched.
+	bool ok = HookStub(ntdll, "NtCreateFile", reinterpret_cast<const void*>(&HookNtCreateFile), reinterpret_cast<void**>(&gNtCreateFile), page);
+	ok = ok && HookStub(ntdll, "NtOpenFile", reinterpret_cast<const void*>(&HookNtOpenFile), reinterpret_cast<void**>(&gNtOpenFile), page);
+	ok = ok && HookStub(ntdll, "NtReadFile", reinterpret_cast<const void*>(&HookNtReadFile), reinterpret_cast<void**>(&gNtReadFile), page);
+	ok = ok && HookStub(ntdll, "NtCreateSection", reinterpret_cast<const void*>(&HookNtCreateSection),
+		reinterpret_cast<void**>(&gNtCreateSection), page);
+	ok = ok && HookStub(ntdll, "NtSetInformationFile", reinterpret_cast<const void*>(&HookNtSetInformationFile),
+		reinterpret_cast<void**>(&gNtSetInformationFile), page);
+	ok = ok && HookStub(ntdll, "NtClose", reinterpret_cast<const void*>(&HookNtClose), reinterpret_cast<void**>(&gNtClose), page);
+	return ok;
+}
+
 // Points every module's imports of CreateFileW/A and CloseHandle (from
 // kernel32 or kernelbase) at the hooks, except system modules other than
 // the C runtimes ZBrush may read files through.
@@ -5069,6 +5371,15 @@ static void InstallZprHooks()
 	gRealMoveFileExW = reinterpret_cast<MoveFileExWFn>(GetProcAddress(k32, "MoveFileExW"));
 	if (!gRealCreateFileW || !gRealCreateFileA || !gRealCloseHandle || !gRealMoveFileExW)
 		return;
+	if (InstallNtHooks()) {
+		HWND zb = nullptr;
+		EnumWindows(FindZBrushWindow, reinterpret_cast<LPARAM>(&zb));
+		wchar_t title[512] = {0};
+		if (zb)
+			GetWindowTextW(zb, title, 512);
+		ProjectLog("watching ZBrush's project files (ntdll), window:", title);
+		return;
+	}
 	gRealMoveFileExA = reinterpret_cast<MoveFileExAFn>(GetProcAddress(k32, "MoveFileExA"));
 	gRealMoveFileProgressW = reinterpret_cast<MoveFileProgressWFn>(GetProcAddress(k32, "MoveFileWithProgressW"));
 	gRealReplaceFileW = reinterpret_cast<ReplaceFileWFn>(GetProcAddress(k32, "ReplaceFileW"));
@@ -5345,5 +5656,44 @@ ZFUNC RSOverlayStop(char*, double, char*, int, char*, int, char**)
 		LeaveCriticalSection(&gOverlayLock);
 		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
 	}
+	return 1;
+}
+
+// Copies JRef into ZBrush's ZStartup\ZPlugs64 folder (JRef.zsc there, the
+// DLL and icon in JRef_Data next to it), so loading JRef.txt once with
+// ZScript > Load installs it. Returns 1 if installed, 0 if this already is
+// the installed copy, -1 if it could not be written (no permission), -2 if
+// ZBrush has no ZPlugs64 folder, -3 if JRef.zsc is not next to JRef_Data.
+ZFUNC RSInstall(char*, double, char*, int, char*, int, char**)
+{
+	wchar_t exe[MAX_PATH] = {0};
+	GetModuleFileNameW(nullptr, exe, MAX_PATH);
+	const std::wstring plugs = FolderOf(exe) + L"ZStartup\\ZPlugs64\\";
+	if (!IsFolder(plugs))
+		return -2;
+	const std::wstring own = DllFolder();  // the JRef_Data folder
+	const std::wstring parent = FolderOf(own.substr(0, own.size() - 1));  // where JRef.zsc is
+	if (_wcsicmp(parent.c_str(), plugs.c_str()) == 0)
+		return 0;
+	const std::wstring zsc = parent + L"JRef.zsc";
+	if (GetFileAttributesW(zsc.c_str()) == INVALID_FILE_ATTRIBUTES)
+		return -3;
+	const std::wstring data = plugs + L"JRef_Data\\";
+	CreateDirectoryW(data.c_str(), nullptr);
+	const wchar_t* files[2] = {L"JRef64.dll", L"trash.psd"};
+	for (const wchar_t* f : files) {
+		const std::wstring from = own + f, to = data + f;
+		if (!CopyFileW(from.c_str(), to.c_str(), FALSE)) {
+			// The installed DLL is loaded (ZBrush started with it): a loaded
+			// DLL can be renamed, then replaced.
+			const std::wstring old = to + L".old";
+			DeleteFileW(old.c_str());
+			if (!MoveFileExW(to.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING) || !CopyFileW(from.c_str(), to.c_str(), FALSE))
+				return -1;
+		}
+	}
+	if (!CopyFileW(zsc.c_str(), (plugs + L"JRef.zsc").c_str(), FALSE))
+		return -1;
+	ProjectLog("installed into", plugs);
 	return 1;
 }
