@@ -23,6 +23,20 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <emmintrin.h>
+#include <thread>
+#include <atomic>
+#include <ppl.h>
+#include <dwmapi.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
+#include <windows.graphics.capture.interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
+
+// Windows' headers define these as macros (rpcndr.h), which MSVC sees.
+#undef small
+#undef near
 
 #define ZFUNC extern "C" __declspec(dllexport) float
 
@@ -237,7 +251,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 91;
+static const int kDllBuild = 119;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -515,10 +529,9 @@ static BOOL CALLBACK FindZBrushWindow(HWND wnd, LPARAM param)
 	return TRUE;
 }
 
-// Stage 2 (keying): the canvas is captured once with only the document's
-// background on it (RSBackground), so the model is what no longer matches
-// that capture. The overlay
-// is excluded from screen capture (SetWindowDisplayAffinity), captures the
+// Stage 2 (keying): the background is the document's background colour,
+// learned per row from what ZBrush shows (LearnRowBackground), inside the
+// viewport; the model is everything else. The overlay is excluded from screen capture (SetWindowDisplayAffinity), captures the
 // screen under itself every time the desktop changes (DXGI desktop
 // duplication, or BitBlt where that is unavailable), and shows an opaque copy
 // of it with the background replaced by the reference. The copy is at most a frame behind what ZBrush drew.
@@ -1468,10 +1481,20 @@ static void DrawPanelCell(const OverlayState& st, int slot, int x0, int y0, int 
 	double ix, iy, iw, ih;
 	if (!ImageRectFor(vs, (*levels)[0].w, (*levels)[0].h, ix, iy, iw, ih))
 		return;
-	// The viewport as Classic would show it, fitted into the cell.
-	int vx0, vy0, vx1, vy1;
+	// The part of the viewport beside the panel (where the model is worked
+	// on: the panel covers the rest) as Classic would show it, fitted into
+	// the cell, so the model centred there has its reference centred in the
+	// cell.
+	int vx0, vy0, vx1, vy1, px, py, pw, ph;
 	ViewportRect(gRefLayer.w, gRefLayer.h, vx0, vy0, vx1, vy1);
+	PanelRect(gRefLayer.w, gRefLayer.h, px, py, pw, ph);
+	if (gPanelLeft)
+		vx0 = px + pw;
+	else
+		vx1 = px;
 	const double vw = vx1 - vx0, vh = vy1 - vy0;
+	if (vw < 1 || vh < 1)
+		return;
 	const double s = std::min(cw / vw, ch / vh);
 	const double ox = x0 + (cw - vw * s) * 0.5 - vx0 * s, oy = y0 + (ch - vh * s) * 0.5 - vy0 * s;
 	DrawLevels(gRefLayer, *levels, ox + ix * s, oy + iy * s, iw * s, ih * s, x0, y0, x0 + cw, y0 + ch, 255);
@@ -1493,18 +1516,16 @@ static bool BuildRefLayer(const OverlayState& st)
 	gImgH = levels ? (*levels)[0].h : 0;
 	if (gMode == 1) {
 		const uint32_t g = static_cast<uint32_t>(gBackGrey & 255);
-		memset(gRefLayer.bits, 0, static_cast<size_t>(w) * h * 4);
+		FillRect(gRefLayer, 0, 0, w, h, 0xFF000000u | g << 16 | g << 8 | g);
 		int px, py, pw, ph;
 		PanelRect(w, h, px, py, pw, ph);
-		FillRect(gRefLayer, px, py, px + pw, py + ph, 0xFF000000u | g << 16 | g << 8 | g);
 		if (gMulti) {
-			const int hw = pw / 2, hh = ph / 2;
-			DrawPanelCell(st, gCells[0], px, py, hw, hh);
-			DrawPanelCell(st, gCells[1], px + hw, py, pw - hw, hh);
-			DrawPanelCell(st, gCells[2], px + hw, py + hh, pw - hw, ph - hh);
-			DrawPanelCell(st, gCells[3], px, py + hh, hw, ph - hh);
+			// The upper image's view above the lower's (ZPlugin > JRef >
+			// Upper Image and Lower Image).
+			const int hh = ph / 2;
+			DrawPanelCell(st, gMultiA, px, py, pw, hh);
+			DrawPanelCell(st, gMultiB, px, py + hh, pw, ph - hh);
 			FillRect(gRefLayer, px, py + hh - 1, px + pw, py + hh + 1, 0xFF505050u);
-			FillRect(gRefLayer, px + hw - 1, py, px + hw + 1, py + ph, 0xFF505050u);
 		} else {
 			DrawPanelCell(st, ActiveViewSlot(), px, py, pw, ph);
 		}
@@ -1539,6 +1560,7 @@ struct Duplicator {
 	ID3D11Texture2D* staging = nullptr;
 	RECT output = {0, 0, 0, 0};   // the duplicated monitor, screen pixels
 	RECT region = {0, 0, 0, 0};   // what the staging texture holds
+	std::vector<RECT> dirty;      // the last frame's changed rectangles
 	bool failed = false;
 
 	void Release()
@@ -1607,12 +1629,45 @@ struct Duplicator {
 			Release();
 			return -1;
 		}
-		ID3D11Texture2D* frame = nullptr;
-		res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&frame));
-		res->Release();
 		// The part of the rectangle on this monitor, in the monitor's pixels.
 		const int left = sx > output.left ? sx : output.left, top = sy > output.top ? sy : output.top;
 		const int right = sx + w < output.right ? sx + w : output.right, bottom = sy + h < output.bottom ? sy + h : output.bottom;
+		// Nothing to do when only the mouse pointer moved (no new image) or
+		// nothing under the overlay changed: hovering ZBrush's menus or
+		// anything else on screen then costs no copy and no composite. Once
+		// a frame of this rectangle has been taken; the first always is.
+		const bool fresh = !staging || region.left != left || region.top != top || region.right != right || region.bottom != bottom;
+		bool under = info.LastPresentTime.QuadPart != 0 || fresh;
+		if (under && !fresh) {
+			UINT need = 0;
+			dirty.resize(64);
+			HRESULT dr = dup->GetFrameDirtyRects(static_cast<UINT>(dirty.size() * sizeof(RECT)), dirty.data(), &need);
+			if (dr == DXGI_ERROR_MORE_DATA) {
+				dirty.resize(need / sizeof(RECT) + 1);
+				dr = dup->GetFrameDirtyRects(static_cast<UINT>(dirty.size() * sizeof(RECT)), dirty.data(), &need);
+			}
+			UINT moveNeed = 0;
+			DXGI_OUTDUPL_MOVE_RECT mv[1];
+			const HRESULT mr = dup->GetFrameMoveRects(sizeof(mv), mv, &moveNeed);
+			if (SUCCEEDED(dr) && SUCCEEDED(mr) && moveNeed == 0) {
+				under = false;
+				for (UINT k = 0; k < need / sizeof(RECT); ++k) {
+					const RECT& d = dirty[k];
+					if (d.left + output.left < right && d.right + output.left > left && d.top + output.top < bottom && d.bottom + output.top > top) {
+						under = true;
+						break;
+					}
+				}
+			}
+		}
+		if (!under) {
+			res->Release();
+			dup->ReleaseFrame();
+			return 0;
+		}
+		ID3D11Texture2D* frame = nullptr;
+		res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&frame));
+		res->Release();
 		int result = 0;
 		if (frame && right > left && bottom > top) {
 			const int cw = right - left, ch = bottom - top;
@@ -1658,16 +1713,215 @@ struct Duplicator {
 };
 
 static Duplicator gDup;
+
+// Capture of ZBrush's own window (Windows Graphics Capture): it shows ZBrush
+// without the overlay, so the overlay need not be hidden from screen capture
+// (screenshots show it). Frames come when ZBrush draws.
+struct WindowCapture {
+	ID3D11Device* device = nullptr;
+	ID3D11DeviceContext* context = nullptr;
+	ID3D11Texture2D* staging = nullptr;
+	int stagingW = 0, stagingH = 0;
+	HWND target = nullptr;
+	HANDLE arrived = nullptr;
+	winrt::Windows::Graphics::Capture::GraphicsCaptureItem item{nullptr};
+	winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool pool{nullptr};
+	winrt::Windows::Graphics::Capture::GraphicsCaptureSession session{nullptr};
+	winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice rtDevice{nullptr};
+	winrt::Windows::Graphics::SizeInt32 size{0, 0};
+
+	void Release()
+	{
+		try {
+			if (session)
+				session.Close();
+			if (pool)
+				pool.Close();
+		} catch (...) {
+		}
+		session = nullptr;
+		pool = nullptr;
+		item = nullptr;
+		rtDevice = nullptr;
+		if (staging) staging->Release();
+		if (context) context->Release();
+		if (device) device->Release();
+		staging = nullptr;
+		context = nullptr;
+		device = nullptr;
+		stagingW = stagingH = 0;
+	}
+
+	bool Init(HWND wnd)
+	{
+		using namespace winrt::Windows::Graphics::Capture;
+		using winrt::Windows::Graphics::DirectX::DirectXPixelFormat;
+		Release();
+		target = wnd;
+		if (!arrived)
+			arrived = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		try {
+			winrt::init_apartment(winrt::apartment_type::multi_threaded);
+		} catch (...) {
+		}
+		try {
+			if (!GraphicsCaptureSession::IsSupported())
+				return false;
+			if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+					D3D11_SDK_VERSION, &device, nullptr, &context))) {
+				Release();
+				return false;
+			}
+			IDXGIDevice* dxgi = nullptr;
+			device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgi));
+			winrt::com_ptr<::IInspectable> insp;
+			const HRESULT hr = dxgi ? CreateDirect3D11DeviceFromDXGIDevice(dxgi, insp.put()) : E_FAIL;
+			if (dxgi)
+				dxgi->Release();
+			if (FAILED(hr)) {
+				Release();
+				return false;
+			}
+			rtDevice = insp.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+			auto interop = winrt::get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+			if (FAILED(interop->CreateForWindow(wnd, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item))) || !item) {
+				Release();
+				return false;
+			}
+			size = item.Size();
+			pool = Direct3D11CaptureFramePool::CreateFreeThreaded(rtDevice, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+			HANDLE ev = arrived;
+			pool.FrameArrived([ev](auto&&, auto&&) { SetEvent(ev); });
+			session = pool.CreateCaptureSession(item);
+			try {
+				session.IsCursorCaptureEnabled(false);
+			} catch (...) {
+			}
+			// Every frame ZBrush draws (Windows 11 24H2 and later limit the
+			// rate otherwise; build 112 saw at most 32 a second).
+			try {
+				session.MinUpdateInterval(std::chrono::milliseconds(1));
+			} catch (...) {
+			}
+			// No yellow border around ZBrush while it is captured.
+			try {
+				GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless).get();
+				session.IsBorderRequired(false);
+			} catch (...) {
+			}
+			session.StartCapture();
+			return true;
+		} catch (...) {
+			Release();
+			return false;
+		}
+	}
+
+	// As Duplicator::Grab: waits up to timeout ms for a new frame of ZBrush's
+	// window and copies the screen rectangle (sx, sy, w, h) from it.
+	int Grab(int sx, int sy, int w, int h, Buffer32& dst, DWORD timeout)
+	{
+		using winrt::Windows::Graphics::DirectX::DirectXPixelFormat;
+		if (!session)
+			return -1;
+		if (!IsWindow(target)) {
+			Release();
+			return -1;
+		}
+		try {
+			winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame frame{nullptr};
+			for (int pass = 0; pass < 2 && !frame; ++pass) {
+				// The latest frame: older ones waiting are dropped.
+				for (auto next = pool.TryGetNextFrame(); next; next = pool.TryGetNextFrame()) {
+					if (frame)
+						frame.Close();
+					frame = next;
+				}
+				if (!frame && pass == 0)
+					WaitForSingleObject(arrived, timeout);
+			}
+			if (!frame)
+				return 0;
+			const auto cs = frame.ContentSize();
+			if (cs.Width != size.Width || cs.Height != size.Height) {
+				size = cs;
+				pool.Recreate(rtDevice, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+			}
+			auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+			winrt::com_ptr<ID3D11Texture2D> tex;
+			access->GetInterface(__uuidof(ID3D11Texture2D), tex.put_void());
+			// The frame is the window's visible bounds.
+			RECT wr;
+			if (FAILED(DwmGetWindowAttribute(target, DWMWA_EXTENDED_FRAME_BOUNDS, &wr, sizeof(wr))))
+				GetWindowRect(target, &wr);
+			D3D11_TEXTURE2D_DESC td;
+			tex->GetDesc(&td);
+			const int fw = std::min(static_cast<int>(td.Width), cs.Width), fh = std::min(static_cast<int>(td.Height), cs.Height);
+			const int left = std::max(sx, static_cast<int>(wr.left)), top = std::max(sy, static_cast<int>(wr.top));
+			const int right = std::min(sx + w, static_cast<int>(wr.left) + fw), bottom = std::min(sy + h, static_cast<int>(wr.top) + fh);
+			int result = 0;
+			if (right > left && bottom > top) {
+				const int cw = right - left, ch = bottom - top;
+				if (!staging || stagingW != cw || stagingH != ch) {
+					if (staging)
+						staging->Release();
+					staging = nullptr;
+					D3D11_TEXTURE2D_DESC sd = {};
+					sd.Width = cw;
+					sd.Height = ch;
+					sd.MipLevels = 1;
+					sd.ArraySize = 1;
+					sd.Format = td.Format;
+					sd.SampleDesc.Count = 1;
+					sd.Usage = D3D11_USAGE_STAGING;
+					sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+					device->CreateTexture2D(&sd, nullptr, &staging);
+					stagingW = cw;
+					stagingH = ch;
+				}
+				if (staging) {
+					D3D11_BOX box = {static_cast<UINT>(left - wr.left), static_cast<UINT>(top - wr.top), 0,
+						static_cast<UINT>(right - wr.left), static_cast<UINT>(bottom - wr.top), 1};
+					context->CopySubresourceRegion(staging, 0, 0, 0, 0, tex.get(), 0, &box);
+					D3D11_MAPPED_SUBRESOURCE map;
+					if (SUCCEEDED(context->Map(staging, 0, D3D11_MAP_READ, 0, &map))) {
+						if (cw != w || ch != h)
+							memset(dst.bits, 0, static_cast<size_t>(w) * h * 4);
+						for (int y = 0; y < ch; ++y)
+							memcpy(dst.bits + (static_cast<size_t>(top - sy + y) * w + (left - sx)) * 4,
+								static_cast<BYTE*>(map.pData) + static_cast<size_t>(y) * map.RowPitch, cw * 4);
+						context->Unmap(staging, 0);
+						result = 1;
+					}
+				}
+			}
+			frame.Close();
+			return result;
+		} catch (...) {
+			Release();
+			return -1;
+		}
+	}
+};
+
+static WindowCapture gWgc;
+static bool gUseWgc = false;  // the overlay captures ZBrush's window, not the screen
 static double gMagentaShare = 0;  // percent of the overlay that was background
-// The canvas with only the document's background on it (no model), as
-// captured by RSBackground: where the capture still matches it, the
-// background shows and the reference replaces it. ZBrush's own background is
-// left as it is, so nothing of the overlay is saved with a project.
-static std::vector<uint32_t> gBg;
-static int gBgW = 0, gBgH = 0;
-static volatile LONG gBgWanted = 0;
+// The document's background colour on screen, per overlay row (ZBrush's
+// background is flat or a vertical gradient), learned from the frames
+// themselves (LearnRowBackground): a pixel of that colour inside the
+// viewport is background, and the reference replaces it. ZBrush's own
+// background is left as it is, so nothing of the overlay is saved with a
+// project. 0 for a row not learned yet; the colour has 0xFF000000 set.
+static std::vector<uint32_t> gRowBg;
+static DWORD gRowBgAt = 0;
+// The viewport as the calibration capture showed it (where the pattern was
+// seen), applied when the overlay is placed; the viewport is not grown
+// from the background then.
+static int gCalVX0 = 0, gCalVY0 = 0, gCalVX1 = 0, gCalVY1 = 0;
+static bool gViewFixed = false;
 static double gModelPixels = 0;   // pixels of the overlay that were not
-static int gCaptureMethod = 0;  // 1 desktop duplication, 0 BitBlt
+static int gCaptureMethod = 0;  // 2 ZBrush's window, 1 desktop duplication, 0 BitBlt
 static double gFps = 0;
 
 // Fills gCapture with the screen under the overlay. Returns true if it may
@@ -1676,6 +1930,18 @@ static bool Capture(const OverlayState& st)
 {
 	const int w = gCapture.w, h = gCapture.h;
 	const int sx = static_cast<int>(st.screenX), sy = static_cast<int>(st.screenY);
+	if (gUseWgc) {
+		const int got = gWgc.Grab(sx, sy, w, h, gCapture, 8);
+		if (got >= 0) {
+			gCaptureMethod = 2;
+			return got == 1;
+		}
+		// The window capture stopped: the screen is captured instead, which
+		// needs the overlay hidden from it.
+		gUseWgc = false;
+		SetWindowDisplayAffinity(gOverlayWnd, 0x11);
+		return false;
+	}
 	if (!gDup.dup && !gDup.failed) {
 		if (!gDup.Init(sx + w / 2, sy + h / 2))
 			gDup.failed = true;
@@ -1769,10 +2035,10 @@ static void RefreshUiRects()
 	}
 }
 
-// While the cursor is over the panel, the panel steps aside and ZBrush
-// shows under it (its view gizmo, menus drawn inside its window). Cursor
-// changes are logged (the canvas cursor is the one most seen over the
-// canvas outside the panel).
+// While the cursor is over the panel, the panel steps aside: see-through and
+// ZBrush shows under it (its view gizmo, menus drawn inside its window).
+// Cursor changes are logged (the canvas cursor is the one most seen over the
+// viewport outside the panel).
 static bool gPanelAside = false;
 
 static bool UpdatePanelAside(const OverlayState& st)
@@ -1789,7 +2055,9 @@ static bool UpdatePanelAside(const OverlayState& st)
 	int px, py, pw, ph;
 	PanelRect(w, h, px, py, pw, ph);
 	const int x = static_cast<int>(ci.ptScreenPos.x - st.screenX), y = static_cast<int>(ci.ptScreenPos.y - st.screenY);
-	const bool onCanvas = x >= 0 && y >= 0 && x < w && y < h;
+	int vx0, vy0, vx1, vy1;
+	ViewportRect(w, h, vx0, vy0, vx1, vy1);
+	const bool onCanvas = x >= vx0 && y >= vy0 && x < vx1 && y < vy1;
 	const bool onPanel = onCanvas && x >= px && x < px + pw && y >= py && y < py + ph;
 	static std::vector<std::pair<HCURSOR, int>> seen;
 	static HCURSOR canvas = nullptr, logged = reinterpret_cast<HCURSOR>(-1);
@@ -1807,6 +2075,9 @@ static bool UpdatePanelAside(const OverlayState& st)
 	// see-through until the cursor leaves it.
 	if (onPanel)
 		gPanelAside = true;
+	// Only that: guessing when a ZBrush menu was open (by the cursor's shape,
+	// build 115; by where the cursor left the canvas, builds 116 and 117) hid
+	// the panel when it should have shown.
 	if (cur != logged && onCanvas) {
 		logged = cur;
 		if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
@@ -1819,10 +2090,146 @@ static bool UpdatePanelAside(const OverlayState& st)
 	return before != gPanelAside;
 }
 
+static inline bool SameColour(uint32_t a, uint32_t b, int tol = 3)
+{
+	return abs(static_cast<int>(a & 255) - static_cast<int>(b & 255)) <= tol &&
+		abs(static_cast<int>(a >> 8 & 255) - static_cast<int>(b >> 8 & 255)) <= tol &&
+		abs(static_cast<int>(a >> 16 & 255) - static_cast<int>(b >> 16 & 255)) <= tol;
+}
+
+// Learns gRowBg from gCapture, twice a second, going down the viewport from
+// the colour seen most over it (see below). A shaded model never fills a row
+// with one colour, so it cannot become the background, and the background is
+// right however ZBrush tints or graduates it, without ever capturing the
+// canvas empty.
+static void LearnRowBackground()
+{
+	const int w = gCapture.w, h = gCapture.h;
+	const DWORD now = GetTickCount();
+	if (gRowBg.size() == static_cast<size_t>(h) && now - gRowBgAt < 500)
+		return;
+	gRowBgAt = now;
+	gRowBg.assign(h, 0);
+	int vx0, vy0, vx1, vy1;
+	ViewportRect(w, h, vx0, vy0, vx1, vy1);
+	if (vx1 - vx0 < 8 || vy1 - vy0 < 8)
+		return;
+	const uint32_t* c = reinterpret_cast<const uint32_t*>(gCapture.bits);
+	// Counts colours, the first 128 different ones seen (the background is
+	// among the first in any row: it borders the viewport).
+	std::vector<std::pair<uint32_t, int>> counts;
+	size_t last = 0;  // the entry counted last: runs of one colour are quick
+	auto count = [&](uint32_t p) {
+		if (last < counts.size() && counts[last].first == p) {
+			++counts[last].second;
+			return;
+		}
+		for (size_t i = 0; i < counts.size(); ++i)
+			if (counts[i].first == p) {
+				++counts[i].second;
+				last = i;
+				return;
+			}
+		if (counts.size() < 128) {
+			last = counts.size();
+			counts.push_back({p, 1});
+		}
+	};
+	auto most = [&](uint32_t& col) {
+		int best = 0;
+		for (const auto& e : counts)
+			if (e.second > best) { best = e.second; col = e.first; }
+		return best;
+	};
+	// The start: the colour seen most over the whole viewport (every 16th
+	// pixel each way). ([IGet, Document:Back] does not give the colour: starting from
+	// it, the rows crept through the model's greys and the top of the
+	// viewport, depending on what the cursor and menus put there, kept no
+	// background.)
+	uint32_t ref = 0xFF303030u;
+	for (int y = vy0; y < vy1; y += 16)
+		for (int x = vx0; x < vx1; x += 16)
+			count(c[static_cast<size_t>(y) * w + x] | 0xFF000000u);
+	most(ref);
+	// Every 4th pixel of a row is counted, so 4% of the row is a quarter as
+	// many.
+	const int need = std::max(2, (vx1 - vx0) / 100);
+	// Counts by offset from the row above's colour, -12 to 12 per channel, so
+	// a pixel costs one increment (searching a list of the model's shades
+	// near the background took 9 ms, a dropped frame twice a second).
+	static std::vector<int> hist(25 * 25 * 25, 0);
+	static std::vector<int> touched;
+	for (int y = vy0; y < vy1; ++y) {
+		const uint32_t* row = c + static_cast<size_t>(y) * w;
+		// The colour seen most within 12 of the row above's, if at least 4%
+		// of the row has it; else the row above's carries on. (Not simply a
+		// colour filling the row: ZBrush's frame line and tooltips do.)
+		const int r0 = ref & 255, g0 = ref >> 8 & 255, b0 = ref >> 16 & 255;
+		touched.clear();
+		for (int x = vx0; x < vx1; x += 4) {
+			const uint32_t p = row[x];
+			const int dr = static_cast<int>(p & 255) - r0 + 12;
+			const int dg = static_cast<int>(p >> 8 & 255) - g0 + 12;
+			const int db = static_cast<int>(p >> 16 & 255) - b0 + 12;
+			if (static_cast<unsigned>(dr) > 24 || static_cast<unsigned>(dg) > 24 || static_cast<unsigned>(db) > 24)
+				continue;
+			const int i = (db * 25 + dg) * 25 + dr;
+			if (hist[i]++ == 0)
+				touched.push_back(i);
+		}
+		int best = 0, bi = 0;
+		for (int i : touched) {
+			if (hist[i] > best) { best = hist[i]; bi = i; }
+			hist[i] = 0;
+		}
+		if (best >= need)
+			ref = 0xFF000000u | static_cast<uint32_t>(r0 + bi % 25 - 12) |
+				static_cast<uint32_t>(g0 + bi / 25 % 25 - 12) << 8 |
+				static_cast<uint32_t>(b0 + bi / 625 - 12) << 16;
+		gRowBg[y] = ref;
+	}
+}
+
 // Builds the opaque output from gCapture: the background is replaced by the
 // reference (gRefLayer, where it has one).
+// How long each stage of the last Composite took, in ms (for the log).
+static double gStageMs[8] = {0};
+
+// Runs fn(y0, y1) over rows y0 to y1 in bands, one per core (up to 8), and
+// waits: the overlay's per-pixel work, so a frame takes a fraction of the
+// time on one core. The runtime's worker threads stay between frames.
+template <typename Fn>
+static void ParallelRows(int y0, int y1, const Fn& fn)
+{
+	static const int cores = std::max(1, std::min(8, static_cast<int>(std::thread::hardware_concurrency())));
+	const int bands = std::min(cores, std::max(1, (y1 - y0) / 64));
+	if (bands <= 1) {
+		fn(y0, y1);
+		return;
+	}
+	concurrency::parallel_for(0, bands, [&](int b) { fn(y0 + (y1 - y0) * b / bands, y0 + (y1 - y0) * (b + 1) / bands); });
+}
+
+// A row's run of background-coloured pixels, x0 to x1 (past the end), and
+// its region (union-find: parent; area and edge gathered in the root).
+struct BgRun {
+	int y, x0, x1, parent;
+	size_t area;
+	bool edge, keep;
+};
+
 static void Composite(HWND wnd, const OverlayState& st)
 {
+	LARGE_INTEGER compStart;  // for the log: how long a frame takes
+	QueryPerformanceCounter(&compStart);
+	LARGE_INTEGER stageAt = compStart, qpf;
+	QueryPerformanceFrequency(&qpf);
+	auto stage = [&](int k) {
+		LARGE_INTEGER t;
+		QueryPerformanceCounter(&t);
+		gStageMs[k] = 1000.0 * (t.QuadPart - stageAt.QuadPart) / qpf.QuadPart;
+		stageAt = t;
+	};
 	const int w = gOutput.w, h = gOutput.h;
 	const size_t n = static_cast<size_t>(w) * h;
 	gKeyShare.resize(n);
@@ -1835,49 +2242,191 @@ static void Composite(HWND wnd, const OverlayState& st)
 	static std::vector<int> rowMagenta, colMagenta;
 	rowMagenta.assign(h, 0);
 	colMagenta.assign(w, 0);
-	// Background: the pixel and its four neighbours as in the background
-	// capture (within 3 per channel), so a pixel of the model that happens to
-	// have the background's colour there is not taken for it.
-	static std::vector<unsigned char> same;
-	same.assign(n, 0);
-	if (gBgW == w && gBgH == h && gBg.size() == n) {
+	// Background: pixels of their row's background colour (within 1 per
+	// channel) inside the viewport, with their four neighbours too, that
+	// belong to a region of such pixels reaching the viewport's edge or
+	// covering 1% of it. The model's shading can have the background's grey
+	// (its darker parts often do); such patches are enclosed by the model's
+	// other shades and stay model, where before the reference showed through
+	// them as gaps.
+	LearnRowBackground();
+	stage(0);
+	static std::vector<unsigned char> same, bg;
+	static std::vector<BgRun> runs;
+	// Not cleared: only the viewport is read, and every byte of it is
+	// written first.
+	same.resize(n);
+	bg.resize(n);
+	{
+		int vx0, vy0, vx1, vy1;
+		ViewportRect(w, h, vx0, vy0, vx1, vy1);
 		const uint32_t* c = reinterpret_cast<const uint32_t*>(gCapture.bits);
-		for (size_t i = 0; i < n; ++i) {
-			const uint32_t a = c[i], b = gBg[i];
-			same[i] = abs(static_cast<int>(a & 255) - static_cast<int>(b & 255)) <= 3 &&
-				abs(static_cast<int>(a >> 8 & 255) - static_cast<int>(b >> 8 & 255)) <= 3 &&
-				abs(static_cast<int>(a >> 16 & 255) - static_cast<int>(b >> 16 & 255)) <= 3;
+		ParallelRows(vy0, vy1, [&](int ya, int yb) {
+		for (int y = ya; y < yb; ++y) {
+			const uint32_t b = gRowBg.size() == static_cast<size_t>(h) ? gRowBg[y] : 0;
+			const uint32_t* row = c + static_cast<size_t>(y) * w;
+			unsigned char* s = &same[static_cast<size_t>(y) * w];
+			if (!b) {
+				memset(s + vx0, 0, vx1 - vx0);
+				continue;
+			}
+			// Within 1: ZBrush draws its background exactly, and its menu
+			// panels are only 3 off it (51 on a 48 background). Four pixels
+			// at a time: per byte |p - b| <= 1, for blue, green and red.
+			const __m128i bv = _mm_set1_epi32(static_cast<int>(b)), one = _mm_set1_epi8(1), zero = _mm_setzero_si128();
+			int x = vx0;
+			for (; x + 4 <= vx1; x += 4) {
+				const __m128i p = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + x));
+				const __m128i d = _mm_or_si128(_mm_subs_epu8(p, bv), _mm_subs_epu8(bv, p));
+				const int m = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_subs_epu8(d, one), zero));
+				s[x] = (m & 0x7) == 0x7;
+				s[x + 1] = (m & 0x70) == 0x70;
+				s[x + 2] = (m & 0x700) == 0x700;
+				s[x + 3] = (m & 0x7000) == 0x7000;
+			}
+			for (; x < vx1; ++x)
+				s[x] = SameColour(row[x], b, 1);
+		}
+		});
+		// With all four neighbours (those outside the viewport count): thin
+		// bridges of the background's colour, as along the model's
+		// antialiased outline, are cut, so a region cannot leak into the
+		// model through them. Plain byte loops, which the compiler vectorises.
+		static std::vector<unsigned char> ones;
+		ones.assign(w, 1);
+		ParallelRows(vy0, vy1, [&](int ya, int yb) {
+		for (int y = ya; y < yb; ++y) {
+			const size_t r = static_cast<size_t>(y) * w;
+			const unsigned char* s = &same[r];
+			const unsigned char* up = y == vy0 ? ones.data() : s - w;
+			const unsigned char* dn = y == vy1 - 1 ? ones.data() : s + w;
+			unsigned char* o = &bg[r];
+			for (int x = vx0 + 1; x < vx1 - 1; ++x)
+				o[x] = s[x] & s[x - 1] & s[x + 1] & up[x] & dn[x];
+			o[vx0] = s[vx0] & (vx0 + 1 < vx1 ? s[vx0 + 1] : 1) & up[vx0] & dn[vx0];
+			o[vx1 - 1] = s[vx1 - 1] & (vx1 - 2 >= vx0 ? s[vx1 - 2] : 1) & up[vx1 - 1] & dn[vx1 - 1];
+		}
+		});
+		stage(1);
+		// Regions (4-connected), as runs: each row's background is a few
+		// runs, and runs touching across rows are joined (union-find), so a
+		// region costs its runs, not its pixels. A region is background if it
+		// reaches the viewport's edge or covers 1% of it (ZBrush's frame line
+		// encloses most of the canvas, so most of it is the second kind).
+		runs.clear();
+		auto root = [&](int r) {
+			while (runs[r].parent != r) {
+				runs[r].parent = runs[runs[r].parent].parent;
+				r = runs[r].parent;
+			}
+			return r;
+		};
+		size_t prevStart = 0, prevEnd = 0;
+		for (int y = vy0; y < vy1; ++y) {
+			const unsigned char* row = &bg[static_cast<size_t>(y) * w];
+			const size_t curStart = runs.size();
+			size_t p = prevStart;
+			// Eight bytes at a time through long stretches of 0s or 1s.
+			const uint64_t ones8 = 0x0101010101010101ull;
+			for (int x = vx0; x < vx1;) {
+				if (!row[x]) {
+					uint64_t v;
+					while (x + 8 <= vx1 && (memcpy(&v, row + x, 8), v == 0))
+						x += 8;
+					while (x < vx1 && !row[x])
+						++x;
+					continue;
+				}
+				const int x0 = x;
+				uint64_t v;
+				while (x + 8 <= vx1 && (memcpy(&v, row + x, 8), v == ones8))
+					x += 8;
+				while (x < vx1 && row[x])
+					++x;
+				const int id = static_cast<int>(runs.size());
+				runs.push_back({y, x0, x, id, static_cast<size_t>(x - x0), x0 == vx0 || x == vx1 || y == vy0 || y == vy1 - 1, false});
+				while (p < prevEnd && runs[p].x1 <= x0)
+					++p;
+				for (size_t q = p; q < prevEnd && runs[q].x0 < x; ++q) {
+					const int a = root(static_cast<int>(q)), b = root(id);
+					if (a != b)
+						runs[std::max(a, b)].parent = std::min(a, b);
+				}
+			}
+			prevStart = curStart;
+			prevEnd = runs.size();
+		}
+		// Roots have the smallest index of their region, so one pass in
+		// order gathers each region's area and edge into its root.
+		for (size_t i = 0; i < runs.size(); ++i) {
+			const int r = root(static_cast<int>(i));
+			if (r != static_cast<int>(i)) {
+				runs[r].area += runs[i].area;
+				runs[r].edge = runs[r].edge || runs[i].edge;
+			}
+		}
+		const size_t big = std::max<size_t>(2000, static_cast<size_t>(vx1 - vx0) * (vy1 - vy0) / 100);
+		for (size_t i = 0; i < runs.size(); ++i) {
+			const BgRun& r = runs[root(static_cast<int>(i))];
+			runs[i].keep = r.edge || r.area >= big;
 		}
 	}
-	for (size_t i = 0; i < n; ++i, cap += 4, ref += 4, out += 4) {
-		const int b = cap[0], g = cap[1], r = cap[2];
-		const int x = static_cast<int>(i % w), y = static_cast<int>(i / w);
-		int t = same[i] && (x == 0 || same[i - 1]) && (x == w - 1 || same[i + 1]) && (y == 0 || same[i - w]) &&
-			(y == h - 1 || same[i + w]) ? 255 : 0;
-		gKeyShare[i] = static_cast<unsigned char>(t);
-		out[3] = 255;
-		if (t < kModelBelow) {
-			++model;
-			out[0] = static_cast<unsigned char>(b);
-			out[1] = static_cast<unsigned char>(g);
-			out[2] = static_cast<unsigned char>(r);
+	stage(3);
+	// The model everywhere first (a straight copy), then the background runs:
+	// the reference (premultiplied) over the background, opaque or absent
+	// almost everywhere, which needs no blending. In PureRef the background
+	// colour (the panel is drawn below, over the model too).
+	const uint32_t* cap32 = reinterpret_cast<const uint32_t*>(cap);
+	const uint32_t* ref32 = reinterpret_cast<const uint32_t*>(ref);
+	uint32_t* out32 = reinterpret_cast<uint32_t*>(out);
+	// Runs are in row order, so each band of rows has its own runs and rows.
+	std::atomic<size_t> keyed(0);
+	ParallelRows(0, h, [&](int ya, int yb) {
+	const size_t a0 = static_cast<size_t>(ya) * w, a1 = static_cast<size_t>(yb) * w;
+	for (size_t i = a0; i < a1; ++i)
+		out32[i] = cap32[i] | 0xFF000000u;
+	memset(&gKeyShare[a0], 0, a1 - a0);
+	size_t mine = 0;
+	auto first = std::lower_bound(runs.begin(), runs.end(), ya, [](const BgRun& r, int y) { return r.y < y; });
+	for (auto it = first; it != runs.end() && it->y < yb; ++it) {
+		const BgRun& run = *it;
+		if (!run.keep)
 			continue;
+		const size_t i0 = static_cast<size_t>(run.y) * w;
+		const int len = run.x1 - run.x0;
+		memset(&gKeyShare[i0 + run.x0], 255, len);
+		rowMagenta[run.y] += len;
+		mine += len;
+		for (int x = run.x0; x < run.x1; ++x) {
+			const size_t i = i0 + x;
+			const uint32_t rf = ref32[i];
+			const unsigned a = rf >> 24;
+			if (a == 255) {
+				out32[i] = rf;
+			} else if (a != 0) {
+				const uint32_t c = cap32[i];
+				const unsigned k = 255 - a;
+				uint32_t o = 0xFF000000u;
+				for (int s = 0; s < 24; s += 8) {
+					const unsigned v = (rf >> s & 255) + ((c >> s & 255) * k + 127) / 255;
+					o |= (v > 255 ? 255 : v) << s;
+				}
+				out32[i] = o;
+			}
 		}
-		if (t > 128) {
-			++rowMagenta[i / w];
-			++colMagenta[i % w];
-		}
-		if (t > 200)
-			++magenta;
-		// The reference (premultiplied) over the background; in PureRef the
-		// background stays (the panel is drawn below).
-		const int a = gMode == 0 ? ref[3] : 0;
-		const int ob = (a ? ref[0] : 0) + b * (255 - a) / 255, og = (a ? ref[1] : 0) + g * (255 - a) / 255,
-			orr = (a ? ref[2] : 0) + r * (255 - a) / 255;
-		out[0] = static_cast<unsigned char>(ob > 255 ? 255 : ob);
-		out[1] = static_cast<unsigned char>(og > 255 ? 255 : og);
-		out[2] = static_cast<unsigned char>(orr > 255 ? 255 : orr);
 	}
+	keyed += mine;
+	});
+	magenta = keyed;
+	// Per column, only for growing the viewport (one with a fixed viewport
+	// never grows) and the log's spans.
+	if (!gViewFixed)
+		for (const BgRun& run : runs)
+			if (run.keep)
+				for (int x = run.x0; x < run.x1; ++x)
+					++colMagenta[x];
+	model = n - magenta;
+	stage(4);
 	gMagentaShare = n ? 100.0 * magenta / n : 0;
 	if (gViewX1 > gViewX0 && gViewY1 > gViewY0) {
 		// The gizmo: what is not background in the viewport's top right
@@ -1939,16 +2488,37 @@ static void Composite(HWND wnd, const OverlayState& st)
 			if (colMagenta[x] >= 8) { x0 = std::min(x0, x); x1 = x; }
 		for (int y = 0; y < h; ++y)
 			if (rowMagenta[y] >= 8) { y0 = std::min(y0, y); y1 = y; }
+		// The slowest frame since the last stats line (to here, plus the
+		// present before it), and how many went over 8 ms (a dropped frame at
+		// 120 Hz).
+		LARGE_INTEGER now;
+		QueryPerformanceCounter(&now);
+		const double ms = 1000.0 * (now.QuadPart - compStart.QuadPart) / qpf.QuadPart;
+		static double worstMs = 0, worstStage[8];
+		static int frames = 0, slow = 0;
+		++frames;
+		if (ms + gStageMs[6] > 8.0)
+			++slow;
+		if (ms + gStageMs[6] > worstMs) {
+			worstMs = ms + gStageMs[6];
+			memcpy(worstStage, gStageMs, sizeof worstStage);
+		}
 		static DWORD statsAt = 0;
 		if (GetTickCount() - statsAt >= 2000) {
 			statsAt = GetTickCount();
 			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
-				fprintf(f, "%lu capture method %d, %.1f fps, magenta %.1f%%, background spans %d %d to %d %d, viewport %d %d to %d %d, mode %d\n",
-					statsAt, gCaptureMethod, gFps, gMagentaShare, x0, y0, x1, y1, gViewX0, gViewY0, gViewX1, gViewY1, gMode);
+				fprintf(f, "%lu capture method %d, %.1f fps, magenta %.1f%%, background spans %d %d to %d %d, viewport %d %d to %d %d, mode %d, frame %.1f ms to here "
+					"(learn %.1f, match %.1f, regions %.1f, combine %.1f; last present %.1f); worst of %d frames %.1f ms "
+					"(learn %.1f, match %.1f, regions %.1f, combine %.1f, present %.1f), %d over 8 ms\n",
+					statsAt, gCaptureMethod, gFps, gMagentaShare, x0, y0, x1, y1, gViewX0, gViewY0, gViewX1, gViewY1, gMode, ms,
+					gStageMs[0], gStageMs[1], gStageMs[3], gStageMs[4], gStageMs[6], frames, worstMs,
+					worstStage[0], worstStage[1], worstStage[3], worstStage[4], worstStage[6], slow);
 				fclose(f);
 			}
+			worstMs = 0;
+			frames = slow = 0;
 		}
-		if (x1 - x0 >= w / 3 && y1 - y0 >= h / 3) {
+		if (!gViewFixed && x1 - x0 >= w / 3 && y1 - y0 >= h / 3) {
 			const bool had = gViewX1 > gViewX0;
 			const int nx0 = had ? std::min(gViewX0, x0) : x0, ny0 = had ? std::min(gViewY0, y0) : y0;
 			const int nx1 = had ? std::max(gViewX1, x1 + 1) : x1 + 1, ny1 = had ? std::max(gViewY1, y1 + 1) : y1 + 1;
@@ -1974,24 +2544,133 @@ static void Composite(HWND wnd, const OverlayState& st)
 		int px, py, pw, ph;
 		PanelRect(w, h, px, py, pw, ph);
 		const int sx = static_cast<int>(st.screenX), sy = static_cast<int>(st.screenY);
-		for (int y = py; y < py + ph && y < h; ++y) {
+		// ZBrush's menus drawn inside its window over the panel's part of the
+		// canvas, open whether or not the cursor is on them. A menu is a
+		// rectangle filled with one flat colour: 20+ rows whose first long
+		// run (48+ pixels) of one exact colour, not the background, starts at
+		// the same column in the same colour. A model's flat facets have
+		// such runs too, but their edges slant or wobble (nav_log snapshot:
+		// a blockout's black and grey facets, starts drifting row to row).
+		// The panel leaves them (and a margin for their edges and text)
+		// showing.
+		static std::vector<RECT> menus;
+		const size_t menusBefore = menus.size();
+		menus.clear();
+		{
+			const uint32_t* cap32 = reinterpret_cast<const uint32_t*>(gCapture.bits);
+			const int cx0 = std::max(0, px), cx1 = std::min(w, px + pw);
+			int mx0 = 0, mx1 = 0, my0 = 0, rows = 0, last = -100;
+			uint32_t mcol = 0;
+			auto flush = [&]() {
+				if (rows >= 20)
+					menus.push_back({mx0 - 12, my0 - 12, mx1 + 12, last + 13});
+				rows = 0;
+			};
+			for (int y = std::max(0, py); y < py + ph && y < h; ++y) {
+				const uint32_t* row = cap32 + static_cast<size_t>(y) * w;
+				const uint32_t bg = y < static_cast<int>(gRowBg.size()) ? gRowBg[y] : 0;
+				int fx = -1, rx1 = -1;
+				uint32_t fcol = 0;
+				for (int x = cx0; x < cx1;) {
+					const uint32_t v = row[x] & 0xFFFFFFu;
+					int e = x + 1;
+					while (e < cx1 && (row[e] & 0xFFFFFFu) == v)
+						++e;
+					if (e - x >= 48 && !SameColour(v | 0xFF000000u, bg, 2)) {
+						if (fx < 0) {
+							fx = x;
+							fcol = v;
+						}
+						rx1 = e;
+					}
+					x = e;
+				}
+				if (fx < 0)
+					continue;
+				if (rows > 0 && y - last <= 6 && abs(fx - mx0) <= 1 && fcol == mcol) {
+					mx1 = std::max(mx1, rx1);
+				} else {
+					flush();
+					mx0 = fx;
+					mx1 = rx1;
+					my0 = y;
+					mcol = fcol;
+				}
+				++rows;
+				last = y;
+			}
+			flush();
+		}
+		if (menus.size() != menusBefore)
+			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				fprintf(f, "%lu menus over the panel: %zu", GetTickCount(), menus.size());
+				for (const RECT& r : menus)
+					fprintf(f, " [%ld %ld %ld %ld]", r.left, r.top, r.right, r.bottom);
+				fprintf(f, "\n");
+				fclose(f);
+			}
+		// Per row, the panel is drawn between the parts left showing.
+		std::vector<std::pair<int, int>> skip;
+		const int ex0 = std::max(0, px), ex1 = std::min(w, px + pw);
+		for (int y = std::max(0, py); y < py + ph && y < h; ++y) {
 			const uint32_t* src = reinterpret_cast<const uint32_t*>(gRefLayer.bits) + static_cast<size_t>(y) * w;
 			uint32_t* dst = reinterpret_cast<uint32_t*>(gOutput.bits) + static_cast<size_t>(y) * w;
-			for (int x = px; x < px + pw && x < w; ++x) {
-				bool ui = false;
-				for (const RECT& r : gUiRects)
-					if (x + sx >= r.left && x + sx < r.right && y + sy >= r.top && y + sy < r.bottom) {
-						ui = true;
-						break;
-					}
-				if (!ui)
+			skip.clear();
+			for (const RECT& r : gUiRects)
+				if (y + sy >= r.top && y + sy < r.bottom)
+					skip.push_back({static_cast<int>(r.left) - sx, static_cast<int>(r.right) - sx});
+			for (const RECT& r : menus)
+				if (y >= r.top && y < r.bottom)
+					skip.push_back({static_cast<int>(r.left), static_cast<int>(r.right)});
+			std::sort(skip.begin(), skip.end());
+			int x = ex0;
+			for (size_t k = 0; k <= skip.size(); ++k) {
+				const int stop = k < skip.size() ? std::min(ex1, std::max(x, skip[k].first)) : ex1;
+				for (; x < stop; ++x)
 					dst[x] = src[x] | 0xFF000000u;
+				if (k < skip.size())
+					x = std::max(x, std::min(ex1, skip[k].second));
 			}
+		}
+	} else if (gMode == 1) {
+		// Stepped aside: see-through, so ZBrush shows there as it is (build
+		// 115 drew the reference only in the background, the model over it).
+		int px, py, pw, ph;
+		PanelRect(w, h, px, py, pw, ph);
+		const int x0 = std::max(0, px), x1 = std::min(w, px + pw);
+		for (int y = std::max(0, py); y < py + ph && y < h && x1 > x0; ++y)
+			memset(gOutput.bits + (static_cast<size_t>(y) * w + x0) * 4, 0, static_cast<size_t>(x1 - x0) * 4);
+	}
+	{
+		// Outside the viewport (ZBrush's interface over the document's edges)
+		// and over ZBrush's other windows the overlay is see-through, so
+		// ZBrush's menus and popups show as they are, never covered.
+		int vx0, vy0, vx1, vy1;
+		ViewportRect(w, h, vx0, vy0, vx1, vy1);
+		uint32_t* o = reinterpret_cast<uint32_t*>(gOutput.bits);
+		for (int y = 0; y < h; ++y) {
+			uint32_t* row = o + static_cast<size_t>(y) * w;
+			if (y < vy0 || y >= vy1) {
+				memset(row, 0, static_cast<size_t>(w) * 4);
+				continue;
+			}
+			memset(row, 0, static_cast<size_t>(vx0) * 4);
+			memset(row + vx1, 0, static_cast<size_t>(w - vx1) * 4);
+		}
+		const int sx = static_cast<int>(st.screenX), sy = static_cast<int>(st.screenY);
+		for (const RECT& r : gUiRects) {
+			const int x0 = std::max(0, static_cast<int>(r.left) - sx), x1 = std::min(w, static_cast<int>(r.right) - sx);
+			const int y0 = std::max(0, static_cast<int>(r.top) - sy), y1 = std::min(h, static_cast<int>(r.bottom) - sy);
+			for (int y = y0; y < y1; ++y)
+				if (x1 > x0)
+					memset(o + static_cast<size_t>(y) * w + x0, 0, static_cast<size_t>(x1 - x0) * 4);
 		}
 	}
 	if (gAdjust && gMode == 0)
 		DrawGizmo(st, gOutput);
+	stage(5);
 	Present(wnd, st, gOutput, 255);
+	stage(6);
 }
 
 // Checks that the overlay really is left out of screen captures: shows it
@@ -2355,10 +3034,15 @@ static bool TripletValues(double& sx, double& px, double& py, int mode)
 			continue;
 		}
 		// Prefer the copy whose position follows drags (some copies only
-		// ever update the scale), then the busiest, then the latest.
+		// ever update the scale, or only after the button is let go), then
+		// the busiest, then the latest. Moving while rotating does not count
+		// against a copy: ZBrush's live position does move when it turns
+		// about the model (nav_log: x 560.958 to 565.552 in a turn's first
+		// frame), and passing over those copies picked one that only updated
+		// after each drag, so pans lagged a drag behind. MemFollow keeps a
+		// rotation's position change out of the image anyway.
 		const MemTriplet& o = gTriplets[best];
-		if ((t.rotFrames == 0) != (o.rotFrames == 0) ? t.rotFrames == 0 :
-				t.posFrames != o.posFrames ? t.posFrames > o.posFrames :
+		if (t.posFrames != o.posFrames ? t.posFrames > o.posFrames :
 				t.dragFrames != o.dragFrames ? t.dragFrames > o.dragFrames : static_cast<int>(t.changedAt - o.changedAt) > 0)
 			best = static_cast<int>(i);
 	}
@@ -2369,8 +3053,7 @@ static bool TripletValues(double& sx, double& px, double& py, int mode)
 		const MemTriplet& cand = gTriplets[best];
 		double a, b, c;
 		const bool curReadable = MemRead(cur.s, a) && MemRead(cur.x, b) && MemRead(cur.y, c);
-		if (curReadable && !(cur.rotFrames > 0 && cand.rotFrames == 0) &&
-				cand.posFrames <= cur.posFrames * 3 / 2 + 10 && !(cur.dragFrames == 0 && cand.dragFrames > 0))
+		if (curReadable && cand.posFrames <= cur.posFrames * 3 / 2 + 10 && !(cur.dragFrames == 0 && cand.dragFrames > 0))
 			best = gTripletInUse;
 	}
 	if (best < 0)
@@ -2378,17 +3061,19 @@ static bool TripletValues(double& sx, double& px, double& py, int mode)
 	const MemTriplet& t = gTriplets[best];
 	const bool jump = sx > 0 && (fabs(t.s.last / sx - 1) > 0.3 || fabs(t.x.last - px) > 200 || fabs(t.y.last - py) > 200);
 	// ZBrush briefly reuses the view's memory, for example to draw the
-	// navigation head. A big jump is only taken once three reads in a row
-	// show it.
+	// navigation head. A big jump is only taken once the next read carries
+	// on from it (close to it, not equal: a fast zoom or pan keeps changing,
+	// and waiting for equal reads held the image still until the drag
+	// stopped).
 	static int pending = 0;
 	static double pendS = 0, pendX = 0, pendY = 0;
 	if (jump) {
-		const bool same = pending > 0 && fabs(t.s.last / pendS - 1) < 0.02 && fabs(t.x.last - pendX) < 5 && fabs(t.y.last - pendY) < 5;
-		pending = same ? pending + 1 : 1;
+		const bool follows = pending > 0 && fabs(t.s.last / pendS - 1) < 0.3 && fabs(t.x.last - pendX) < 200 && fabs(t.y.last - pendY) < 200;
+		pending = follows ? pending + 1 : 1;
 		pendS = t.s.last;
 		pendX = t.x.last;
 		pendY = t.y.last;
-		if (pending < 3)
+		if (pending < 2)
 			return true;  // keep the values passed in
 	}
 	pending = 0;
@@ -3480,14 +4165,16 @@ static void RotRelate()
 	}
 }
 
-// Reads every candidate. Returns the codes of the ones that are snapped
-// (axis-aligned), without repeats, and whether any changed since the last
-// read (more than rounding). With sinceSettled, only the copies that changed
-// since the view was last looked up count: a copy ZBrush stopped updating
-// would otherwise keep reporting its old view.
+// Reads every candidate. Returns the code most of the snapped (axis-aligned)
+// ones hold (every such code on a tie), and whether any changed since the
+// last read (more than rounding). With sinceSettled, only the copies that
+// changed since the view was last looked up count: a copy ZBrush stopped
+// updating would otherwise keep reporting its old view. A lone copy left on
+// an old view does not count either (nav_log: one copy still on Left while
+// eight were on Front showed a Left image loaded on Front).
 static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = false)
 {
-	std::vector<int> codes;
+	std::vector<int> codes, counts;
 	bool any = false;
 	// The camera turns only while a mouse button is held or in the snap
 	// animation just after: a copy that changes with the buttons up and idle
@@ -3526,12 +4213,23 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 		double canon[9];
 		RotApply(c.rel, m, canon);
 		const int code = RotCode(canon);
-		if (code >= 0 && std::find(codes.begin(), codes.end(), code) == codes.end())
+		if (code < 0)
+			continue;
+		const size_t at = std::find(codes.begin(), codes.end(), code) - codes.begin();
+		if (at == codes.size()) {
 			codes.push_back(code);
+			counts.push_back(0);
+		}
+		++counts[at];
 	}
 	if (changed)
 		*changed = any;
-	return codes;
+	const int most = counts.empty() ? 0 : *std::max_element(counts.begin(), counts.end());
+	std::vector<int> top;
+	for (size_t i = 0; i < codes.size(); ++i)
+		if (counts[i] == most)
+			top.push_back(codes[i]);
+	return top;
 }
 
 static std::vector<int> CurrentRotCodes()
@@ -3719,8 +4417,12 @@ static bool OverlayStep(HWND wnd)
 			// The overlay moved (recalibrated): it may be on another monitor.
 			gDup.Release();
 			gDup.failed = false;
-			gViewX0 = gViewY0 = gViewX1 = gViewY1 = 0;
-			gBg.clear();
+			gViewFixed = gCalVX1 > gCalVX0 && gCalVY1 > gCalVY0;
+			gViewX0 = gCalVX0;
+			gViewY0 = gCalVY0;
+			gViewX1 = gCalVX1;
+			gViewY1 = gCalVY1;
+			gRowBg.clear();
 			gGizmoBottom = 0;
 		}
 		if (!BuildRefLayer(st)) {
@@ -3729,7 +4431,7 @@ static bool OverlayStep(HWND wnd)
 		}
 		shown = st;
 	}
-	if (gKeyState == 1 && !tested) {
+	if (gKeyState == 1 && !tested && !gUseWgc) {
 		tested = true;
 		if (!ExclusionWorks(wnd, st))
 			gKeyState = -1;
@@ -3740,15 +4442,7 @@ static bool OverlayStep(HWND wnd)
 		return false;
 	}
 	const bool aside = UpdatePanelAside(st);
-	bool changed = Capture(st);
-	if (gBgWanted) {
-		gBgW = gCapture.w;
-		gBgH = gCapture.h;
-		const uint32_t* c = reinterpret_cast<const uint32_t*>(gCapture.bits);
-		gBg.assign(c, c + static_cast<size_t>(gBgW) * gBgH);
-		gBgWanted = 0;
-		changed = true;
-	}
+	const bool changed = Capture(st);
 	if (changed || layoutChanged || aside) {
 		Composite(wnd, st);
 		gLastFrameAt = GetTickCount();
@@ -3804,12 +4498,15 @@ static DWORD WINAPI OverlayThread(LPVOID ready)
 	EnumWindows(FindZBrushWindow, reinterpret_cast<LPARAM>(&owner));
 	gOverlayWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
 		wc.lpszClassName, L"JRef", WS_POPUP, 0, 0, 1, 1, owner, nullptr, wc.hInstance, nullptr);
-	// WDA_EXCLUDEFROMCAPTURE (Windows 10 2004 and later): the overlay's own
-	// captures of the screen see what is underneath it.
+	// Capturing ZBrush's window sees what is underneath the overlay, and
+	// screenshots still show the overlay. Without it, WDA_EXCLUDEFROMCAPTURE
+	// (Windows 10 2004 and later) hides the overlay from screen capture, its
+	// own included.
 #ifdef RS_TEST_HIDE_CAPTURE
 	gKeyState = 1;
 #else
-	gKeyState = gOverlayWnd && SetWindowDisplayAffinity(gOverlayWnd, 0x11) ? 1 : 0;
+	gUseWgc = gOverlayWnd && owner && gWgc.Init(owner);
+	gKeyState = gUseWgc || (gOverlayWnd && SetWindowDisplayAffinity(gOverlayWnd, 0x11)) ? 1 : 0;
 #endif
 	if (gOverlayWnd) {
 		LoadNav();
@@ -4046,8 +4743,10 @@ struct Calibration {
 static Calibration gCalibration;
 
 // Finds the calibration pattern in the screen capture. Returns false if the
-// best placement correlates under 0.4.
-static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
+// best placement correlates under 0.4. hint (capture pixels, k > 0) is the
+// last press's placement: when the canvas has not moved, only the fine
+// passes run there (well under a second instead of about 20).
+static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out, const Calibration* hint = nullptr)
 {
 	// Sample grids: one point in the middle of each large pattern block for
 	// the coarse search, four per block for the next pass, then a dense grid
@@ -4060,12 +4759,64 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
 		return s;
 	};
 	const std::vector<Sample> coarse = grid(kBigBlocks, 0.5), medium = grid(4 * kBigBlocks, 0.5), fine = grid(110, 0.37);
-
-	// Coarse search on the capture shrunk by d, over scales 0.25 to 4.
 	const int d = 8;
-	const Rgb small = Shrink(screen, d);
 	std::vector<int> lums;
 	double best = -1e9, bestCorr = -1, bestK = 1, bestX = 0, bestY = 0;
+
+	// Refine at full resolution. The coarse fit is good to about half a large
+	// block, the medium one to about a small block.
+	struct Pass { const std::vector<Sample>* samples; double scaleRange, scaleStep; int offRange, offStep; };
+	auto refine = [&](size_t first) {
+		const int halfBlock = static_cast<int>(0.6 * bestK * frame.w / kBigBlocks) + 2 * d;
+		const Pass passes[] = {
+			{&medium, 0.05, 0.01, halfBlock, 2},
+			{&fine, 0.012, 0.002, 2 + static_cast<int>(1.2 * bestK * frame.w / kSmallBlocks), 1},
+			{&fine, 0.004, 0.001, 2, 1}};
+		for (size_t p = first; p < 3; ++p) {
+			const Pass& pass = passes[p];
+			const double k0 = bestK, x0 = bestX, y0 = bestY;
+			best = -1e9;
+			for (double f = 1 - pass.scaleRange; f <= 1 + pass.scaleRange + 1e-9; f += pass.scaleStep) {
+				const double k = k0 * f;
+				SampleLums(frame, *pass.samples, 0.5 / k, lums);
+				// Keep the document centre fixed while trying scales.
+				const double cx = floor(x0 + (k0 - k) * frame.w * 0.5), cy = floor(y0 + (k0 - k) * frame.h * 0.5);
+				for (int dy = -pass.offRange; dy <= pass.offRange; dy += pass.offStep)
+					for (int dx = -pass.offRange; dx <= pass.offRange; dx += pass.offStep) {
+						int n = 0;
+						const double c = Score(screen, *pass.samples, lums, cx + dx, cy + dy, k, &n);
+						const double s = c > -1 ? Significance(c, n) : -1e9;
+						if (s > best) {
+							best = s;
+							bestCorr = c;
+							bestK = k;
+							bestX = cx + dx;
+							bestY = cy + dy;
+						}
+					}
+			}
+		}
+	};
+	auto done = [&]() {
+		out.pixelsPerDoc = bestK;
+		out.screenX = bestX;
+		out.screenY = bestY;
+		out.percent = 100.0 * bestCorr;
+		return bestCorr >= 0.4;
+	};
+	if (hint && hint->pixelsPerDoc > 0) {
+		bestK = hint->pixelsPerDoc;
+		bestX = hint->screenX;
+		bestY = hint->screenY;
+		refine(1);
+		if (bestCorr >= 0.6)
+			return done();
+		best = -1e9;
+		bestCorr = -1;
+	}
+
+	// Coarse search on the capture shrunk by d, over scales 0.25 to 4.
+	const Rgb small = Shrink(screen, d);
 	for (double k = 0.25; k <= 4.0; k *= 1.04) {
 		const double ks = k / d;  // small-image pixels per document pixel
 		SampleLums(frame, coarse, 0.5 / ks, lums);
@@ -4086,43 +4837,83 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out)
 				}
 			}
 	}
+	refine(0);
+	return done();
+}
 
-	// Refine at full resolution. The coarse fit is good to about half a large
-	// block, the medium one to about a small block.
-	struct Pass { const std::vector<Sample>* samples; double scaleRange, scaleStep; int offRange, offStep; };
-	const int halfBlock = static_cast<int>(0.6 * bestK * frame.w / kBigBlocks) + 2 * d;
-	const Pass passes[] = {
-		{&medium, 0.05, 0.01, halfBlock, 2},
-		{&fine, 0.012, 0.002, 2 + static_cast<int>(1.2 * bestK * frame.w / kSmallBlocks), 1},
-		{&fine, 0.004, 0.001, 2, 1}};
-	for (const Pass& pass : passes) {
-		const double k0 = bestK, x0 = bestX, y0 = bestY;
-		best = -1e9;
-		for (double f = 1 - pass.scaleRange; f <= 1 + pass.scaleRange + 1e-9; f += pass.scaleStep) {
-			const double k = k0 * f;
-			SampleLums(frame, *pass.samples, 0.5 / k, lums);
-			// Keep the document centre fixed while trying scales.
-			const double cx = floor(x0 + (k0 - k) * frame.w * 0.5), cy = floor(y0 + (k0 - k) * frame.h * 0.5);
-			for (int dy = -pass.offRange; dy <= pass.offRange; dy += pass.offStep)
-				for (int dx = -pass.offRange; dx <= pass.offRange; dx += pass.offStep) {
-					int n = 0;
-					const double c = Score(screen, *pass.samples, lums, cx + dx, cy + dy, k, &n);
-					const double s = c > -1 ? Significance(c, n) : -1e9;
-					if (s > best) {
-						best = s;
-						bestCorr = c;
-						bestK = k;
-						bestX = cx + dx;
-						bestY = cy + dy;
+// The part of the document the capture shows the pattern in (the viewport;
+// ZBrush's interface hides the rest), in overlay pixels: each sampled
+// column and row where at least 60% of the samples have the pattern's
+// brightness (fitted to how the screen shows it). False if unclear.
+static bool PatternViewport(const Rgb& frame, const Rgb& screen, double ox, double oy, double k, int ow, int oh,
+	int& x0, int& y0, int& x1, int& y1)
+{
+	const int step = 4;
+	const int cols = ow / step, rows = oh / step;
+	if (cols < 8 || rows < 8 || k <= 0)
+		return false;
+	std::vector<int> fl(static_cast<size_t>(cols) * rows, -1), sl(fl.size(), -1);
+	double sf = 0, ss = 0, sff = 0, sfs = 0;
+	int n = 0;
+	for (int r = 0; r < rows; ++r)
+		for (int c = 0; c < cols; ++c) {
+			const int fx = static_cast<int>((c * step + step / 2) / k), fy = static_cast<int>((r * step + step / 2) / k);
+			const int sx = static_cast<int>(floor(ox + c * step + step / 2)), sy = static_cast<int>(floor(oy + r * step + step / 2));
+			if (fx < 0 || fy < 0 || fx >= frame.w || fy >= frame.h || sx < 0 || sy < 0 || sx >= screen.w || sy >= screen.h)
+				continue;
+			const size_t i = static_cast<size_t>(r) * cols + c;
+			// Both averaged over about 3 x 3 screen pixels: the pattern's
+			// fine noise is not resolved the same way by ZBrush's display.
+			int fc[3];
+			FrameColor(frame, fx, fy, std::max(1.0, 1.5 / k), fc);
+			const unsigned char fp[3] = {static_cast<unsigned char>(fc[0]), static_cast<unsigned char>(fc[1]), static_cast<unsigned char>(fc[2])};
+			fl[i] = Lum(fp);
+			int sum = 0, m = 0;
+			for (int j = sy - 1; j <= sy + 1; ++j)
+				for (int q = sx - 1; q <= sx + 1; ++q)
+					if (q >= 0 && j >= 0 && q < screen.w && j < screen.h) {
+						sum += Lum(screen.at(q, j));
+						++m;
 					}
-				}
+			sl[i] = sum / m;
+			sf += fl[i];
+			ss += sl[i];
+			sff += static_cast<double>(fl[i]) * fl[i];
+			sfs += static_cast<double>(fl[i]) * sl[i];
+			++n;
 		}
-	}
-	out.pixelsPerDoc = bestK;
-	out.screenX = bestX;
-	out.screenY = bestY;
-	out.percent = 100.0 * bestCorr;
-	return bestCorr >= 0.4;
+	const double var = sff - sf * sf / std::max(n, 1);
+	if (n < 64 || var <= 0)
+		return false;
+	const double a = (sfs - sf * ss / n) / var, b = (ss - a * sf) / n;
+	if (a <= 0.2)
+		return false;
+	std::vector<int> colHit(cols, 0), colAll(cols, 0), rowHit(rows, 0), rowAll(rows, 0);
+	for (int r = 0; r < rows; ++r)
+		for (int c = 0; c < cols; ++c) {
+			const size_t i = static_cast<size_t>(r) * cols + c;
+			if (fl[i] < 0)
+				continue;
+			const bool hit = fabs(sl[i] - (a * fl[i] + b)) < 30 * a + 8;
+			colAll[c]++;
+			rowAll[r]++;
+			colHit[c] += hit;
+			rowHit[r] += hit;
+		}
+	int c0 = -1, c1 = -1, r0 = -1, r1 = -1;
+	// 60%: the canvas matches at about 90%, ZBrush's dark interface strips
+	// (close to the pattern's dark blocks) at up to about 50%.
+	for (int c = 0; c < cols; ++c)
+		if (colAll[c] && colHit[c] * 5 >= colAll[c] * 3) { if (c0 < 0) c0 = c; c1 = c; }
+	for (int r = 0; r < rows; ++r)
+		if (rowAll[r] && rowHit[r] * 5 >= rowAll[r] * 3) { if (r0 < 0) r0 = r; r1 = r; }
+	if (c0 < 0 || r0 < 0 || c1 - c0 < cols / 4 || r1 - r0 < rows / 4)
+		return false;
+	x0 = c0 * step;
+	y0 = r0 * step;
+	x1 = std::min(ow, (c1 + 1) * step);
+	y1 = std::min(oh, (r1 + 1) * step);
+	return true;
 }
 
 // Saves an Rgb image as PNG, for diagnosing calibration.
@@ -4176,10 +4967,44 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 	if (!CaptureScreen(r, screen))
 		return -4;
 	SaveRgb(DataFolder() + L"capture.png", screen);
+	// The last placement found (screen pixels, kept in calibration.txt), tried
+	// first: the canvas rarely moves between presses.
+	Calibration hint;
+	if (FILE* f = _wfopen((DataFolder() + L"calibration.txt").c_str(), L"rb")) {
+		if (fscanf(f, "%lf %lf %lf", &hint.pixelsPerDoc, &hint.screenX, &hint.screenY) != 3)
+			hint.pixelsPerDoc = 0;
+		fclose(f);
+	}
+	hint.screenX -= r.left;
+	hint.screenY -= r.top;
 	Calibration cal;
-	const bool found = Calibrate(frame, screen, cal);
+	const DWORD calAt = GetTickCount();
+	const bool found = Calibrate(frame, screen, cal, &hint);
+	// The viewport: where the capture shows the pattern.
+	gCalVX0 = gCalVY0 = gCalVX1 = gCalVY1 = 0;
+	if (found) {
+		const int ow = static_cast<int>(frame.w * cal.pixelsPerDoc + 0.5), oh = static_cast<int>(frame.h * cal.pixelsPerDoc + 0.5);
+		int x0, y0, x1, y1;
+		if (PatternViewport(frame, screen, cal.screenX, cal.screenY, cal.pixelsPerDoc, ow, oh, x0, y0, x1, y1)) {
+			gCalVX0 = x0;
+			gCalVY0 = y0;
+			gCalVX1 = x1;
+			gCalVY1 = y1;
+		}
+	}
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu calibration %s in %lu ms (%s), match %.0f%%, viewport %d %d to %d %d\n", GetTickCount(), found ? "found" : "failed",
+			GetTickCount() - calAt, hint.pixelsPerDoc > 0 && cal.pixelsPerDoc > 0 && fabs(cal.pixelsPerDoc / hint.pixelsPerDoc - 1) < 0.02 ? "near the last one" : "searched",
+			cal.percent, gCalVX0, gCalVY0, gCalVX1, gCalVY1);
+		fclose(f);
+	}
 	cal.screenX += r.left;
 	cal.screenY += r.top;
+	if (found)
+		if (FILE* f = _wfopen((DataFolder() + L"calibration.txt").c_str(), L"wb")) {
+			fprintf(f, "%.6f %.3f %.3f\n", cal.pixelsPerDoc, cal.screenX, cal.screenY);
+			fclose(f);
+		}
 	// The frame's size in document pixels can differ from docW if ZBrush
 	// reports the document size differently; scale to the frame.
 	cal.pixelsPerDoc *= frame.w / dw;
@@ -4206,6 +5031,12 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 		fclose(f);
 	}
 	gOverlay.visible = true;
+	gViewFixed = gCalVX1 > gCalVX0 && gCalVY1 > gCalVY0;
+	gViewX0 = gCalVX0;
+	gViewY0 = gCalVY0;
+	gViewX1 = gCalVX1;
+	gViewY1 = gCalVY1;
+	gRowBgAt = GetTickCount() - 1000;
 	// Only a view's image is shown, once its view is snapped to.
 	LoadViews();
 	LoadDisplay();
@@ -4412,6 +5243,37 @@ ZFUNC RSRotProbe(char* text, double, char*, int, char*, int, char**)
 	return static_cast<float>(n);
 }
 
+// text: "scale x y", the view TransformGet reports now. Returns 1 if the
+// camera and rotation found by an earlier Overlay press are still read
+// right (the memory scans, about 15 seconds, are then not needed again),
+// else 0.
+ZFUNC RSProbeKeep(char* text, double, char*, int, char*, int, char**)
+{
+	double sx, px, py;
+	if (!text || sscanf(text, "%lf %lf %lf", &sx, &px, &py) != 3 || sx <= 0)
+		return 0;
+	EnsureLock();
+	EnterCriticalSection(&gOverlayLock);
+	double ms = sx, mx = px, my = py;
+	bool ok = gMemLocked && gRotLocked && MemValue(gMemScale, ms) && MemValue(gMemX, mx) && MemValue(gMemY, my) &&
+		MemMatch(ms, sx) && MemMatch(mx, px) && MemMatch(my, py);
+	if (ok) {
+		int readable = 0;
+		for (const RotCand& c : gRotCands) {
+			double m[9];
+			if (RotRead(c, m))
+				++readable;
+		}
+		ok = readable > 0;
+	}
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu earlier camera and rotation %s\n", GetTickCount(), ok ? "still read right: scans skipped" : "not usable: scanning");
+		fclose(f);
+	}
+	LeaveCriticalSection(&gOverlayLock);
+	return ok ? 1 : 0;
+}
+
 // Saves what the overlay last captured (snap_capture.png, the canvas as
 // ZBrush drew it) and what it showed (snap_overlay.png) next to the DLL.
 // Returns 1, or 0 if the overlay has not drawn anything yet.
@@ -4434,25 +5296,6 @@ ZFUNC RSSnapshot(char*, double, char*, int, char*, int, char**)
 	LeaveCriticalSection(&gOverlayLock);
 	SaveRgb(DataFolder() + L"snap_capture.png", cap);
 	SaveRgb(DataFolder() + L"snap_overlay.png", out);
-	return 1;
-}
-
-// Takes the canvas as it is now (the layer cleared, the model not drawn:
-// only the document's background) as the background the reference replaces.
-// Returns 1, or 0 if the overlay is not capturing.
-ZFUNC RSBackground(char*, double, char*, int, char*, int, char**)
-{
-	if (!gOverlayWnd)
-		return 0;
-	gBgWanted = 1;
-	for (int i = 0; i < 100 && gBgWanted; ++i)
-		Sleep(20);
-	if (gBgWanted) {
-		gBgWanted = 0;
-		return 0;
-	}
-	if (gOverlayWnd)
-		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
 	return 1;
 }
 
@@ -5364,6 +6207,17 @@ static void InstallZprHooks()
 		return;
 	gZprReady = true;
 	InitializeCriticalSection(&gZprLock);
+	// Only the first JRef DLL in ZBrush watches its files: a second one (the
+	// installed copy and this folder's both loaded, as when an update
+	// installs a copy ZBrush is still about to load) would hook the hooks and
+	// see every save twice. The mutex lives as long as ZBrush.
+	wchar_t name[64];
+	swprintf(name, 64, L"Local\\JRefFileHooks-%lu", GetCurrentProcessId());
+	CreateMutexW(nullptr, FALSE, name);
+	if (GetLastError() == ERROR_ALREADY_EXISTS) {
+		ProjectLog("another JRef DLL already watches ZBrush's project files; this one does not:", DllFolder());
+		return;
+	}
 	HMODULE k32 = GetModuleHandleW(L"kernel32.dll"), kb = GetModuleHandleW(L"kernelbase.dll");
 	gRealCreateFileW = reinterpret_cast<CreateFileWFn>(GetProcAddress(k32, "CreateFileW"));
 	gRealCreateFileA = reinterpret_cast<CreateFileAFn>(GetProcAddress(k32, "CreateFileA"));
@@ -5555,7 +6409,16 @@ ZFUNC RSViewImage(char* text, double, char*, int, char*, int, char**)
 	w.imgX = w.imgY = 0;
 	// Shown (and the model's outline recorded) now only when snapped to that
 	// view; otherwise kept until it is snapped to.
-	const bool here = gRotLocked && AtView(CurrentRotCodes(), gPrepSlot);
+	const std::vector<int> codes = CurrentRotCodes();
+	const bool here = gRotLocked && AtView(codes, gPrepSlot);
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu image for slot %d: rotation locked %d, %zu copies, snapped codes", GetTickCount(), gPrepSlot, gRotLocked ? 1 : 0,
+			gRotCands.size());
+		for (int c : codes)
+			fprintf(f, " %d", c);
+		fprintf(f, " (slot's code %d): %s\n", gPrepSlot < 6 ? kViewCodes[gPrepSlot] : -1, here ? "shown now" : "kept for later");
+		fclose(f);
+	}
 	float result = 1;
 	if (here) {
 		AnchorSlot(gPrepSlot, gPrep);
@@ -5644,6 +6507,138 @@ ZFUNC RSViewGet(char* text, double, char*, int, char*, int, char**)
 }
 
 // Hides the overlay. Returns 1.
+// ---------------------------------------------------------------------------
+// Status: a small message box over ZBrush's window, shown from pressing
+// Overlay until it is done. A ZBrush note only stays up while the script
+// waits on it, and the script is busy in the DLL for most of the press, so
+// the box is the DLL's own window, on its own thread (ZBrush does not pump
+// messages while a script runs). It is click-through and left out of screen
+// captures, so the canvas search and the overlay never see it.
+// ---------------------------------------------------------------------------
+static SRWLOCK gStatusLock = SRWLOCK_INIT;
+static std::wstring gStatusText;
+static HWND gStatusWnd = nullptr;
+static const UINT WM_RS_STATUS = WM_APP + 41;
+
+static void PlaceStatus(HWND wnd)
+{
+	AcquireSRWLockShared(&gStatusLock);
+	const std::wstring text = gStatusText;
+	ReleaseSRWLockShared(&gStatusLock);
+	if (text.empty()) {
+		ShowWindow(wnd, SW_HIDE);
+		return;
+	}
+	HDC dc = GetDC(wnd);
+	HFONT font = static_cast<HFONT>(GetPropW(wnd, L"font"));
+	HGDIOBJ old = SelectObject(dc, font);
+	RECT tr = {0, 0, 900, 0};
+	DrawTextW(dc, text.c_str(), -1, &tr, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+	SelectObject(dc, old);
+	ReleaseDC(wnd, dc);
+	const int w = tr.right + 48, h = tr.bottom + 28;
+	HWND zb = nullptr;
+	EnumWindows(FindZBrushWindow, reinterpret_cast<LPARAM>(&zb));
+	RECT zr;
+	if (!zb || !GetWindowRect(zb, &zr))
+		SystemParametersInfoW(SPI_GETWORKAREA, 0, &zr, 0);
+	const int x = (zr.left + zr.right - w) / 2, y = zr.top + (zr.bottom - zr.top) / 5;
+	SetWindowPos(wnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+	InvalidateRect(wnd, nullptr, TRUE);
+}
+
+static LRESULT CALLBACK StatusProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+	switch (msg) {
+	case WM_RS_STATUS:
+		PlaceStatus(wnd);
+		return 0;
+	case WM_ERASEBKGND:
+		return 1;
+	case WM_PAINT: {
+		PAINTSTRUCT ps;
+		HDC dc = BeginPaint(wnd, &ps);
+		RECT r;
+		GetClientRect(wnd, &r);
+		HBRUSH bg = CreateSolidBrush(RGB(36, 36, 36)), bar = CreateSolidBrush(RGB(232, 128, 32));
+		FillRect(dc, &r, bg);
+		RECT b = {0, 0, 5, r.bottom};
+		FillRect(dc, &b, bar);
+		DeleteObject(bg);
+		DeleteObject(bar);
+		AcquireSRWLockShared(&gStatusLock);
+		const std::wstring text = gStatusText;
+		ReleaseSRWLockShared(&gStatusLock);
+		HGDIOBJ old = SelectObject(dc, static_cast<HFONT>(GetPropW(wnd, L"font")));
+		SetBkMode(dc, TRANSPARENT);
+		SetTextColor(dc, RGB(235, 235, 235));
+		RECT tr = {24, 14, r.right - 24, r.bottom - 14};
+		DrawTextW(dc, text.c_str(), -1, &tr, DT_WORDBREAK | DT_NOPREFIX);
+		SelectObject(dc, old);
+		EndPaint(wnd, &ps);
+		return 0;
+	}
+	case WM_NCHITTEST:
+		return HTTRANSPARENT;
+	case WM_MOUSEACTIVATE:
+		return MA_NOACTIVATE;
+	}
+	return DefWindowProcW(wnd, msg, wp, lp);
+}
+
+static DWORD WINAPI StatusThread(LPVOID ready)
+{
+	WNDCLASSW wc = {};
+	wc.lpfnWndProc = StatusProc;
+	wc.hInstance = GetModuleHandleW(nullptr);
+	wc.lpszClassName = L"JRefStatus";
+	wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+	RegisterClassW(&wc);
+	HWND wnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED, L"JRefStatus",
+		L"JRef", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, wc.hInstance, nullptr);
+	if (wnd) {
+		SetLayeredWindowAttributes(wnd, 0, 240, LWA_ALPHA);
+		SetWindowDisplayAffinity(wnd, 0x11);  // WDA_EXCLUDEFROMCAPTURE
+		HFONT font = CreateFontW(-20, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+		SetPropW(wnd, L"font", font);
+	}
+	gStatusWnd = wnd;
+	SetEvent(static_cast<HANDLE>(ready));
+	if (!wnd)
+		return 0;
+	MSG m;
+	while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+		TranslateMessage(&m);
+		DispatchMessageW(&m);
+	}
+	return 0;
+}
+
+// text: the message to show over ZBrush ("\n" for a new line), or empty to
+// hide it. Returns 1, or 0 if the box could not be made.
+ZFUNC RSStatus(char* text, double, char*, int, char*, int, char**)
+{
+	const std::string t = text ? text : "";
+	AcquireSRWLockExclusive(&gStatusLock);
+	gStatusText = Widen(t.c_str());
+	ReleaseSRWLockExclusive(&gStatusLock);
+	if (!gStatusWnd) {
+		if (t.empty())
+			return 1;
+		HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		HANDLE th = CreateThread(nullptr, 0, StatusThread, ready, 0, nullptr);
+		if (th) {
+			WaitForSingleObject(ready, 2000);
+			CloseHandle(th);
+		}
+		CloseHandle(ready);
+		if (!gStatusWnd)
+			return 0;
+	}
+	PostMessageW(gStatusWnd, WM_RS_STATUS, 0, 0);
+	return 1;
+}
+
 ZFUNC RSOverlayStop(char*, double, char*, int, char*, int, char**)
 {
 	if (gOverlayWnd) {
@@ -5659,11 +6654,41 @@ ZFUNC RSOverlayStop(char*, double, char*, int, char*, int, char**)
 	return 1;
 }
 
-// Copies JRef into ZBrush's ZStartup\ZPlugs64 folder (JRef.zsc there, the
-// DLL and icon in JRef_Data next to it), so loading JRef.txt once with
-// ZScript > Load installs it. Returns 1 if installed, 0 if this already is
-// the installed copy, -1 if it could not be written (no permission), -2 if
-// ZBrush has no ZPlugs64 folder, -3 if JRef.zsc is not next to JRef_Data.
+// text: a switch of the plugin's: "overlay", "overlayoff", "classic",
+// "pureref", "left", "multi", "adjust", or "a N" / "b N" (view N in the
+// upper / lower Multiview image). Returns 1 if it is on, else 0: each switch
+// starts as this, and ZBrush loads the plugin again for every press.
+ZFUNC RSIsOn(char* text, double, char*, int, char*, int, char**)
+{
+	char name[16] = {0};
+	int n = -1;
+	if (!text || sscanf(text, "%15s %d", name, &n) < 1)
+		return 0;
+	EnsureLock();
+	EnterCriticalSection(&gOverlayLock);
+	LoadDisplay();
+	const bool visible = gOverlay.visible;
+	bool on = false;
+	if (strcmp(name, "overlay") == 0) on = visible;
+	else if (strcmp(name, "overlayoff") == 0) on = !visible;
+	else if (strcmp(name, "classic") == 0) on = gMode == 0;
+	else if (strcmp(name, "pureref") == 0) on = gMode == 1;
+	else if (strcmp(name, "left") == 0) on = gPanelLeft != 0;
+	else if (strcmp(name, "multi") == 0) on = gMulti != 0;
+	else if (strcmp(name, "adjust") == 0) on = gAdjust;
+	else if (strcmp(name, "a") == 0) on = gMultiA == n;
+	else if (strcmp(name, "b") == 0) on = gMultiB == n;
+	LeaveCriticalSection(&gOverlayLock);
+	return on ? 1.0f : 0.0f;
+}
+
+// Copies JRef into ZBrush's ZStartup\ZPlugs64 folder (JRef.zsc there as
+// ZZ_JRef.zsc, the DLL and icon in JRef_Data next to it), so loading JRef.txt once with
+// ZScript > Load installs it. Returns 1 if installed, 2 if installed over
+// another build (an update: ZBrush then runs the installed copy, which makes
+// the buttons), 0 if this already is the installed copy, -1 if it could not
+// be written (no permission), -2 if ZBrush has no ZPlugs64 folder, -3 if
+// JRef.zsc is not next to JRef_Data.
 ZFUNC RSInstall(char*, double, char*, int, char*, int, char**)
 {
 	wchar_t exe[MAX_PATH] = {0};
@@ -5675,9 +6700,28 @@ ZFUNC RSInstall(char*, double, char*, int, char*, int, char**)
 	const std::wstring parent = FolderOf(own.substr(0, own.size() - 1));  // where JRef.zsc is
 	if (_wcsicmp(parent.c_str(), plugs.c_str()) == 0)
 		return 0;
+	// Once a session, the same answer after: the top level (and this) runs
+	// on every press.
+	static int done = 0;
+	if (done)
+		return static_cast<float>(done == 1 ? 0 : done);
 	const std::wstring zsc = parent + L"JRef.zsc";
 	if (GetFileAttributesW(zsc.c_str()) == INVALID_FILE_ATTRIBUTES)
 		return -3;
+	// An installed copy that differs from this one is an older build.
+	auto readAll = [](const std::wstring& path, std::string& out) {
+		FILE* f = _wfopen(path.c_str(), L"rb");
+		if (!f)
+			return false;
+		char buf[65536];
+		size_t got;
+		while ((got = fread(buf, 1, sizeof(buf), f)) > 0)
+			out.append(buf, got);
+		fclose(f);
+		return true;
+	};
+	std::string mine, theirs;
+	const bool update = readAll(plugs + L"ZZ_JRef.zsc", theirs) && readAll(zsc, mine) && mine != theirs;
 	const std::wstring data = plugs + L"JRef_Data\\";
 	CreateDirectoryW(data.c_str(), nullptr);
 	const wchar_t* files[2] = {L"JRef64.dll", L"trash.psd"};
@@ -5692,8 +6736,23 @@ ZFUNC RSInstall(char*, double, char*, int, char*, int, char**)
 				return -1;
 		}
 	}
-	if (!CopyFileW(zsc.c_str(), (plugs + L"JRef.zsc").c_str(), FALSE))
+	// Installed as ZZ_JRef.zsc: ZBrush loads ZPlugs64's plugins in name
+	// order, and an update (the installed copy loading this folder's
+	// JRef.txt at startup) stops the plugins after it from loading, so JRef
+	// goes last. A JRef.zsc from before is removed (it would load twice).
+	if (!CopyFileW(zsc.c_str(), (plugs + L"ZZ_JRef.zsc").c_str(), FALSE))
 		return -1;
-	ProjectLog("installed into", plugs);
-	return 1;
+	DeleteFileW((plugs + L"JRef.zsc").c_str());
+	// Where it was installed from, for the installed copy to update itself
+	// at startup when that folder has another build: the folder, then a 0
+	// byte (ZScript's MemReadString reads up to it).
+	if (FILE* f = _wfopen((data + L"source.txt").c_str(), L"wb")) {
+		char path[MAX_PATH * 2] = {0};
+		WideCharToMultiByte(CP_ACP, 0, parent.c_str(), -1, path, sizeof(path), nullptr, nullptr);
+		fwrite(path, 1, strlen(path) + 1, f);
+		fclose(f);
+	}
+	ProjectLog(update ? "installed (an update) into" : "installed into", plugs);
+	done = update ? 2 : 1;
+	return static_cast<float>(done);
 }

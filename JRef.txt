@@ -7,6 +7,7 @@
 //
 // Install: load this file once with ZScript > Load. ZBrush writes JRef.zsc
 // next to it, and JRef copies JRef.zsc into ZBrush's ZStartup\ZPlugs64 folder
+// (as ZZ_JRef.zsc, so it loads after the other plugins)
 // and JRef_Data into a folder there; JRef then loads every time ZBrush
 // starts, in ZPlugin > JRef. Where JRef_Data cannot be written, the DLL writes its frames,
 // log and settings to C:\Users\Public\Documents\JRef instead.
@@ -21,9 +22,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 91"]
+[VarDef, zrsBuild, "build 119"]
 [VarDef, zrsDll, "JRef_Data\JRef64.dll"]
-[VarDef, zrsDllBuild, 91]
+[VarDef, zrsDllBuild, 119]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -48,18 +49,12 @@
 [VarDef, zrsOy, 0]
 [VarDef, zrsZoom, 1]
 [VarDef, zrsOverlayOn, 0]
-[VarDef, zrsTurn, 0]
 [VarDef, zrsCleared, 0]
 [VarDef, zrsMsg2, ""]
-[VarDef, zrsSetResult, 0]
 [VarDef, zrsAutoAnchored, 0]
-[VarDef, zrsMemFound, 0]
 [VarDef, zrsN, 0]
 [VarDef, zrsMult, 0]
 [VarDef, zrsTry, 0]
-[VarDef, zrsCount, 0]
-[VarDef, zrsBestCount, 0]
-[VarDef, zrsBestZ, 0]
 [VarDef, zrsEditFill, -1]
 [VarDef, zrsEditAfter, -1]
 [VarDef, zrsKx, 0]
@@ -74,12 +69,67 @@
 [VarDef, zrsView, -1]
 [VarDef, zrsOk, 0]
 [VarDef, zrsRot, ""]
-[VarDef, zrsL0, ""]
-[VarDef, zrsL1, ""]
-[VarDef, zrsL2, ""]
-[VarDef, zrsL3, ""]
+[VarDef, zrsA, 0]
+[VarDef, zrsB, 0]
+[VarDef, zrsI, 0]
+[VarDef, zrsSw, ""]
+[VarDef, zrsSelf, ""]
+[VarDef, zrsBusy, 0]
+[VarDef, zrsStarted, 0]
 // 1 shows the popups used for finding problems (overlay details, depth fix).
 [VarDef, zrsDebug, 0]
+[VarDef, zrsSrc, ""]
+[VarDef, zrsUpdating, 0]
+
+// The installed copy updates itself: JRef_Data\source.txt (written when it
+// was installed) names the folder it came from, and that folder's
+// JRef_Data\build.txt (written by dll\build.bat) says "build N;". When N is
+// another build, its JRef.txt is loaded instead of starting this copy:
+// ZBrush compiles it and it installs itself over this one. Neither DLL is
+// loaded for this, so there is only ever one JRef DLL in ZBrush and this
+// copy's can be replaced. Anything missing or unreadable: this copy starts
+// as usual.
+// This comes before any button is made, and this copy stops here when it
+// updates: the loaded build then makes the only JRef buttons. When this copy
+// made its buttons first, presses ran this copy's script but not the
+// buttons' commands (nav_log, builds 102 and 107: "plugin script run" but no
+// "overlay pressed"), until ZBrush restarted. Only checked at startup, so a
+// press is never taken over by an update.
+[VarSet, zrsUpdating, 0]
+[If, zrsStarted == 0,
+	[VarSet, zrsFile, [FileNameResolvePath, "JRef_Data\source.txt"]]
+	[If, [FileExists, zrsFile],
+		[MemCreateFromFile, zrsSrcMem, zrsFile]
+		[MemReadString, zrsSrcMem, zrsSrc, 0, 0]
+		[MemDelete, zrsSrcMem]
+		[If, [FileExists, [StrMerge, zrsSrc, "JRef_Data\build.txt"]],
+			[If, [FileExists, [StrMerge, zrsSrc, "JRef.txt"]],
+				[MemCreateFromFile, zrsSrcMem, [StrMerge, zrsSrc, "JRef_Data\build.txt"]]
+				[MemReadString, zrsSrcMem, zrsMsg2, 0, 1]
+				[MemDelete, zrsSrcMem]
+				[If, [StrFind, [StrMerge, "build ", zrsDllBuild, ";"], zrsMsg2] < 0,
+					[VarSet, zrsUpdating, 1]
+				]
+			]
+		]
+	]
+]
+[If, zrsUpdating,
+	[FileNameSetNext, [StrMerge, zrsSrc, "JRef.txt"]]
+	[IPress, "Zscript:Load"]
+	[Exit]
+]
+
+// Loaded with ZScript > Load from anywhere else: installs itself into
+// ZBrush's ZStartup\ZPlugs64 folder, so it loads every time ZBrush starts.
+// In an update this copy makes the session's buttons: ZBrush does not run
+// the newly installed copy until it next starts (build 110 stopped here on
+// an update and JRef was missing), and the installed copy stopped before
+// making any (above), so there is one set.
+[VarSet, zrsTick, [FileExecute, zrsDll, "RSInstall"]]
+[If, zrsTick == 1, [Note, [StrMerge, "JRef ", zrsBuild, " installed."], , 1.5]]
+[If, zrsTick == -1, [Note, "JRef could not copy itself into ZBrush's ZStartup\ZPlugs64 folder: Windows did not allow writing there."]]
+[If, zrsTick == -3, [Note, "JRef.zsc was not found next to the JRef_Data folder, so JRef could not install itself. Load JRef.txt once more."]]
 
 // Sets the variables for the base layout: the image fitted to the document,
 // unscaled (ratio 1, model position = anchor position).
@@ -200,6 +250,8 @@
 // multiple of 90) that no other view has taken. The current zoom and
 // position become the view's anchor, and the model's outline is recorded.
 [RoutineDef, ZRSViewLoad,
+	// Each step is logged (nav_log.txt), so a press that stops shows where.
+	[FileExecute, zrsDll, "RSLog", [StrMerge, "load pressed: ", zrsMsg2, ", ", zrsBuild]]
 	[RoutineCall, ZRSCheckDll]
 	[VarSet, zrsOk, 1]
 	[If, [IGet, Transform:Edit] == 0,
@@ -212,6 +264,7 @@
 			[Note, "Press Overlay first: the views are shown by the overlay."]
 		]
 	]
+	[FileExecute, zrsDll, "RSLog", [StrMerge, "load: edit mode and overlay ok ", zrsOk]]
 	[If, zrsOk,
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
 		[VarSet, zrsRot, [StrMerge, zrsRx, " ", zrsRy, " ", zrsRz]]
@@ -224,11 +277,13 @@
 			[VarSet, zrsOk, 0]
 			[Note, "No image chosen."]
 		]
+		[FileExecute, zrsDll, "RSLog", [StrMerge, "load: file chosen ", zrsOk, " ", zrsFile]]
 	]
 	[If, zrsOk,
 		[VarSet, zrsArgs, [StrMerge, zrsView, " ", zrsSx, " ", zrsPx, " ", zrsPy, " ", zrsRot]]
 		[FileExecute, zrsDll, "RSViewPrep", zrsArgs]
 		[VarSet, zrsResult, [FileExecute, zrsDll, "RSViewImage", zrsFile]]
+		[FileExecute, zrsDll, "RSLog", [StrMerge, "load: result ", zrsResult, ", rotation ", zrsRot]]
 		[If, zrsResult == 2,
 			[If, [FileExecute, zrsDll, "RSOverlayInfo", "39"] > 0,
 				[Note, [StrMerge, zrsMsg2, " image loaded. It shows when you snap to the ", zrsMsg2, " view."], , 2]
@@ -259,15 +314,13 @@
 	]
 ]
 
-// Clears the canvas layer (the model is not drawn after a fill) and gives
-// the DLL the canvas as it then shows, only the document's own background:
-// the reference replaces what still matches it. The background is not
-// changed, so a project saved with the overlay on looks as it always does.
+// Clears the canvas layer (the pattern fill). The DLL learns the document's
+// background colour from the frames and replaces it with the reference. The
+// background is not changed, so a project saved with the overlay on looks as
+// it always does.
 [RoutineDef, ZRSKeyBackground,
 	[VarSet, zrsCleared, [IExists, "Layer:Clear"]]
 	[If, zrsCleared, [IPress, "Layer:Clear"]]
-	[Sleep, 0.5, [VarSet, zrsTick, 0]]
-	[VarSet, zrsTick, [FileExecute, zrsDll, "RSBackground"]]
 ]
 
 // Projects saved by builds before 91 have the magenta key colour as their
@@ -337,117 +390,30 @@
 	]
 ]
 
-// Counts in zrsCount how many points of a 30 x 30 grid over the document
-// ZBrush has drawn the model at (anything other than what the empty top left
-// corner holds).
-[RoutineDef, ZRSCountModel,
-	[VarSet, zrsCount, 0]
-	[VarSet, zrsN, [PixolPick, 0, 1, 1]]
-	[VarSet, zrsMult, [IGet, Document:Height] / 60]
-	[Loop, 30,
-		[VarSet, zrsTry, [IGet, Document:Width] / 60]
-		[Loop, 30,
-			[If, [PixolPick, 0, zrsTry, zrsMult] != zrsN, [VarSet, zrsCount, zrsCount + 1]]
-			[VarSet, zrsTry, zrsTry + [IGet, Document:Width] / 30]
-		]
-		[VarSet, zrsMult, zrsMult + [IGet, Document:Height] / 30]
-	]
-]
-
-// ZBrush stops drawing what is behind its back clipping plane, and a model
-// at the canvas plane (depth 0) is cut off when zoomed out. The ZBrush fix is
-// to bring the model forward in depth. This shrinks the view to 30% (where
-// the cut-off shows), counts how much of the model ZBrush draws with it 5x
-// its scale in front of and behind its depth, keeps whichever shows more,
-// and restores the zoom. The factor is kept with RSValue "depth".
-[RoutineDef, ZRSDepthFix,
-	[TransformGet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
-	[VarSet, zrsBestZ, zrsKz]
-	[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx * 0.3, zrsKsy * 0.3, zrsKsz * 0.3, zrsKrx, zrsKry, zrsKrz]
-	[RoutineCall, ZRSCountModel]
-	[VarSet, zrsBestCount, zrsCount]
-	[VarSet, zrsMemFound, zrsCount]
-	[TransformSet, zrsKx, zrsKy, zrsKz - 5 * zrsKsx, zrsKsx * 0.3, zrsKsy * 0.3, zrsKsz * 0.3, zrsKrx, zrsKry, zrsKrz]
-	[RoutineCall, ZRSCountModel]
-	[VarSet, zrsTurn, zrsCount]
-	[If, zrsCount > zrsBestCount + 2,
-		[VarSet, zrsBestZ, zrsKz - 5 * zrsKsx]
-	]
-	[If, zrsCount > zrsBestCount + 2,
-		[VarSet, zrsBestCount, zrsCount]
-	]
-	[TransformSet, zrsKx, zrsKy, zrsKz + 5 * zrsKsx, zrsKsx * 0.3, zrsKsy * 0.3, zrsKsz * 0.3, zrsKrx, zrsKry, zrsKrz]
-	[RoutineCall, ZRSCountModel]
-	[If, zrsCount > zrsBestCount + 2,
-		[VarSet, zrsBestZ, zrsKz + 5 * zrsKsx]
-	]
-	[If, zrsCount > zrsBestCount + 2,
-		[VarSet, zrsBestCount, zrsCount]
-	]
-	[FileExecute, zrsDll, "RSLog", [StrMerge, "document ", [IGet, Document:Width], " x ", [IGet, Document:Height]]]
-	[VarSet, zrsArgs, [StrMerge, "depth fix: z ", zrsKz, " shows ", zrsMemFound, ", z-5s shows ", zrsTurn, ", z+5s shows ", zrsCount]]
-	[FileExecute, zrsDll, "RSLog", [StrMerge, zrsArgs, ", using ", zrsBestZ]]
-	[TransformSet, zrsKx, zrsKy, zrsBestZ, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
-	[If, zrsBestZ != zrsKz,
-		[FileExecute, zrsDll, "RSValue", [StrMerge, "depth ", zrsBestZ / zrsKsx]]
-		,
-		[FileExecute, zrsDll, "RSValue", "depth 0"]
-	]
-]
-
-// Sets zrsMsg2 to the label of Multiview cell zrsN (0 top left, 1 top
-// right, 2 bottom right, 3 bottom left): "Front View" ... or "No View".
-[RoutineDef, ZRSCellName,
-	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", [StrMerge, "cell ", zrsN]]]
-	[If, zrsTick < 0,
-		[VarSet, zrsMsg2, "No View"]
-		,
-		[RoutineCall, ZRSViewName]
-		[VarSet, zrsMsg2, [StrMerge, zrsMsg2, " View"]]
-	]
-]
-
-// The Multiview views: a popup with a row per cell, its name, an arrow and a
-// button showing its view; pressing the view (or its row) steps it to the
-// next view. Plugin buttons cannot change their text, so this is a popup,
-// rebuilt after every press.
-[RoutineDef, ZRSMultiDialog,
-	[Loop, 100,
-		[VarSet, zrsN, 0]
-		[RoutineCall, ZRSCellName]
-		[VarSet, zrsL0, zrsMsg2]
-		[VarSet, zrsN, 1]
-		[RoutineCall, ZRSCellName]
-		[VarSet, zrsL1, zrsMsg2]
-		[VarSet, zrsN, 2]
-		[RoutineCall, ZRSCellName]
-		[VarSet, zrsL2, zrsMsg2]
-		[VarSet, zrsN, 3]
-		[RoutineCall, ZRSCellName]
-		[VarSet, zrsL3, zrsMsg2]
-		[NoteIButton, "Top Left", , 0, 0, 20, 50, 130, 30]
-		[NoteIButton, "->", , 0, 0, 160, 50, 40, 30]
-		[NoteIButton, zrsL0, , 0, 0, 210, 50, 150, 30]
-		[NoteIButton, "Top Right", , 0, 0, 20, 90, 130, 30]
-		[NoteIButton, "->", , 0, 0, 160, 90, 40, 30]
-		[NoteIButton, zrsL1, , 0, 0, 210, 90, 150, 30]
-		[NoteIButton, "Bottom Right", , 0, 0, 20, 130, 130, 30]
-		[NoteIButton, "->", , 0, 0, 160, 130, 40, 30]
-		[NoteIButton, zrsL2, , 0, 0, 210, 130, 150, 30]
-		[NoteIButton, "Bottom Left", , 0, 0, 20, 170, 130, 30]
-		[NoteIButton, "->", , 0, 0, 160, 170, 40, 30]
-		[NoteIButton, zrsL3, , 0, 0, 210, 170, 150, 30]
-		[NoteIButton, "Done", , 0, 0, 140, 220, 100, 30]
-		[VarSet, zrsTry, [Note, "Multiview: press a view to switch it.", , 0, , , 380, 270]]
-		[VarSet, zrsN, -1]
-		[If, zrsTry > 0, [VarSet, zrsN, 0]]
-		[If, zrsTry > 3, [VarSet, zrsN, 1]]
-		[If, zrsTry > 6, [VarSet, zrsN, 2]]
-		[If, zrsTry > 9, [VarSet, zrsN, 3]]
-		[If, zrsTry > 12, [VarSet, zrsN, -1]]
-		[If, zrsN < 0, [LoopExit]]
-		[FileExecute, zrsDll, "RSDisplay", [StrMerge, "cell ", zrsN, " -1"]]
-	]
+// Lights (orange) every switch that is on in the DLL and darkens the rest.
+// Only called with zrsBusy set: setting a switch can run its commands, which
+// then do nothing (a routine running again inside itself broke it: "The
+// number of inputs exceeds the number of inputs defined", build 108).
+[RoutineDef, ZRSLightSwitches,
+	[ISet, "ZPlugin:JRef:Overlay", [FileExecute, zrsDll, "RSIsOn", "overlay"]]
+	[ISet, "ZPlugin:JRef:Overlay Off", [FileExecute, zrsDll, "RSIsOn", "overlayoff"]]
+	[ISet, "ZPlugin:JRef:Classic", [FileExecute, zrsDll, "RSIsOn", "classic"]]
+	[ISet, "ZPlugin:JRef:PureRef", [FileExecute, zrsDll, "RSIsOn", "pureref"]]
+	[ISet, "ZPlugin:JRef:Panel Left", [FileExecute, zrsDll, "RSIsOn", "left"]]
+	[ISet, "ZPlugin:JRef:Adjust Image", [FileExecute, zrsDll, "RSIsOn", "adjust"]]
+	[ISet, "ZPlugin:JRef:Multiview:Multiview", [FileExecute, zrsDll, "RSIsOn", "multi"]]
+	[ISet, "ZPlugin:JRef:Upper Image:Front", [FileExecute, zrsDll, "RSIsOn", "a 0"]]
+	[ISet, "ZPlugin:JRef:Upper Image:Back", [FileExecute, zrsDll, "RSIsOn", "a 1"]]
+	[ISet, "ZPlugin:JRef:Upper Image:Right", [FileExecute, zrsDll, "RSIsOn", "a 2"]]
+	[ISet, "ZPlugin:JRef:Upper Image:Left", [FileExecute, zrsDll, "RSIsOn", "a 3"]]
+	[ISet, "ZPlugin:JRef:Upper Image:Top", [FileExecute, zrsDll, "RSIsOn", "a 4"]]
+	[ISet, "ZPlugin:JRef:Upper Image:Bottom", [FileExecute, zrsDll, "RSIsOn", "a 5"]]
+	[ISet, "ZPlugin:JRef:Lower Image:Front", [FileExecute, zrsDll, "RSIsOn", "b 0"]]
+	[ISet, "ZPlugin:JRef:Lower Image:Back", [FileExecute, zrsDll, "RSIsOn", "b 1"]]
+	[ISet, "ZPlugin:JRef:Lower Image:Right", [FileExecute, zrsDll, "RSIsOn", "b 2"]]
+	[ISet, "ZPlugin:JRef:Lower Image:Left", [FileExecute, zrsDll, "RSIsOn", "b 3"]]
+	[ISet, "ZPlugin:JRef:Lower Image:Top", [FileExecute, zrsDll, "RSIsOn", "b 4"]]
+	[ISet, "ZPlugin:JRef:Lower Image:Bottom", [FileExecute, zrsDll, "RSIsOn", "b 5"]]
 ]
 
 // ---------------------------------------------------------------------------
@@ -457,21 +423,25 @@
 
 // Overlay: works out the layout for the current camera (rendering it to
 // frame0.png also saves the layout for the DLL), fills the canvas with the
-// calibration pattern, which also hides the model, waits a second so ZBrush
-// repaints the screen, lets the DLL find the pattern on screen, then fills the
-// canvas with the key colour magenta (or with the reference if that failed)
-// and puts the model back. The overlay shows the reference wherever it sees
-// magenta, so the model stays in front.
+// calibration pattern, which also hides the model, waits for ZBrush to
+// repaint the screen, lets the DLL find the pattern on screen (and from it the
+// part of the document ZBrush's interface leaves showing), then clears the
+// canvas and puts the model back. The overlay shows the reference wherever it
+// sees the document's background colour, so the model stays in front. The
+// DLL's status box says what is happening until the press is done.
 // Every fill uses frame0.png: importing a name that already exists replaces
 // that texture in place, so a single name keeps it the last texture.
-[IButton, "ZPlugin:JRef:Overlay",
-	"Show the reference in a click-through window over the canvas, behind the model. Press again to find the canvas again.",
+[RoutineDef, ZRSOverlayGo,
+	// Each step is logged (nav_log.txt), so a press that stops shows where.
+	[FileExecute, zrsDll, "RSLog", [StrMerge, "overlay pressed, ", zrsBuild]]
 	[RoutineCall, ZRSCheckDll]
 	[FileExecute, zrsDll, "RSOverlayStop"]
+	[FileExecute, zrsDll, "RSLog", [StrMerge, "overlay: edit mode ", [IGet, Transform:Edit]]]
 	[If, [IGet, Transform:Edit] == 0,
 		[Note, "Put the model in Edit mode first."]
 		,
-		[Note, "JRef: starting the overlay...", "ZPlugin:JRef:Overlay", 0.5]
+		[FileExecute, zrsDll, "RSStatus", "JRef: starting the overlay..."]
+		[FileExecute, zrsDll, "RSLog", "overlay: status shown"]
 		[RoutineCall, ZRSRestoreBackground]
 		[VarSet, zrsAutoAnchored, 0]
 		[If, [FileExecute, zrsDll, "RSAnchorGet", "0"] <= 0,
@@ -492,23 +462,25 @@
 		// The overlay shows only the views' images, so no image (-3) is fine.
 		// ZScript does not evaluate "a != b && c != d" as two comparisons, so
 		// conditions are built one step at a time.
+		[FileExecute, zrsDll, "RSLog", "overlay: rendering the layout"]
 		[VarSet, zrsResult, [FileExecute, zrsDll, "RSRender", zrsArgs]]
+		[FileExecute, zrsDll, "RSLog", [StrMerge, "overlay: render result ", zrsResult]]
 		[If, zrsResult == -3, [VarSet, zrsResult, 1]]
 		[If, zrsResult != 1,
+			[FileExecute, zrsDll, "RSStatus", ""]
 			[If, zrsDebug, [Note, [StrMerge, "Render failed (", zrsResult, ")."]], [Note, "Overlay could not start. Press Overlay again."]]
 			,
 			[FileExecute, zrsDll, "RSPattern", [StrMerge, [IGet, Document:Width], " ", [IGet, Document:Height], " frame0.png"]]
 			[RoutineCall, ZRSFramePath]
 			[TransformGet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
-			[VarSet, zrsMsg2, "before overlay"]
-			[RoutineCall, ZRSDepthProbe]
 			[RoutineCall, ZRSFillOnly]
-			[VarSet, zrsMsg2, "pattern fill"]
-			[RoutineCall, ZRSDepthProbe]
-			[Sleep, 1, [VarSet, zrsTick, 0]]
+			[FileExecute, zrsDll, "RSStatus", "JRef: finding the canvas..."]
+			[Sleep, 0.5, [VarSet, zrsTick, 0]]
+			[FileExecute, zrsDll, "RSLog", "overlay: finding the canvas"]
 			[RoutineCall, ZRSOverlayOn]
+			[FileExecute, zrsDll, "RSLog", [StrMerge, "overlay: canvas result ", zrsResult]]
 			[If, zrsResult > 0,
-				[Note, "JRef: canvas found, lining up with ZBrush's view...", "ZPlugin:JRef:Overlay", 0.5]
+				[FileExecute, zrsDll, "RSStatus", "JRef: canvas found, lining up with ZBrush's view..."]
 				[RoutineCall, ZRSKeyBackground]
 				,
 				[VarSet, zrsTick, [FileExecute, zrsDll, "RSRender", zrsArgs]]
@@ -527,15 +499,15 @@
 					,
 					[VarSet, zrsMsg, [StrMerge, "Keying unavailable (", zrsResult, "): 0 = this Windows cannot exclude the overlay from capture, -1 = exclusion did not work. The overlay covers the model."]]
 				]
-				[Sleep, 0.5, [VarSet, zrsTick, 0]]
-				[VarSet, zrsMsg2, "overlay ready"]
-				[RoutineCall, ZRSDepthProbe]
-				[If, zrsDebug, [If, [FileExecute, zrsDll, "RSOverlayInfo", "32"] < 5, [Note, "The background was not captured: the reference will not show behind the model."]]]
 				[VarSet, zrsTick, 0]
-				[RoutineCall, ZRSMemProbe]
-				[VarSet, zrsSetResult, zrsResult]
-				[RoutineCall, ZRSDepthFix]
-				[VarSet, zrsResult, zrsSetResult]
+				// The camera and rotation found by an earlier press are kept
+				// while they still read right: the scans take about 15 s.
+				[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+				[VarSet, zrsResult, [FileExecute, zrsDll, "RSProbeKeep", [StrMerge, zrsSx, " ", zrsPx, " ", zrsPy]]]
+				[If, zrsResult != 1,
+					[FileExecute, zrsDll, "RSStatus", "JRef: finding ZBrush's camera in memory (about 15 seconds, once per session)..."]
+					[RoutineCall, ZRSMemProbe]
+				]
 				[If, zrsResult == 1,
 					[VarSet, zrsMsg, [StrMerge, zrsMsg, "\nFound ZBrush's view in memory: zoom and pan follow exactly."]]
 					[If, [FileExecute, zrsDll, "RSOverlayInfo", "39"] > 0,
@@ -551,18 +523,18 @@
 				]
 				[If, zrsCleared == 0, [VarSet, zrsMsg, [StrMerge, zrsMsg, "\nLayer:Clear not found, the model may show stripes."]]]
 				[If, zrsAutoAnchored, [VarSet, zrsMsg, [StrMerge, zrsMsg, "\nNo anchor was set: anchored at the current view."]]]
-				[If, zrsDebug,
-					[Note, [StrMerge, zrsArgs, "\n", zrsMsg]]
-					[If, [FileExecute, zrsDll, "RSValue", "depth"] != 0,
-						[Note, [StrMerge, "Moved the model off ZBrush's back clipping plane, to depth ", zrsBestZ]]
-						,
-						[Note, [StrMerge, "Depth unchanged: the model showed at ", zrsMemFound, " / ", zrsTurn, " / ", zrsCount, " of 900 points (now / in front / behind)."]]
-					]
-				]
+				// Shows the image of the view snapped to now: views are
+				// otherwise looked up only when the rotation changes, so after
+				// Overlay none showed until the camera turned (nav_log: Classic
+				// stayed empty on Front with a Front image).
+				[FileExecute, zrsDll, "RSViewNow", "go"]
+				[FileExecute, zrsDll, "RSStatus", ""]
+				[If, zrsDebug, [Note, [StrMerge, zrsArgs, "\n", zrsMsg]]]
 				[Note, "Overlay on.", "ZPlugin:JRef:Overlay", 1.5]
 				// No image is shown until a view is snapped to (the DLL looks views
 				// up as the rotation changes).
 				,
+				[FileExecute, zrsDll, "RSStatus", ""]
 				[VarSet, zrsMsg, "-3: frame0.png missing.\n-4: screen capture failed.\n-5: the pattern was not found on screen."]
 				[VarSet, zrsArgs, [StrMerge, "Overlay failed (", zrsResult, "). Best match ", zrsTick, "% at ", zrsOx, ", ", zrsOy]]
 				[If, zrsDebug,
@@ -575,35 +547,93 @@
 			]
 		]
 	]
-	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:JRef:Overlay Off",
-	"Hide the overlay.",
-	[FileExecute, zrsDll, "RSOverlayStop"]
-	[RoutineCall, ZRSRestoreBackground]
-	[Note, "Overlay off.", , 1]
-	, 0, 0.5
-]
+// Switches light orange while on. Each starts as the DLL's setting (RSIsOn),
+// and every press ends by setting all of them from the DLL
+// (ZRSLightSwitches), since ZBrush can put a pressed switch back to how it
+// started (build 111: Overlay never lit). A switch is never read: [IGet] on
+// a switch can flip it (build 112: both Classic and PureRef lit, and pressing
+// the wrongly lit Classic only ran its off commands). Setting a switch can run
+// its commands, so while a press is being handled (zrsBusy) switch commands do
+// nothing, and every command is safe to run again (it only applies what the
+// DLL already says, or pressing the lit one just relights it). ZBrush 2021
+// and later show a switch given a width disabled (greyed) until IEnable (end
+// of this file).
 
-[IButton, "ZPlugin:JRef:Classic",
-	"Classic: the reference shows behind the model.",
-	[FileExecute, zrsDll, "RSDisplay", "mode 0"]
-	[Note, "Classic: the reference shows behind the model.", , 1.5]
-	, 0, 0.5
+// What each switch's press does. A switch's on and off commands are the
+// same: which one ZBrush runs says nothing, since loading the plugin for a
+// press puts the switch back to how it started first (build 113: the first
+// Overlay press ran its off commands, so Overlay took two presses).
+
+// Starts the overlay, or finds the canvas again when it is on.
+[RoutineDef, ZRSPressOverlay,
+	[RoutineCall, ZRSOverlayGo]
 ]
-[IButton, "ZPlugin:JRef:PureRef",
-	"PureRef: the reference shows in a panel at the side, zoomed and panned with the camera.",
+[RoutineDef, ZRSPressOverlayOff,
+	[If, [FileExecute, zrsDll, "RSIsOn", "overlay"],
+		[FileExecute, zrsDll, "RSOverlayStop"]
+		[FileExecute, zrsDll, "RSStatus", ""]
+		[RoutineCall, ZRSRestoreBackground]
+	]
+]
+[RoutineDef, ZRSPressPureRef,
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSValue", "back"]]
 	[If, zrsTick < 256, [FileExecute, zrsDll, "RSDisplay", [StrMerge, "back ", zrsTick]]]
 	[FileExecute, zrsDll, "RSDisplay", "mode 1"]
-	[Note, "PureRef: the reference shows in a panel at the side.", , 1.5]
+]
+// Turns Adjust Image off when it is on, else on.
+[RoutineDef, ZRSPressAdjust,
+	[If, [FileExecute, zrsDll, "RSIsOn", "adjust"],
+		[FileExecute, zrsDll, "RSAdjust", "0"]
+		,
+		// The note comes first: while Adjust Image is on, clicks on the image
+		// do not reach ZBrush.
+		[VarSet, zrsTick, [FileExecute, zrsDll, "RSAdjust", "2"]]
+		[If, zrsTick == 1,
+			[Note, "Adjust Image: drag the image to move it, drag a corner or edge or right-drag to scale it.\nPress Adjust Image again or Esc when done.", , 2]
+			[FileExecute, zrsDll, "RSAdjust", "1"]
+			,
+			[If, zrsTick == 0, [Note, "No reference image is showing: snap to a view that has one."]]
+			[If, zrsTick == -1, [Note, "Press Overlay first."]]
+			[If, zrsTick == -2, [Note, "Adjust Image works in Classic mode (ZPlugin > JRef > Classic)."]]
+		]
+	]
+]
+
+// Overlay and Overlay Off: the lit one says whether the overlay is on.
+[ISwitch, "ZPlugin:JRef:Overlay", [FileExecute, zrsDll, "RSIsOn", "overlay"],
+	"Show the reference in a click-through window over the canvas, behind the model (lit while on). Press again to find the canvas again.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressOverlay] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressOverlay] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
 	, 0, 0.5
 ]
-[IButton, "ZPlugin:JRef:Panel Side",
-	"PureRef: move the panel to the other side of the canvas.",
-	[VarSet, zrsTick, [FileExecute, zrsDll, "RSDisplay", "left -1"]]
-	[If, zrsTick == 1, [Note, "PureRef panel on the left.", , 1], [Note, "PureRef panel on the right.", , 1]]
+
+[ISwitch, "ZPlugin:JRef:Overlay Off", [FileExecute, zrsDll, "RSIsOn", "overlayoff"],
+	"Hide the overlay (lit while it is off).",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressOverlayOff] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressOverlayOff] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
+	, 0, 0.5
+]
+
+// Classic and PureRef are one choice: the lit one is the mode.
+[ISwitch, "ZPlugin:JRef:Classic", [FileExecute, zrsDll, "RSIsOn", "classic"],
+	"Classic: the reference shows behind the model.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "mode 0"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "mode 0"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
+	, 0, 0.5
+]
+[ISwitch, "ZPlugin:JRef:PureRef", [FileExecute, zrsDll, "RSIsOn", "pureref"],
+	"PureRef: the reference shows in a panel at the side, zoomed and panned with the camera.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressPureRef] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressPureRef] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
+	, 0, 0.5
+]
+// Each press moves the panel to the other side ("left -1" toggles it).
+[ISwitch, "ZPlugin:JRef:Panel Left", [FileExecute, zrsDll, "RSIsOn", "left"],
+	"PureRef: the panel on the left of the canvas (lit) or the right.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "left -1"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "left -1"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
 	, 0, 0.5
 ]
 
@@ -626,24 +656,10 @@
 	, 0, 0.5
 ]
 
-[IButton, "ZPlugin:JRef:Adjust Image",
-	"Press to move and scale the reference image: drag inside it to move it, drag a corner or edge (or right-drag) to scale it. Press again or Esc when done.",
-	[If, [FileExecute, zrsDll, "RSOverlayInfo", "38"] == 1,
-		[FileExecute, zrsDll, "RSAdjust", "0"]
-		[Note, "Adjust Image off: the image keeps its new place and size.", , 1.5]
-		,
-		// The note comes first: while Adjust Image is on, clicks on the image
-		// do not reach ZBrush.
-		[VarSet, zrsTick, [FileExecute, zrsDll, "RSAdjust", "2"]]
-		[If, zrsTick == 1,
-			[Note, "Adjust Image: drag the image to move it, drag a corner or edge or right-drag to scale it.\nPress Adjust Image again or Esc when done.", , 2]
-			[FileExecute, zrsDll, "RSAdjust", "1"]
-			,
-			[If, zrsTick == 0, [Note, "No reference image is showing: snap to a view that has one."]]
-			[If, zrsTick == -1, [Note, "Press Overlay first."]]
-			[If, zrsTick == -2, [Note, "Adjust Image works in Classic mode (ZPlugin > JRef > Classic)."]]
-		]
-	]
+[ISwitch, "ZPlugin:JRef:Adjust Image", [FileExecute, zrsDll, "RSIsOn", "adjust"],
+	"Lit while on: drag inside the reference image to move it, drag a corner or edge (or right-drag) to scale it. Press again or Esc when done.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressAdjust] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressAdjust] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
 	, 0, 0.5
 ]
 [IButton, "ZPlugin:JRef:Anchor",
@@ -679,7 +695,7 @@
 [ISubPalette, "ZPlugin:JRef:Views", 1]
 
 [IButton, "ZPlugin:JRef:Views:Load Front",
-	"Snap to the Front view, then load its reference image.",
+	"Load the Front view's reference image (from any angle: it shows whenever the Front view is snapped to).",
 	[VarSet, zrsView, 0]
 	[VarSet, zrsMsg2, "Front"]
 	[RoutineCall, ZRSViewLoad]
@@ -695,7 +711,7 @@
 ]
 
 [IButton, "ZPlugin:JRef:Views:Load Back",
-	"Snap to the Back view, then load its reference image.",
+	"Load the Back view's reference image (from any angle: it shows whenever the Back view is snapped to).",
 	[VarSet, zrsView, 1]
 	[VarSet, zrsMsg2, "Back"]
 	[RoutineCall, ZRSViewLoad]
@@ -711,7 +727,7 @@
 ]
 
 [IButton, "ZPlugin:JRef:Views:Load Right",
-	"Snap to the Right view, then load its reference image.",
+	"Load the Right view's reference image (from any angle: it shows whenever the Right view is snapped to).",
 	[VarSet, zrsView, 2]
 	[VarSet, zrsMsg2, "Right"]
 	[RoutineCall, ZRSViewLoad]
@@ -727,7 +743,7 @@
 ]
 
 [IButton, "ZPlugin:JRef:Views:Load Left",
-	"Snap to the Left view, then load its reference image.",
+	"Load the Left view's reference image (from any angle: it shows whenever the Left view is snapped to).",
 	[VarSet, zrsView, 3]
 	[VarSet, zrsMsg2, "Left"]
 	[RoutineCall, ZRSViewLoad]
@@ -743,7 +759,7 @@
 ]
 
 [IButton, "ZPlugin:JRef:Views:Load Top",
-	"Snap to the Top view, then load its reference image.",
+	"Load the Top view's reference image (from any angle: it shows whenever the Top view is snapped to).",
 	[VarSet, zrsView, 4]
 	[VarSet, zrsMsg2, "Top"]
 	[RoutineCall, ZRSViewLoad]
@@ -759,7 +775,7 @@
 ]
 
 [IButton, "ZPlugin:JRef:Views:Load Bottom",
-	"Snap to the Bottom view, then load its reference image.",
+	"Load the Bottom view's reference image (from any angle: it shows whenever the Bottom view is snapped to).",
 	[VarSet, zrsView, 5]
 	[VarSet, zrsMsg2, "Bottom"]
 	[RoutineCall, ZRSViewLoad]
@@ -789,27 +805,58 @@
 	, 0, 1
 ]
 
-// Multiview (PureRef): four views in the panel.
+// Multiview (PureRef): two views in the panel, one above the other, chosen
+// in Upper Image and Lower Image (the lit one is showing).
 [ISubPalette, "ZPlugin:JRef:Multiview", 1]
 
-[IButton, "ZPlugin:JRef:Multiview:Multiview On",
-	"PureRef: show four views in the panel (choose them with Views).",
-	[FileExecute, zrsDll, "RSDisplay", "multi 1"]
-	[Note, "Multiview on: four views in the PureRef panel.", , 1.5]
-	, 0, 0.5
-]
-[IButton, "ZPlugin:JRef:Multiview:Multiview Off",
-	"PureRef: the panel shows the view you are snapped to.",
-	[FileExecute, zrsDll, "RSDisplay", "multi 0"]
-	[Note, "Multiview off: the panel shows the view you are snapped to.", , 1.5]
-	, 0, 0.5
-]
-
-[IButton, "ZPlugin:JRef:Multiview:Views",
-	"Choose the view in each corner of the Multiview panel: Top Left, Top Right, Bottom Right, Bottom Left.",
-	[RoutineCall, ZRSMultiDialog]
+[ISwitch, "ZPlugin:JRef:Multiview:Multiview", [FileExecute, zrsDll, "RSIsOn", "multi"],
+	"PureRef: lit, the panel shows two views, one above the other (choose them in Upper Image and Lower Image); off, the view you are snapped to.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "multi -1"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "multi -1"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
 	, 0, 1
 ]
+
+// Pressing a view shows it there (the one it replaces goes dark); pressing
+// the lit one keeps it lit.
+[ISubPalette, "ZPlugin:JRef:Upper Image", 1]
+[ISwitch, "ZPlugin:JRef:Upper Image:Front", [FileExecute, zrsDll, "RSIsOn", "a 0"], "Multiview: the Front view in the upper image.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "a 0"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "a 0"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]], 0, 0.333]
+[ISwitch, "ZPlugin:JRef:Upper Image:Back", [FileExecute, zrsDll, "RSIsOn", "a 1"], "Multiview: the Back view in the upper image.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "a 1"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "a 1"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]], 0, 0.333]
+[ISwitch, "ZPlugin:JRef:Upper Image:Right", [FileExecute, zrsDll, "RSIsOn", "a 2"], "Multiview: the Right view in the upper image.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "a 2"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "a 2"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]], 0, 0.333]
+[ISwitch, "ZPlugin:JRef:Upper Image:Left", [FileExecute, zrsDll, "RSIsOn", "a 3"], "Multiview: the Left view in the upper image.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "a 3"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "a 3"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]], 0, 0.333]
+[ISwitch, "ZPlugin:JRef:Upper Image:Top", [FileExecute, zrsDll, "RSIsOn", "a 4"], "Multiview: the Top view in the upper image.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "a 4"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "a 4"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]], 0, 0.333]
+[ISwitch, "ZPlugin:JRef:Upper Image:Bottom", [FileExecute, zrsDll, "RSIsOn", "a 5"], "Multiview: the Bottom view in the upper image.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "a 5"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "a 5"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]], 0, 0.333]
+
+[ISubPalette, "ZPlugin:JRef:Lower Image", 1]
+[ISwitch, "ZPlugin:JRef:Lower Image:Front", [FileExecute, zrsDll, "RSIsOn", "b 0"], "Multiview: the Front view in the lower image.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "b 0"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "b 0"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]], 0, 0.333]
+[ISwitch, "ZPlugin:JRef:Lower Image:Back", [FileExecute, zrsDll, "RSIsOn", "b 1"], "Multiview: the Back view in the lower image.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "b 1"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "b 1"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]], 0, 0.333]
+[ISwitch, "ZPlugin:JRef:Lower Image:Right", [FileExecute, zrsDll, "RSIsOn", "b 2"], "Multiview: the Right view in the lower image.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "b 2"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "b 2"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]], 0, 0.333]
+[ISwitch, "ZPlugin:JRef:Lower Image:Left", [FileExecute, zrsDll, "RSIsOn", "b 3"], "Multiview: the Left view in the lower image.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "b 3"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "b 3"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]], 0, 0.333]
+[ISwitch, "ZPlugin:JRef:Lower Image:Top", [FileExecute, zrsDll, "RSIsOn", "b 4"], "Multiview: the Top view in the lower image.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "b 4"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "b 4"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]], 0, 0.333]
+[ISwitch, "ZPlugin:JRef:Lower Image:Bottom", [FileExecute, zrsDll, "RSIsOn", "b 5"], "Multiview: the Bottom view in the lower image.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "b 5"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "b 5"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]], 0, 0.333]
 
 // The project, and help.
 [ISubPalette, "ZPlugin:JRef:Project", 1]
@@ -853,10 +900,31 @@
 // Loads the DLL now, so it watches ZBrush open and save projects (and opens
 // the JRef project that belongs to each) from the start.
 [FileExecute, zrsDll, "RSProject", "has"]
+[FileExecute, zrsDll, "RSLog", [StrMerge, "plugin script run, ", zrsBuild]]
 
-// Loaded with ZScript > Load from anywhere else: installs itself into
-// ZBrush's ZStartup\ZPlugs64 folder, so it loads every time ZBrush starts.
-[VarSet, zrsTick, [FileExecute, zrsDll, "RSInstall"]]
-[If, zrsTick == 1, [Note, "JRef is installed: it now loads every time ZBrush starts (ZPlugin > JRef)."]]
-[If, zrsTick == -1, [Note, "JRef could not copy itself into ZBrush's ZStartup\ZPlugs64 folder: Windows did not allow writing there."]]
-[If, zrsTick == -3, [Note, "JRef.zsc was not found next to the JRef_Data folder, so JRef could not install itself. Load JRef.txt once more."]]
+[VarSet, zrsStarted, 1]
+// A press that stopped part-way (a ZScript error) leaves zrsBusy set; the
+// script runs again whenever ZBrush loads it, which clears it.
+[VarSet, zrsBusy, 0]
+
+// ZBrush 2021 and later show a switch given a width disabled (greyed, as
+// in build 109) until it is enabled.
+[IEnable, "ZPlugin:JRef:Overlay"]
+[IEnable, "ZPlugin:JRef:Overlay Off"]
+[IEnable, "ZPlugin:JRef:Classic"]
+[IEnable, "ZPlugin:JRef:PureRef"]
+[IEnable, "ZPlugin:JRef:Panel Left"]
+[IEnable, "ZPlugin:JRef:Adjust Image"]
+[IEnable, "ZPlugin:JRef:Multiview:Multiview"]
+[IEnable, "ZPlugin:JRef:Upper Image:Front"]
+[IEnable, "ZPlugin:JRef:Upper Image:Back"]
+[IEnable, "ZPlugin:JRef:Upper Image:Right"]
+[IEnable, "ZPlugin:JRef:Upper Image:Left"]
+[IEnable, "ZPlugin:JRef:Upper Image:Top"]
+[IEnable, "ZPlugin:JRef:Upper Image:Bottom"]
+[IEnable, "ZPlugin:JRef:Lower Image:Front"]
+[IEnable, "ZPlugin:JRef:Lower Image:Back"]
+[IEnable, "ZPlugin:JRef:Lower Image:Right"]
+[IEnable, "ZPlugin:JRef:Lower Image:Left"]
+[IEnable, "ZPlugin:JRef:Lower Image:Top"]
+[IEnable, "ZPlugin:JRef:Lower Image:Bottom"]
