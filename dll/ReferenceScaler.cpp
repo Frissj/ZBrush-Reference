@@ -251,7 +251,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 119;
+static const int kDllBuild = 137;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1322,6 +1322,9 @@ static void DrawGizmo(const OverlayState& st, Buffer32& b)
 // (gMultiA above gMultiB) share the panel. Outside the panel the background
 // shows gBackGrey.
 static int gMode = 0, gPanelLeft = 0, gMulti = 0, gMultiA = 0, gMultiB = 3, gBackGrey = 48;
+// 3D Auto Track: Multiview goes to the surface being looked at (HullDepth),
+// not only the band; off unless switched on.
+static int gAuto3D = 0;
 // Multiview's four cells (top left, top right, bottom right, bottom left):
 // a view slot each, or -1 for none.
 static int gCells[4] = {0, 3, 4, 1};
@@ -2035,8 +2038,78 @@ static void RefreshUiRects()
 	}
 }
 
-// While the cursor is over the panel, the panel steps aside: see-through and
-// ZBrush shows under it (its view gizmo, menus drawn inside its window).
+struct Rgb {
+	std::vector<unsigned char> px;  // B, G, R per pixel
+	int w = 0, h = 0;
+	const unsigned char* at(int x, int y) const { return &px[(static_cast<size_t>(y) * w + x) * 3]; }
+};
+
+static bool OnMenu(int x, int y);
+static int MenuAt(int x, int y);
+
+// Whether ZBrush shows its canvas cursor (it draws the brush circle with it)
+// rather than an interface one (over its palettes and menus, also where they
+// lie over the canvas). The handles change every session (nav_log, build
+// 128: canvas 600BFD and EC0467 alternating; over the JRef palette on the
+// canvas 1BD0181, 2F0A51, 10013), so each is judged by its hotspot: a
+// pointer's is near its tip, the canvas cursor's in the middle. No
+// cursor (hidden while sculpting) counts as the canvas. Logged once each.
+static bool CanvasCursor(HCURSOR cur)
+{
+	if (!cur)
+		return true;
+	static std::vector<std::pair<HCURSOR, bool>> known;
+	for (const auto& k : known)
+		if (k.first == cur)
+			return k.second;
+	bool canvas = false;
+	int hx = -1, hy = -1, cw = 0, ch = 0;
+	ICONINFO ii = {};
+	if (GetIconInfo(cur, &ii)) {
+		hx = static_cast<int>(ii.xHotspot);
+		hy = static_cast<int>(ii.yHotspot);
+		BITMAP bm = {};
+		if (ii.hbmMask && GetObject(ii.hbmMask, sizeof(bm), &bm)) {
+			cw = bm.bmWidth;
+			ch = ii.hbmColor ? bm.bmHeight : bm.bmHeight / 2;
+		}
+		// In the middle half both ways (10013, used over the palette, has
+		// its hotspot at 5 11 of 32 x 32).
+		canvas = cw > 0 && ch > 0 && hx >= cw / 4 && hx <= cw * 3 / 4 && hy >= ch / 4 && hy <= ch * 3 / 4;
+		if (ii.hbmMask)
+			DeleteObject(ii.hbmMask);
+		if (ii.hbmColor)
+			DeleteObject(ii.hbmColor);
+	}
+	known.push_back({cur, canvas});
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu cursor %p: hotspot %d %d of %d x %d, %s\n", GetTickCount(), static_cast<void*>(cur), hx, hy, cw, ch,
+			canvas ? "ZBrush's canvas cursor" : "an interface cursor (palettes, menus)");
+		fclose(f);
+	}
+	return canvas;
+}
+static std::vector<RECT> gMenuBoxes;  // ZBrush's menus on the canvas (UpdateMenus)
+// An open flyout (ZPlugin and the other menus): ZBrush lightens a rectangle
+// behind it over its interface (56 to 65, 58 to 74: capture.png), seen round
+// the canvas: the strip left of it and the band above. That rectangle is the
+// flyout; ZBrush shows there, through the panel, until it goes. Opening one
+// redraws the whole canvas at once (nav_log, build 129: "redraw ... 362179
+// pixels"), so the menu's own pixels on the canvas cannot be told from it.
+static RECT gFlyout = {0, 0, 0, 0};
+// Where a flyout just closed: the canvas coming back there is no menu for a
+// second (build 132: closed from the menu bar, cursor on the interface, the
+// canvas reappearing under it became a menu, a hole in the panel).
+static RECT gFlyoutGone = {0, 0, 0, 0};
+static DWORD gFlyoutGoneAt = 0;
+
+static bool InFlyout(int x, int y)
+{
+	return gFlyout.right > gFlyout.left && x >= gFlyout.left && x < gFlyout.right && y >= gFlyout.top && y < gFlyout.bottom;
+}
+
+// While the cursor is over the panel (not over a ZBrush menu on it), the
+// panel steps aside: see-through, and ZBrush's view gizmo in front of it.
 // Cursor changes are logged (the canvas cursor is the one most seen over the
 // viewport outside the panel).
 static bool gPanelAside = false;
@@ -2058,7 +2131,13 @@ static bool UpdatePanelAside(const OverlayState& st)
 	int vx0, vy0, vx1, vy1;
 	ViewportRect(w, h, vx0, vy0, vx1, vy1);
 	const bool onCanvas = x >= vx0 && y >= vy0 && x < vx1 && y < vy1;
-	const bool onPanel = onCanvas && x >= px && x < px + pw && y >= py && y < py + ph;
+	const bool inPanel = onCanvas && x >= px && x < px + pw && y >= py && y < py + ph;
+	const int menu = MenuAt(x, y);
+	const bool canvasCursor = CanvasCursor(cur);
+	// With an interface cursor over the panel, ZBrush has a menu there
+	// (build 128 went see-through with the cursor on the JRef palette).
+	const bool flyout = InFlyout(x, y);
+	const bool onPanel = inPanel && menu < 0 && canvasCursor && !flyout;
 	static std::vector<std::pair<HCURSOR, int>> seen;
 	static HCURSOR canvas = nullptr, logged = reinterpret_cast<HCURSOR>(-1);
 	if (onCanvas && !onPanel && ZBrushInFront()) {
@@ -2075,6 +2154,23 @@ static bool UpdatePanelAside(const OverlayState& st)
 	// see-through until the cursor leaves it.
 	if (onPanel)
 		gPanelAside = true;
+	if (gPanelAside != before)
+		if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			if (gPanelAside)
+				fprintf(f, "%lu panel see-through: cursor at %d %d on the panel (%d %d to %d %d), no menu there\n", GetTickCount(), x, y, px, py, px + pw, py + ph);
+			else if (inPanel && flyout)
+				fprintf(f, "%lu panel solid: cursor at %d %d in the open flyout [%ld %ld to %ld %ld]\n", GetTickCount(), x, y,
+					gFlyout.left, gFlyout.top, gFlyout.right, gFlyout.bottom);
+			else if (inPanel && menu >= 0)
+				fprintf(f, "%lu panel solid: cursor at %d %d on menu %d of %zu [%ld %ld to %ld %ld] over the panel\n", GetTickCount(), x, y, menu,
+					gMenuBoxes.size(), gMenuBoxes[menu].left, gMenuBoxes[menu].top, gMenuBoxes[menu].right, gMenuBoxes[menu].bottom);
+			else if (inPanel)
+				fprintf(f, "%lu panel solid: cursor at %d %d over the panel shows an interface cursor (%p): a ZBrush menu there\n", GetTickCount(), x, y,
+					static_cast<void*>(cur));
+			else
+				fprintf(f, "%lu panel solid: cursor at %d %d off the panel (%d %d to %d %d)\n", GetTickCount(), x, y, px, py, px + pw, py + ph);
+			fclose(f);
+		}
 	// Only that: guessing when a ZBrush menu was open (by the cursor's shape,
 	// build 115; by where the cursor left the canvas, builds 116 and 117) hid
 	// the panel when it should have shown.
@@ -2088,6 +2184,811 @@ static bool UpdatePanelAside(const OverlayState& st)
 		}
 	}
 	return before != gPanelAside;
+}
+
+// ZBrush's menus over the panel's part of the canvas. A flyout list has no
+// background over the canvas (its text is drawn straight onto the model;
+// capture.png of a ZPlugin menu: the checker's 81 and 105 unchanged between
+// the item names), only sub-palettes are filled, so no colour finds it (build
+// 119 looked for flat runs and found strips). Instead: the whole viewport
+// is kept, and what changes in it while the cursor is on ZBrush's interface
+// (a menu opening; then items lighting, a sub-palette unfolding) is the menu,
+// pixel by pixel, until it goes again or the canvas is clicked (which closes
+// menus and is how the model changes). The panel draws under those pixels, so
+// a menu's text shows over the reference. Build 120 kept only the panel's
+// part, and moving the panel (Panel Left, pressed in the open menu) took the
+// menu as the canvas. A model changed from the interface (a material) shows
+// over the panel the same way until that click.
+// A menu already open when the overlay starts (the one JRef was pressed in)
+// is in the first copy: those pixels are found from the calibration capture,
+// where they covered the pattern, and are still there after it ("baked").
+// The boxes round clusters of menu pixels are the menus: a click in one is
+// not a canvas click (build 121 took pressing Panel Left in the ZPlugin menu,
+// over the canvas, for one and kept the menu as canvas), and the cursor in
+// one is not on the panel (the panel stays solid behind it).
+// Build 124 froze the copy while a menu was open and called every change
+// since then the menu: ZBrush's brush circle following the cursor over the
+// panel, the model and gizmo redrawing. The box grew to wherever the cursor
+// had been (so the panel never went see-through there, and the gizmo could
+// not be reached), model showed through as menu, and past 40% the lot was
+// dropped, the real menu with it (nav_log: "too big for a menu, dropped"
+// again and again). Now each pixel is decided as it changes: menu if the
+// cursor is on ZBrush's interface or on a menu then, else the canvas (taken
+// into the copy at once); a menu pixel back to the copy's value is gone.
+static std::vector<uint32_t> gMenuBase;
+static std::vector<unsigned char> gMenuBaked;
+static int gMenuBakedCount = 0;
+// The start menu's own pixels as found (where, and their colour): fewer than
+// half still alike and it has closed. Build 135 compared them with the copy
+// of the canvas, which other steps overwrite; a menu closed while Overlay
+// settled stayed a hole in the panel.
+static std::vector<std::pair<size_t, uint32_t>> gMenuBakedPixels;
+static std::vector<unsigned char> gMenuMask;  // 1: a menu's pixel
+static std::vector<int> gMenuRowCount;
+static int gMenuMaskCount = 0;
+static bool gMenuOpen = false;  // menu pixels (or the start menu) showing
+static RECT gMenuBox = {0, 0, 0, 0};  // the start menu's box
+// After the first copy, ZBrush redraws the canvas for a while (the pattern
+// going, the model back), with the cursor on the interface (Overlay was just
+// pressed): all canvas until it has been still 20 frames (at most 8 s).
+// Build 127 took those redraws for a menu over the whole viewport, kept all
+// session: holes in the model, the gizmo never reachable.
+static bool gMenuSettling = false;
+static int gMenuQuiet = 0;
+static DWORD gMenuSettleAt = 0;
+static Rgb gCalScreen;           // the calibration capture (pattern showing)
+static Rgb gCalFrame;            // the pattern (frame0.png)
+static int gCalScreenX = 0, gCalScreenY = 0;  // its top left on screen
+static bool gCalPending = false;  // a new calibration not yet compared
+
+static inline bool MenuPixel(size_t i, const uint32_t*)
+{
+	if (gMenuBakedCount && gMenuBaked[i])
+		return true;
+	return gMenuMaskCount && gMenuMask[i];
+}
+
+// Which menu box the point is in (16 pixels round each), or -1.
+static int MenuAt(int x, int y)
+{
+	for (size_t k = 0; k < gMenuBoxes.size(); ++k) {
+		const RECT& r = gMenuBoxes[k];
+		if (x >= r.left - 16 && x < r.right + 16 && y >= r.top - 16 && y < r.bottom + 16)
+			return static_cast<int>(k);
+	}
+	return -1;
+}
+
+static bool OnMenu(int x, int y)
+{
+	return MenuAt(x, y) >= 0;
+}
+
+static void UpdateMenus(const OverlayState& st, int w, int h)
+{
+	if (!gCapture.bits)
+		return;
+	const uint32_t* cap = reinterpret_cast<const uint32_t*>(gCapture.bits);
+	const size_t all = static_cast<size_t>(w) * h;
+	auto log = [&](const char* what, int n) {
+		if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			fprintf(f, "%lu menu %s (%d pixels; box %ld %ld to %ld %ld)\n", GetTickCount(), what, n, gMenuBox.left, gMenuBox.top, gMenuBox.right, gMenuBox.bottom);
+			fclose(f);
+		}
+	};
+	int vx0, vy0, vx1, vy1;
+	ViewportRect(w, h, vx0, vy0, vx1, vy1);
+	vx0 = std::max(0, vx0);
+	vy0 = std::max(0, vy0);
+	vx1 = std::min(w, vx1);
+	vy1 = std::min(h, vy1);
+	if (vx1 <= vx0 || vy1 <= vy0)
+		return;
+	// A pixel of the calibration capture showing the pattern (its own or a
+	// neighbouring pattern pixel, for the scaled edges).
+	const int sox = static_cast<int>(st.screenX) - gCalScreenX, soy = static_cast<int>(st.screenY) - gCalScreenY;
+	auto calAt = [&](int x, int y) -> const unsigned char* {
+		const int sx = x + sox, sy = y + soy;
+		if (sx < 0 || sy < 0 || sx >= gCalScreen.w || sy >= gCalScreen.h)
+			return nullptr;
+		return gCalScreen.at(sx, sy);
+	};
+	auto showsPattern = [&](const unsigned char* c, int x, int y) {
+		const int fx = static_cast<int>(static_cast<long long>(x) * gCalFrame.w / w), fy = static_cast<int>(static_cast<long long>(y) * gCalFrame.h / h);
+		for (int dy = -1; dy <= 1; ++dy)
+			for (int dx = -1; dx <= 1; ++dx) {
+				const int ax = fx + dx, ay = fy + dy;
+				if (ax < 0 || ay < 0 || ax >= gCalFrame.w || ay >= gCalFrame.h)
+					continue;
+				const unsigned char* p = gCalFrame.at(ax, ay);
+				if (abs(p[0] - c[0]) <= 8 && abs(p[1] - c[1]) <= 8 && abs(p[2] - c[2]) <= 8)
+					return true;
+			}
+		return false;
+	};
+	if (gMenuBase.size() != all || gCalPending) {
+		// The first copy, once the canvas is back (the pattern no longer
+		// shows in most of a sample).
+		if (gCalPending && gCalScreen.w && gCalFrame.w) {
+			int pattern = 0, samples = 0;
+			for (int y = vy0; y < vy1; y += 16)
+				for (int x = vx0; x < vx1; x += 16) {
+					const uint32_t v = cap[static_cast<size_t>(y) * w + x];
+					const unsigned char c[3] = {static_cast<unsigned char>(v), static_cast<unsigned char>(v >> 8), static_cast<unsigned char>(v >> 16)};
+					++samples;
+					pattern += showsPattern(c, x, y);
+				}
+			if (samples && pattern * 5 > samples)
+				return;
+		}
+		gMenuBase.assign(cap, cap + all);
+		gMenuBaked.assign(all, 0);
+		gMenuBakedCount = 0;
+		gMenuBakedPixels.clear();
+		gMenuMask.assign(all, 0);
+		gMenuRowCount.assign(h, 0);
+		gMenuMaskCount = 0;
+		gMenuBoxes.clear();
+		gMenuOpen = false;
+		gMenuBox = {0, 0, 0, 0};
+		gMenuSettling = true;
+		gMenuQuiet = 0;
+		gMenuSettleAt = GetTickCount();
+		if (gCalPending && gCalScreen.w && gCalFrame.w) {
+			// Baked: covering the pattern in the calibration capture, the same
+			// now, and so is a neighbour (a stray match is alone). Not the
+			// view gizmo's corner (it is drawn over the canvas too).
+			const int gizmoX = vx1 - static_cast<int>(std::min(vx1 - vx0, vy1 - vy0) * 0.3), gizmoY = vy0 + (vx1 - gizmoX);
+			std::vector<unsigned char> same(all, 0);
+			for (int y = vy0; y < vy1; ++y)
+				for (int x = vx0; x < vx1; ++x) {
+					if (x >= gizmoX && y < gizmoY)
+						continue;
+					const unsigned char* c = calAt(x, y);
+					if (!c || showsPattern(c, x, y))
+						continue;
+					const uint32_t v = cap[static_cast<size_t>(y) * w + x];
+					same[static_cast<size_t>(y) * w + x] = abs(static_cast<int>(v & 255) - c[0]) <= 2 && abs(static_cast<int>(v >> 8 & 255) - c[1]) <= 2 &&
+						abs(static_cast<int>(v >> 16 & 255) - c[2]) <= 2;
+				}
+			for (int y = vy0 + 1; y < vy1 - 1; ++y)
+				for (int x = vx0 + 1; x < vx1 - 1; ++x) {
+					const size_t i = static_cast<size_t>(y) * w + x;
+					if (same[i] && (same[i - 1] || same[i + 1] || same[i - w] || same[i + w]))
+						gMenuBaked[i] = 1;
+				}
+			// Only the menu: the largest cluster of 16-pixel blocks holding 8+
+			// such pixels (a menu's text is dense). Build 122 kept matches
+			// scattered over the whole viewport, its box was the viewport, and
+			// every canvas click then counted as one on the menu.
+			const int bw = (w + 15) / 16, bh = (h + 15) / 16;
+			std::vector<int> blocks(static_cast<size_t>(bw) * bh, 0);
+			for (int y = vy0; y < vy1; ++y)
+				for (int x = vx0; x < vx1; ++x)
+					blocks[static_cast<size_t>(y / 16) * bw + x / 16] += gMenuBaked[static_cast<size_t>(y) * w + x];
+			std::vector<int> label(blocks.size(), 0);
+			int best = 0, bestSize = 0, next = 0;
+			for (size_t s = 0; s < blocks.size(); ++s) {
+				if (blocks[s] < 8 || label[s])
+					continue;
+				++next;
+				int size = 0;
+				std::vector<size_t> stack = {s};
+				label[s] = next;
+				while (!stack.empty()) {
+					const size_t b = stack.back();
+					stack.pop_back();
+					++size;
+					const int bx = static_cast<int>(b % bw), by = static_cast<int>(b / bw);
+					for (int dy = -1; dy <= 1; ++dy)
+						for (int dx = -1; dx <= 1; ++dx) {
+							const int nx = bx + dx, ny = by + dy;
+							if (nx < 0 || ny < 0 || nx >= bw || ny >= bh)
+								continue;
+							const size_t nb = static_cast<size_t>(ny) * bw + nx;
+							if (!label[nb] && blocks[nb] >= 8) {
+								label[nb] = next;
+								stack.push_back(nb);
+							}
+						}
+				}
+				if (size > bestSize) {
+					bestSize = size;
+					best = next;
+				}
+			}
+			long bx0 = w, by0 = h, bx1 = -1, by1 = -1;
+			for (int y = vy0; y < vy1; ++y)
+				for (int x = vx0; x < vx1; ++x) {
+					const size_t i = static_cast<size_t>(y) * w + x;
+					if (!gMenuBaked[i])
+						continue;
+					if (!best || label[static_cast<size_t>(y / 16) * bw + x / 16] != best) {
+						gMenuBaked[i] = 0;
+						continue;
+					}
+					++gMenuBakedCount;
+					gMenuBakedPixels.push_back({i, cap[i] & 0xFFFFFFu});
+					bx0 = std::min<long>(bx0, x);
+					bx1 = std::max<long>(bx1, x + 1);
+					by0 = std::min<long>(by0, y);
+					by1 = y + 1;
+				}
+			if (gMenuBakedCount < 30 || static_cast<double>(bx1 - bx0) * (by1 - by0) > 0.4 * (vx1 - vx0) * (vy1 - vy0)) {
+				gMenuBaked.clear();
+				gMenuBakedCount = 0;
+				gMenuBakedPixels.clear();
+			} else {
+				gMenuBox = {bx0, by0, bx1, by1};
+				gMenuBoxes.assign(1, gMenuBox);
+				gMenuOpen = true;
+			}
+			log("already open at the start", gMenuBakedCount);
+		}
+		gCalPending = false;
+		return;
+	}
+	CURSORINFO ci = {sizeof(ci)};
+	GetCursorInfo(&ci);
+	const int cx = static_cast<int>(ci.ptScreenPos.x - st.screenX), cy = static_cast<int>(ci.ptScreenPos.y - st.screenY);
+	bool onPanel = false;
+	if (gMode == 1) {
+		int px, py, pw, ph;
+		PanelRect(w, h, px, py, pw, ph);
+		onPanel = cx >= px && cx < px + pw && cy >= py && cy < py + ph;
+	}
+	const int menuAt = MenuAt(cx, cy);
+	const bool inView = cx >= vx0 && cy >= vy0 && cx < vx1 && cy < vy1;
+	const bool canvasCursor = CanvasCursor((ci.flags & CURSOR_SHOWING) ? ci.hCursor : nullptr);
+	// On ZBrush's interface: outside the viewport, or over it with an
+	// interface cursor (a palette or menu lying on the canvas).
+	const bool onInterface = !inView || !canvasCursor;
+	// A click with the canvas cursor anywhere on the viewport (over the panel
+	// too: it is the canvas there) closes ZBrush's menus. Build 131 left out
+	// the panel, and a closed ZPlugin menu stayed a hole in it.
+	const bool onCanvas = inView && canvasCursor;
+	const bool down = ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) | GetAsyncKeyState(VK_MBUTTON)) & 0x8000) != 0;
+	const char* where = !inView ? "on the interface" : !canvasCursor ? "on a ZBrush menu (interface cursor)" : menuAt >= 0 ? "in a menu box" :
+		onPanel ? "on the panel" : "on the canvas";
+	// A flyout closed this frame: the start menu (JRef's palette, in the
+	// ZPlugin flyout) went with it. Build 133 waited for half its pixels to
+	// change, but taking a too-big menu as canvas had copied them over, and
+	// its box stayed a hole in the panel until the panel moved.
+	bool flyoutClosed = false;
+	{
+		// The flyout's backdrop round the canvas: pixels of the interface
+		// lighter than the copy by 4 to 40, alike in all three channels.
+		// Opened (3000+ such pixels, with the cursor on the interface, at
+		// least 48 each way), it holds until under a quarter of the most seen
+		// are left; meanwhile the copy of the interface is kept as it was.
+		static std::vector<uint32_t> outBase;
+		static bool open = false;
+		static int peak = 0;
+		auto outside = [&](auto&& fn) {
+			for (int y = 0; y < h; ++y) {
+				const size_t i0 = static_cast<size_t>(y) * w;
+				if (y < vy0 || y >= vy1) {
+					fn(i0, 0, w, y);
+				} else {
+					fn(i0, 0, vx0, y);
+					fn(i0, vx1, w, y);
+				}
+			}
+		};
+		auto keep = [&]() {
+			outside([&](size_t i0, int a, int b, int) {
+				if (b > a)
+					memcpy(&outBase[i0 + a], cap + i0 + a, static_cast<size_t>(b - a) * 4);
+			});
+		};
+		if (outBase.size() != all) {
+			outBase.assign(cap, cap + all);
+		} else {
+			int light = 0, dark = 0;
+			// Lighter pixels per 8-pixel block, for the largest connected area.
+			const int bs = 8, bw = (w + bs - 1) / bs, bh = (h + bs - 1) / bs;
+			static std::vector<int> blocks;
+			blocks.assign(static_cast<size_t>(bw) * bh, 0);
+			outside([&](size_t i0, int a, int b, int y) {
+				// Most of the interface does not change: skipped whole.
+				if (b <= a || !memcmp(cap + i0 + a, &outBase[i0 + a], static_cast<size_t>(b - a) * 4))
+					return;
+				for (int x = a; x < b; ++x) {
+					const uint32_t c = cap[i0 + x], o = outBase[i0 + x];
+					const int d0 = static_cast<int>(c & 255) - static_cast<int>(o & 255);
+					const int d1 = static_cast<int>(c >> 8 & 255) - static_cast<int>(o >> 8 & 255);
+					const int d2 = static_cast<int>(c >> 16 & 255) - static_cast<int>(o >> 16 & 255);
+					const int lo = std::min(d0, std::min(d1, d2)), hi = std::max(d0, std::max(d1, d2));
+					if (lo >= 4 && hi <= 40 && hi - lo <= 6) {
+						++light;
+						++blocks[static_cast<size_t>(y / bs) * bw + x / bs];
+					} else if (hi <= -4 && lo >= -40 && hi - lo <= 6) {
+						++dark;
+					}
+				}
+			});
+			// The largest connected area of lighter blocks (touching blocks
+			// join): the backdrop. Build 132 boxed every lighter pixel: a
+			// button lighting far off stretched the ZPlugin flyout across the
+			// window, and toolbar buttons lit under the cursor made one.
+			long fx0 = w, fy0 = h, fx1 = -1, fy1 = -1;
+			int areaLight = 0;
+			if (light >= 3000) {
+				static std::vector<char> seen;
+				seen.assign(blocks.size(), 0);
+				std::vector<size_t> stack;
+				for (size_t s = 0; s < blocks.size(); ++s) {
+					if (!blocks[s] || seen[s])
+						continue;
+					seen[s] = 1;
+					stack.assign(1, s);
+					int count = 0, b0 = bw, b1 = -1, c0 = bh, c1 = -1;
+					while (!stack.empty()) {
+						const size_t b = stack.back();
+						stack.pop_back();
+						count += blocks[b];
+						const int bx = static_cast<int>(b % bw), by = static_cast<int>(b / bw);
+						b0 = std::min(b0, bx);
+						b1 = std::max(b1, bx);
+						c0 = std::min(c0, by);
+						c1 = std::max(c1, by);
+						for (int dy = -1; dy <= 1; ++dy)
+							for (int dx = -1; dx <= 1; ++dx) {
+								const int nx = bx + dx, ny = by + dy;
+								if (nx < 0 || ny < 0 || nx >= bw || ny >= bh)
+									continue;
+								const size_t nb = static_cast<size_t>(ny) * bw + nx;
+								if (blocks[nb] && !seen[nb]) {
+									seen[nb] = 1;
+									stack.push_back(nb);
+								}
+							}
+					}
+					if (count > areaLight) {
+						areaLight = count;
+						fx0 = std::min<long>(w, static_cast<long>(b0) * bs);
+						fx1 = std::min<long>(w, static_cast<long>(b1 + 1) * bs);
+						fy0 = std::min<long>(h, static_cast<long>(c0) * bs);
+						fy1 = std::min<long>(h, static_cast<long>(c1 + 1) * bs);
+					}
+				}
+			}
+			auto logFly = [&](const char* what) {
+				if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+					fprintf(f, "%lu flyout %s (%d lighter pixels round the canvas, most %d; box %ld %ld to %ld %ld; cursor %s at %d %d)\n", GetTickCount(), what,
+						light, peak, gFlyout.left, gFlyout.top, gFlyout.right, gFlyout.bottom, where, cx, cy);
+					fclose(f);
+				}
+			};
+			// Not while the canvas settles after Overlay (build 131 took the
+			// interface changing then for a flyout over the whole window: the
+			// panel see-through everywhere), nor one over half the window.
+			const bool sane = static_cast<double>(fx1 - fx0) * (fy1 - fy0) <= 0.5 * w * h;
+			if (!open) {
+				// 8000+ lighter pixels in one area, 150 wide and 40 high (a lit
+				// button is far smaller; the ZPlugin backdrop is 62000).
+				if (!gMenuSettling && onInterface && areaLight >= 8000 && fx1 - fx0 >= 150 && fy1 - fy0 >= 40 && sane) {
+					open = true;
+					peak = areaLight;
+				} else {
+					// One open since before Overlay (its backdrop already in the
+					// copy) closing: the interface round the canvas darkens.
+					if (dark >= 8000 && gMenuBakedCount) {
+						flyoutClosed = true;
+						logFly("open since the start closed (the interface darkened)");
+					}
+					keep();
+				}
+			} else {
+				peak = std::max(peak, areaLight);
+				if (areaLight * 4 < peak) {
+					// Its pixels on the canvas go with it: they never match the
+					// copy again exactly (the canvas redrew under the menu).
+					int cleared = 0;
+					const int y0 = std::max(vy0, static_cast<int>(gFlyout.top)), y1 = std::min(vy1, static_cast<int>(gFlyout.bottom));
+					const int x0 = std::max(vx0, static_cast<int>(gFlyout.left)), x1 = std::min(vx1, static_cast<int>(gFlyout.right));
+					for (int y = y0; y < y1 && x1 > x0; ++y) {
+						if (!gMenuRowCount[y])
+							continue;
+						const size_t i0 = static_cast<size_t>(y) * w;
+						for (int x = x0; x < x1; ++x)
+							if (gMenuMask[i0 + x]) {
+								gMenuMask[i0 + x] = 0;
+								--gMenuRowCount[y];
+								--gMenuMaskCount;
+								gMenuBase[i0 + x] = cap[i0 + x];
+								++cleared;
+							}
+					}
+					open = false;
+					flyoutClosed = true;
+					logFly("closed");
+					gFlyoutGone = gFlyout;
+					gFlyoutGoneAt = GetTickCount();
+					gFlyout = {0, 0, 0, 0};
+					if (cleared) {
+						gMenuOpen = gMenuMaskCount > 0 || gMenuBakedCount > 0;
+						gMenuBoxes.erase(std::remove_if(gMenuBoxes.begin(), gMenuBoxes.end(), [&](const RECT& r) {
+							return r.left >= x0 - 24 && r.right <= x1 + 24 && r.top >= y0 - 24 && r.bottom <= y1 + 24;
+						}), gMenuBoxes.end());
+						log("pixels of the closed flyout taken as canvas", cleared);
+					}
+					keep();
+				}
+			}
+			if (open) {
+				// Seen only in the band above the canvas (a menu over the
+				// middle of it): it reaches down the canvas, how far unknown,
+				// so to its bottom.
+				RECT r = {fx0, fy0, fx1, fy1};
+				if (fy1 <= vy0 + 2)
+					r.bottom = vy1;
+				const bool was = gFlyout.right > gFlyout.left;
+				const bool moved = abs(r.left - gFlyout.left) > 8 || abs(r.right - gFlyout.right) > 8 || abs(r.bottom - gFlyout.bottom) > 8;
+				gFlyout = r;
+				if (!was)
+					logFly("opened");
+				else if (moved)
+					logFly("changed");
+			}
+		}
+	}
+	auto sync = [&]() {
+		// The copy takes the capture wherever they differ.
+		for (int y = vy0; y < vy1; ++y) {
+			const size_t i0 = static_cast<size_t>(y) * w + vx0;
+			if (memcmp(cap + i0, &gMenuBase[i0], static_cast<size_t>(vx1 - vx0) * 4))
+				memcpy(&gMenuBase[i0], cap + i0, static_cast<size_t>(vx1 - vx0) * 4);
+		}
+	};
+	auto clearMask = [&]() {
+		if (gMenuMaskCount)
+			for (int y = vy0; y < vy1; ++y)
+				if (gMenuRowCount[y]) {
+					memset(&gMenuMask[static_cast<size_t>(y) * w], 0, w);
+					gMenuRowCount[y] = 0;
+				}
+		gMenuMaskCount = 0;
+	};
+	bool unbaked = false;  // the boxes are worked out again
+	auto unbake = [&](const char* why, int gone) {
+		if (!gMenuBakedCount)
+			return;
+		unbaked = true;
+		// What showed there now is the canvas.
+		for (int y = vy0; y < vy1; ++y)
+			for (int x = vx0; x < vx1; ++x) {
+				const size_t i = static_cast<size_t>(y) * w + x;
+				if (gMenuBaked[i])
+					gMenuBase[i] = cap[i];
+			}
+		gMenuBaked.clear();
+		gMenuBakedCount = 0;
+		gMenuBakedPixels.clear();
+		gMenuBox = {0, 0, 0, 0};
+		log(why, gone);
+	};
+	static size_t boxesLogged = 0;
+	// ZBrush shows its canvas cursor inside a menu box: there is no menu
+	// there (over its menus it shows an interface cursor), and the box goes
+	// (its pixels taken as canvas, the start menu with it if it is that one).
+	// Not in an open flyout, where ZBrush shows the canvas cursor over the
+	// list's empty part. Build 136 kept a start menu whose pixels never
+	// changed (2859 of 2877 still as found long after): something on the
+	// canvas, alike in the calibration capture, not JRef's palette.
+	if (inView && canvasCursor && !InFlyout(cx, cy))
+		for (size_t k = 0; k < gMenuBoxes.size(); ++k) {
+			const RECT r = gMenuBoxes[k];
+			if (cx < r.left || cx >= r.right || cy < r.top || cy >= r.bottom)
+				continue;
+			int cleared = 0;
+			for (int y = std::max(vy0, static_cast<int>(r.top)); y < std::min(vy1, static_cast<int>(r.bottom)); ++y) {
+				if (!gMenuRowCount[y])
+					continue;
+				const size_t i0 = static_cast<size_t>(y) * w;
+				for (int x = std::max(vx0, static_cast<int>(r.left)); x < std::min(vx1, static_cast<int>(r.right)); ++x)
+					if (gMenuMask[i0 + x]) {
+						gMenuMask[i0 + x] = 0;
+						--gMenuRowCount[y];
+						--gMenuMaskCount;
+						gMenuBase[i0 + x] = cap[i0 + x];
+						++cleared;
+					}
+			}
+			if (gMenuBakedCount && gMenuBox.left < r.right && gMenuBox.right > r.left && gMenuBox.top < r.bottom && gMenuBox.bottom > r.top)
+				unbake("start menu dropped: ZBrush shows its canvas cursor there", 0);
+			gMenuBoxes.erase(gMenuBoxes.begin() + k);
+			boxesLogged = gMenuBoxes.size();
+			gMenuOpen = gMenuMaskCount > 0 || gMenuBakedCount > 0;
+			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				fprintf(f, "%lu menu box [%ld %ld to %ld %ld] dropped: ZBrush shows its canvas cursor in it at %d %d (%d pixels taken as canvas)\n",
+					GetTickCount(), r.left, r.top, r.right, r.bottom, cx, cy, cleared);
+				fclose(f);
+			}
+			break;
+		}
+	if (onCanvas && down) {
+		if (gMenuMaskCount || gMenuBakedCount)
+			log("closed (canvas clicked)", gMenuMaskCount);
+		unbake("start menu gone (canvas clicked)", 0);
+		clearMask();
+		sync();
+		gMenuBoxes.clear();
+		boxesLogged = 0;
+		gMenuOpen = false;
+		return;
+	}
+	// Menu pixels grow only while the cursor is on ZBrush's interface
+	// (outside the viewport, or showing an interface cursor over it: a menu
+	// opening, a tooltip, items lighting, a sub-palette unfolding). Not:
+	// - a pixel taken as canvas in the last 45 frames changing back (build 125
+	//   left rings: the brush circle went into the copy while the cursor was
+	//   on the panel, and its going, with the cursor then on the interface,
+	//   became a menu that never matched the copy again);
+	// - a change of 12 levels or less on the model (ZBrush redrawing it after
+	//   a button press; on the background it counts: build 127 lost a
+	//   tooltip's dark body that way, only its outline showed);
+	// - anything while the canvas settles after the first copy;
+	// - the view gizmo's corner (build 125 put the head in front of the
+	//   panel after PureRef was pressed).
+	// More than half the viewport added in one frame is a redraw: those are
+	// taken as canvas, the menus found before are kept (build 125 threw them
+	// all away past a quarter, and the panel covered the submenu).
+	static std::vector<uint16_t> absorbedAt;
+	static uint16_t frame = 0;
+	++frame;
+	if (absorbedAt.size() != all)
+		absorbedAt.assign(all, static_cast<uint16_t>(frame - 1000));
+	// Build 128 also grew menus with the canvas cursor inside a menu box,
+	// and ZBrush draws its brush circle over a list's empty part: rings.
+	// Only ZBrush's interface cursor grows them now.
+	const bool rootGrow = onInterface;
+	const int gizmoX = vx1 - static_cast<int>(std::min(vx1 - vx0, vy1 - vy0) * 0.3);
+	const int gizmoY = std::max(gGizmoBottom, vy0 + (vx1 - gizmoX));
+	int added = 0, gone = 0, absorbed = 0, bakedGone = 0, recent = 0, faint = 0;
+	const unsigned char* keyShare = gKeyShare.size() == all ? gKeyShare.data() : nullptr;
+	// A flyout closed in the last second: the canvas coming back where it was.
+	const bool goneRecent = gFlyoutGone.right > gFlyoutGone.left && GetTickCount() - gFlyoutGoneAt < 1000;
+	// Where ZBrush's canvas cursor was last, and when: for half a second after
+	// it leaves, changes within 200 pixels are its brush circle going (build
+	// 134: leaving the panel over its top edge left a gap there, a menu box
+	// round what was left of the circle, until the cursor came back).
+	static int lastCanvasX = 0, lastCanvasY = 0;
+	static DWORD lastCanvasAt = 0;
+	if (inView && canvasCursor) {
+		lastCanvasX = cx;
+		lastCanvasY = cy;
+		lastCanvasAt = GetTickCount();
+	}
+	const bool justLeft = !(inView && canvasCursor) && GetTickCount() - lastCanvasAt < 500;
+	for (int y = vy0; y < vy1; ++y) {
+		const size_t i0 = static_cast<size_t>(y) * w;
+		if (!memcmp(cap + i0 + vx0, &gMenuBase[i0 + vx0], static_cast<size_t>(vx1 - vx0) * 4)) {
+			if (gMenuRowCount[y]) {
+				gone += gMenuRowCount[y];
+				gMenuMaskCount -= gMenuRowCount[y];
+				gMenuRowCount[y] = 0;
+				memset(&gMenuMask[i0], 0, w);
+			}
+			continue;
+		}
+		for (int x = vx0; x < vx1; ++x) {
+			const size_t i = i0 + x;
+			const uint32_t c = cap[i], b = gMenuBase[i];
+			const bool diff = ((c ^ b) & 0xFFFFFFu) != 0;
+			if (gMenuBakedCount && gMenuBaked[i]) {
+				bakedGone += diff;
+				continue;
+			}
+			if (diff) {
+				if (gMenuMask[i])
+					continue;
+				const bool may = !gMenuSettling && rootGrow &&
+					!(goneRecent && x >= gFlyoutGone.left && x < gFlyoutGone.right && y >= gFlyoutGone.top && y < gFlyoutGone.bottom) &&
+					!(justLeft && abs(x - lastCanvasX) < 200 && abs(y - lastCanvasY) < 200);
+				const bool onModel = keyShare && keyShare[i] < 128;
+				const bool big = !onModel || abs(static_cast<int>(c & 255) - static_cast<int>(b & 255)) > 12 ||
+					abs(static_cast<int>(c >> 8 & 255) - static_cast<int>(b >> 8 & 255)) > 12 ||
+					abs(static_cast<int>(c >> 16 & 255) - static_cast<int>(b >> 16 & 255)) > 12;
+				const bool wasCanvas = static_cast<uint16_t>(frame - absorbedAt[i]) < 45;
+				if (may && big && !wasCanvas && !(x >= gizmoX && y < gizmoY)) {
+					gMenuMask[i] = 3;  // added this frame
+					++gMenuRowCount[y];
+					++gMenuMaskCount;
+					++added;
+				} else {
+					gMenuBase[i] = c;
+					absorbedAt[i] = frame;
+					++absorbed;
+					recent += may && wasCanvas;
+					faint += may && !big;
+				}
+			} else if (gMenuMask[i]) {
+				gMenuMask[i] = 0;
+				--gMenuRowCount[y];
+				--gMenuMaskCount;
+				++gone;
+			}
+		}
+	}
+	// This frame's additions: kept, or a redraw taken as canvas.
+	// Half the viewport: a flyout's see-through backdrop over the canvas is
+	// a quarter or so (build 129 called the ZPlugin menu, 253277 pixels, a
+	// redraw at a tenth and covered it).
+	const bool redraw = added * 2.0 > static_cast<double>(vx1 - vx0) * (vy1 - vy0);
+	if (added)
+		for (int y = vy0; y < vy1; ++y) {
+			if (!gMenuRowCount[y])
+				continue;
+			const size_t i0 = static_cast<size_t>(y) * w;
+			for (int x = vx0; x < vx1; ++x)
+				if (gMenuMask[i0 + x] == 3) {
+					if (redraw) {
+						gMenuMask[i0 + x] = 0;
+						--gMenuRowCount[y];
+						--gMenuMaskCount;
+						gMenuBase[i0 + x] = cap[i0 + x];
+						absorbedAt[i0 + x] = frame;
+					} else {
+						gMenuMask[i0 + x] = 1;
+					}
+				}
+		}
+	if (redraw) {
+		log("redraw (half the viewport changed at once) taken as canvas", added);
+		added = 0;
+	}
+	if (gMenuSettling) {
+		gMenuQuiet = absorbed < 100 ? gMenuQuiet + 1 : 0;
+		// At most 8 s (build 136 stopped at 3 with ZBrush still redrawing, and
+		// took some of it for menus).
+		if (gMenuQuiet >= 20 || GetTickCount() - gMenuSettleAt > 8000) {
+			gMenuSettling = false;
+			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				fprintf(f, "%lu menus: canvas settled after %lu ms (%s)\n", GetTickCount(), GetTickCount() - gMenuSettleAt,
+					gMenuQuiet >= 20 ? "still for 20 frames" : "8 s passed");
+				fclose(f);
+			}
+		}
+	}
+	// The start menu closed: most of its pixels changed.
+	if (gMenuBakedCount && bakedGone * 2 > gMenuBakedCount)
+		unbake("start menu closed", bakedGone);
+	else if (gMenuBakedCount && flyoutClosed)
+		unbake("start menu closed with its flyout", bakedGone);
+	static int bakedAlike = 0;
+	if (gMenuBakedCount) {
+		int& alike = bakedAlike;
+		alike = 0;
+		for (const auto& p : gMenuBakedPixels)
+			alike += (cap[p.first] & 0xFFFFFFu) == p.second;
+		if (alike * 2 < static_cast<int>(gMenuBakedPixels.size()))
+			unbake("start menu gone (under half its pixels as found)", static_cast<int>(gMenuBakedPixels.size()) - alike);
+	}
+	// A quarter of the viewport is not a menu but the model changing from
+	// the interface (a material): it is the canvas.
+	if (gMenuMaskCount * 4.0 > static_cast<double>(vx1 - vx0) * (vy1 - vy0)) {
+		log("too many pixels for a menu: taken as the canvas", gMenuMaskCount);
+		clearMask();
+		sync();
+	}
+	gMenuOpen = gMenuMaskCount > 0 || gMenuBakedCount > 0;
+	{
+		// Now and then: what was taken as canvas, and why.
+		static DWORD at = 0;
+		static int sumAbsorbed = 0, sumRecent = 0, sumFaint = 0;
+		sumAbsorbed += absorbed;
+		sumRecent += recent;
+		sumFaint += faint;
+		if (GetTickCount() - at >= 2000 && (sumAbsorbed || gMenuOpen)) {
+			at = GetTickCount();
+			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				fprintf(f, "%lu menus: %zu showing, %d menu pixels, start menu %d (%d still as found); last 2 s %d taken as canvas (%d changing back from canvas, %d faint), cursor %s\n",
+					at, gMenuBoxes.size(), gMenuMaskCount, gMenuBakedCount, gMenuBakedCount ? bakedAlike : 0, sumAbsorbed, sumRecent, sumFaint, where);
+				fclose(f);
+			}
+			sumAbsorbed = sumRecent = sumFaint = 0;
+		}
+	}
+	if (!added && !gone && !unbaked)
+		return;
+	// The boxes: clusters of 24-pixel blocks holding menu pixels (touching
+	// blocks join, so a list's items make one box with its empty right part),
+	// those with 30+ pixels and something that appeared from the interface
+	// (or the start menu). The rest (grown on a menu that has gone) are
+	// taken as canvas.
+	const int bs = 24, bw = (w + bs - 1) / bs, bh = (h + bs - 1) / bs;
+	std::vector<int> blocks(static_cast<size_t>(bw) * bh, 0), rootBlocks(blocks.size(), 0);
+	if (gMenuMaskCount || gMenuBakedCount)
+		for (int y = vy0; y < vy1; ++y) {
+			if (!gMenuRowCount[y] && !gMenuBakedCount)
+				continue;
+			const size_t i0 = static_cast<size_t>(y) * w;
+			for (int x = vx0; x < vx1; ++x) {
+				const bool baked = gMenuBakedCount && gMenuBaked[i0 + x];
+				if (gMenuMask[i0 + x] || baked) {
+					const size_t s = static_cast<size_t>(y / bs) * bw + x / bs;
+					++blocks[s];
+					rootBlocks[s] += baked || gMenuMask[i0 + x] == 1;
+				}
+			}
+		}
+	std::vector<int> label(blocks.size(), 0);
+	std::vector<RECT> boxes;
+	std::vector<int> counts;
+	std::vector<char> keep(1, 0);  // per label
+	for (size_t s = 0; s < blocks.size(); ++s) {
+		if (!blocks[s] || label[s])
+			continue;
+		const int id = static_cast<int>(keep.size());
+		label[s] = id;
+		std::vector<size_t> stack = {s};
+		int count = 0, roots = 0, b0 = bw, b1 = -1, c0 = bh, c1 = -1;
+		while (!stack.empty()) {
+			const size_t b = stack.back();
+			stack.pop_back();
+			count += blocks[b];
+			roots += rootBlocks[b];
+			const int bx = static_cast<int>(b % bw), by = static_cast<int>(b / bw);
+			b0 = std::min(b0, bx);
+			b1 = std::max(b1, bx);
+			c0 = std::min(c0, by);
+			c1 = std::max(c1, by);
+			for (int dy = -1; dy <= 1; ++dy)
+				for (int dx = -1; dx <= 1; ++dx) {
+					const int nx = bx + dx, ny = by + dy;
+					if (nx < 0 || ny < 0 || nx >= bw || ny >= bh)
+						continue;
+					const size_t nb = static_cast<size_t>(ny) * bw + nx;
+					if (blocks[nb] && !label[nb]) {
+						label[nb] = id;
+						stack.push_back(nb);
+					}
+				}
+		}
+		// Over 40% of the viewport is no menu (the canvas redrawing).
+		const RECT box = {std::max(vx0, b0 * bs), std::max(vy0, c0 * bs), std::min(vx1, (b1 + 1) * bs), std::min(vy1, (c1 + 1) * bs)};
+		const bool huge = static_cast<double>(box.right - box.left) * (box.bottom - box.top) > 0.4 * (vx1 - vx0) * (vy1 - vy0);
+		if (huge)
+			log("box over 40% of the viewport taken as canvas", count);
+		keep.push_back(roots > 0 && !huge);
+		if (count >= 30 && roots > 0 && !huge) {
+			boxes.push_back(box);
+			counts.push_back(count);
+		}
+	}
+	int dropped = 0;
+	for (int y = vy0; y < vy1; ++y) {
+		if (!gMenuRowCount[y])
+			continue;
+		const size_t i0 = static_cast<size_t>(y) * w;
+		for (int x = vx0; x < vx1; ++x)
+			if (gMenuMask[i0 + x] && !keep[label[static_cast<size_t>(y / bs) * bw + x / bs]]) {
+				gMenuMask[i0 + x] = 0;
+				--gMenuRowCount[y];
+				--gMenuMaskCount;
+				gMenuBase[i0 + x] = cap[i0 + x];
+				absorbedAt[i0 + x] = frame;
+				++dropped;
+			}
+	}
+	if (dropped)
+		log("pixels left from a closed menu taken as canvas", dropped);
+	gMenuOpen = gMenuMaskCount > 0 || gMenuBakedCount > 0;
+	gMenuBoxes = boxes;
+	// Logged when the boxes change in number: each box, its pixels, and what
+	// this frame did (with the cursor where).
+	if (boxes.size() != boxesLogged) {
+		boxesLogged = boxes.size();
+		if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			fprintf(f, "%lu menus now %zu (menu pixels %d, start menu %d; this frame %d added, %d gone, %d taken as canvas; cursor %s at %d %d):",
+				GetTickCount(), boxes.size(), gMenuMaskCount, gMenuBakedCount, added, gone, absorbed, where, cx, cy);
+			for (size_t k = 0; k < boxes.size(); ++k)
+				fprintf(f, " [%ld %ld to %ld %ld, %d]", boxes[k].left, boxes[k].top, boxes[k].right, boxes[k].bottom, counts[k]);
+			fprintf(f, "\n");
+			fclose(f);
+		}
+	}
 }
 
 static inline bool SameColour(uint32_t a, uint32_t b, int tol = 3)
@@ -2538,108 +3439,56 @@ static void Composite(HWND wnd, const OverlayState& st)
 		}
 	}
 	gModelPixels = static_cast<double>(model);
-	if (gMode == 1 && !gPanelAside) {
-		// PureRef: the panel is shown over the model, but not over ZBrush's
-		// popups and menus.
+	// Followed in every mode, so a menu open when the panel appears or moves
+	// is known.
+	UpdateMenus(st, w, h);
+	if (gMode == 1) {
+		// PureRef: the panel is solid over the model and the view gizmo (the
+		// head in the viewport's top right). With the cursor over it, it is
+		// see-through (40%) and the gizmo shows in front; it never goes
+		// (builds 118 to 120 hid it). ZBrush's menus are always in front:
+		// their pixels are left to ZBrush, the panel solid around them.
 		int px, py, pw, ph;
 		PanelRect(w, h, px, py, pw, ph);
-		const int sx = static_cast<int>(st.screenX), sy = static_cast<int>(st.screenY);
-		// ZBrush's menus drawn inside its window over the panel's part of the
-		// canvas, open whether or not the cursor is on them. A menu is a
-		// rectangle filled with one flat colour: 20+ rows whose first long
-		// run (48+ pixels) of one exact colour, not the background, starts at
-		// the same column in the same colour. A model's flat facets have
-		// such runs too, but their edges slant or wobble (nav_log snapshot:
-		// a blockout's black and grey facets, starts drifting row to row).
-		// The panel leaves them (and a margin for their edges and text)
-		// showing.
-		static std::vector<RECT> menus;
-		const size_t menusBefore = menus.size();
-		menus.clear();
-		{
-			const uint32_t* cap32 = reinterpret_cast<const uint32_t*>(gCapture.bits);
-			const int cx0 = std::max(0, px), cx1 = std::min(w, px + pw);
-			int mx0 = 0, mx1 = 0, my0 = 0, rows = 0, last = -100;
-			uint32_t mcol = 0;
-			auto flush = [&]() {
-				if (rows >= 20)
-					menus.push_back({mx0 - 12, my0 - 12, mx1 + 12, last + 13});
-				rows = 0;
-			};
-			for (int y = std::max(0, py); y < py + ph && y < h; ++y) {
-				const uint32_t* row = cap32 + static_cast<size_t>(y) * w;
-				const uint32_t bg = y < static_cast<int>(gRowBg.size()) ? gRowBg[y] : 0;
-				int fx = -1, rx1 = -1;
-				uint32_t fcol = 0;
-				for (int x = cx0; x < cx1;) {
-					const uint32_t v = row[x] & 0xFFFFFFu;
-					int e = x + 1;
-					while (e < cx1 && (row[e] & 0xFFFFFFu) == v)
-						++e;
-					if (e - x >= 48 && !SameColour(v | 0xFF000000u, bg, 2)) {
-						if (fx < 0) {
-							fx = x;
-							fcol = v;
-						}
-						rx1 = e;
-					}
-					x = e;
-				}
-				if (fx < 0)
-					continue;
-				if (rows > 0 && y - last <= 6 && abs(fx - mx0) <= 1 && fcol == mcol) {
-					mx1 = std::max(mx1, rx1);
-				} else {
-					flush();
-					mx0 = fx;
-					mx1 = rx1;
-					my0 = y;
-					mcol = fcol;
-				}
-				++rows;
-				last = y;
-			}
-			flush();
-		}
-		if (menus.size() != menusBefore)
-			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
-				fprintf(f, "%lu menus over the panel: %zu", GetTickCount(), menus.size());
-				for (const RECT& r : menus)
-					fprintf(f, " [%ld %ld %ld %ld]", r.left, r.top, r.right, r.bottom);
-				fprintf(f, "\n");
-				fclose(f);
-			}
-		// Per row, the panel is drawn between the parts left showing.
-		std::vector<std::pair<int, int>> skip;
 		const int ex0 = std::max(0, px), ex1 = std::min(w, px + pw);
+		int gvx0, gvy0, gvx1, gvy1;
+		ViewportRect(w, h, gvx0, gvy0, gvx1, gvy1);
+		const int gizmoX = gvx1 - static_cast<int>(std::min(gvx1 - gvx0, gvy1 - gvy0) * 0.3);
+		const uint32_t* cap32 = reinterpret_cast<const uint32_t*>(gCapture.bits);
+		const bool menus = gMenuOpen || gMenuBakedCount;
+		const bool hover = gPanelAside;
+		const unsigned a = 102;
+		// A menu's whole box is ZBrush's (a flyout's see-through backdrop
+		// over the model changes it too little to be found pixel by pixel).
+		std::vector<std::pair<int, int>> spans;
 		for (int y = std::max(0, py); y < py + ph && y < h; ++y) {
-			const uint32_t* src = reinterpret_cast<const uint32_t*>(gRefLayer.bits) + static_cast<size_t>(y) * w;
-			uint32_t* dst = reinterpret_cast<uint32_t*>(gOutput.bits) + static_cast<size_t>(y) * w;
-			skip.clear();
-			for (const RECT& r : gUiRects)
-				if (y + sy >= r.top && y + sy < r.bottom)
-					skip.push_back({static_cast<int>(r.left) - sx, static_cast<int>(r.right) - sx});
-			for (const RECT& r : menus)
+			const size_t i0 = static_cast<size_t>(y) * w;
+			const uint32_t* src = reinterpret_cast<const uint32_t*>(gRefLayer.bits) + i0;
+			uint32_t* dst = reinterpret_cast<uint32_t*>(gOutput.bits) + i0;
+			const bool gizmoRow = hover && y < gGizmoBottom && gKeyShare.size() == static_cast<size_t>(w) * h;
+			spans.clear();
+			for (const RECT& r : gMenuBoxes)
 				if (y >= r.top && y < r.bottom)
-					skip.push_back({static_cast<int>(r.left), static_cast<int>(r.right)});
-			std::sort(skip.begin(), skip.end());
-			int x = ex0;
-			for (size_t k = 0; k <= skip.size(); ++k) {
-				const int stop = k < skip.size() ? std::min(ex1, std::max(x, skip[k].first)) : ex1;
-				for (; x < stop; ++x)
+					spans.push_back({static_cast<int>(r.left), static_cast<int>(r.right)});
+			// And an open flyout's, found from its backdrop round the canvas.
+			if (gFlyout.right > gFlyout.left && y >= gFlyout.top && y < gFlyout.bottom)
+				spans.push_back({static_cast<int>(gFlyout.left), static_cast<int>(gFlyout.right)});
+			for (int x = ex0; x < ex1; ++x) {
+				bool inBox = false;
+				for (const auto& s : spans)
+					inBox |= x >= s.first && x < s.second;
+				if (inBox || (menus && MenuPixel(i0 + x, cap32))) {
+					dst[x] = 0;
+				} else if (!hover) {
 					dst[x] = src[x] | 0xFF000000u;
-				if (k < skip.size())
-					x = std::max(x, std::min(ex1, skip[k].second));
+				} else if (gizmoRow && x >= gizmoX && gKeyShare[i0 + x] < 64) {
+					dst[x] = 0;
+				} else {
+					const uint32_t s = src[x];
+					dst[x] = a << 24 | ((s >> 16 & 255) * a / 255) << 16 | ((s >> 8 & 255) * a / 255) << 8 | (s & 255) * a / 255;
+				}
 			}
 		}
-	} else if (gMode == 1) {
-		// Stepped aside: see-through, so ZBrush shows there as it is (build
-		// 115 drew the reference only in the background, the model over it).
-		int px, py, pw, ph;
-		PanelRect(w, h, px, py, pw, ph);
-		const int x0 = std::max(0, px), x1 = std::min(w, px + pw);
-		for (int y = std::max(0, py); y < py + ph && y < h && x1 > x0; ++y)
-			memset(gOutput.bits + (static_cast<size_t>(y) * w + x0) * 4, 0, static_cast<size_t>(x1 - x0) * 4);
 	}
 	{
 		// Outside the viewport (ZBrush's interface over the document's edges)
@@ -3481,8 +4330,93 @@ struct MaskExtent {
 	bool ok = false;
 	int i0 = 0, i1 = 0, j0 = 0, j1 = 0;
 	std::vector<int> rowMin, rowMax, colMin, colMax;
+	std::vector<unsigned char> clean;  // the silhouette without straight structures
+	int removed = 0;
 };
 static MaskExtent gExtents[kViewSlots];
+
+// A silhouette as recorded holds everything ZBrush drew that is not the
+// background: image planes (a frame round the model, edge on; a filled block
+// face on) and the floor line, all straight and spanning the whole extent
+// (nav_log dumps, build 123: the Left view framed on four sides, every 3D
+// track hitting the frame 3% in). Removed: a run of columns (then rows), each
+// one unbroken over 60% of the extent with the same ends, with background
+// beside the run on one side and at most 60% model on the other. A
+// creature's columns end at different rows from their neighbours and have
+// model beside them.
+static int RemoveStraight(std::vector<unsigned char>& m, int gw, int gh, bool cols)
+{
+	const int n = cols ? gw : gh, len = cols ? gh : gw;
+	auto at = [&](int line, int k) -> unsigned char& {
+		return cols ? m[static_cast<size_t>(k) * gw + line] : m[static_cast<size_t>(line) * gw + k];
+	};
+	// The extent across the lines.
+	int lo = len, hi = -1;
+	for (int line = 0; line < n; ++line)
+		for (int k = 0; k < len; ++k)
+			if (at(line, k) == 2) { lo = std::min(lo, k); hi = std::max(hi, k); }
+	if (hi <= lo)
+		return 0;
+	// 60%: the side plane's edge in the dumps runs 70% of the height.
+	const int need = static_cast<int>((hi - lo + 1) * 0.6);
+	// Each line's longest unbroken model run.
+	std::vector<int> a(n, -1), b(n, -1);
+	for (int line = 0; line < n; ++line) {
+		int start = -1;
+		for (int k = 0; k <= len; ++k) {
+			const bool on = k < len && at(line, k) == 2;
+			if (on && start < 0)
+				start = k;
+			if (!on && start >= 0) {
+				if (k - start > b[line] - a[line] + 1 || a[line] < 0) { a[line] = start; b[line] = k - 1; }
+				start = -1;
+			}
+		}
+	}
+	auto straight = [&](int line) { return line >= 0 && line < n && a[line] >= 0 && b[line] - a[line] + 1 >= need; };
+	// The share of model beside a line (0 off the grid).
+	auto beside = [&](int line, int from, int to) {
+		if (line < 0 || line >= n)
+			return 0.0;
+		int model = 0;
+		for (int k = from; k <= to; ++k)
+			model += at(line, k) == 2;
+		return static_cast<double>(model) / (to - from + 1);
+	};
+	int removed = 0;
+	for (int line = 0; line < n;) {
+		if (!straight(line)) {
+			++line;
+			continue;
+		}
+		int end = line;
+		while (straight(end + 1) && abs(a[end + 1] - a[line]) <= 2 && abs(b[end + 1] - b[line]) <= 2)
+			++end;
+		const int from = a[line], to = b[line];
+		// Clear on one side, at most 60% model on the other (the frame's top
+		// edge with the head touching it, 52% in the Left dump; a creature's
+		// own edge has its body right beside it).
+		const double before = beside(line - 2, from, to), after = beside(end + 2, from, to);
+		if (std::min(before, after) <= 0.25 && std::max(before, after) <= 0.6) {
+			for (int l = line; l <= end; ++l)
+				for (int k = from; k <= to; ++k)
+					if (at(l, k) == 2) {
+						at(l, k) = 1;
+						++removed;
+					}
+			// The line's own edge (a cell either side of it).
+			for (int l : {line - 1, end + 1})
+				if (l >= 0 && l < n)
+					for (int k = from; k <= to; ++k)
+						if (at(l, k) == 2) {
+							at(l, k) = 1;
+							++removed;
+						}
+		}
+		line = end + 1;
+	}
+	return removed;
+}
 
 static const MaskExtent& ExtentFor(int slot)
 {
@@ -3499,6 +4433,20 @@ static const MaskExtent& ExtentFor(int slot)
 	e.sum = sum;
 	if (v.gw <= 0 || v.gh <= 0 || v.mask.size() != static_cast<size_t>(v.gw) * v.gh || v.cell <= 0)
 		return e;
+	// Columns, rows, then both again (the extent shrinks as the frame goes).
+	// A model that is itself a box (an early blockout) would go too: under a
+	// quarter of it left keeps the silhouette as it was. (Build 124 kept it
+	// at over half removed, and the Front view's face-on image plane is
+	// about half: nav_log, view 0, 0 cells removed.)
+	e.clean = v.mask;
+	for (int pass = 0; pass < 2; ++pass) {
+		e.removed += RemoveStraight(e.clean, v.gw, v.gh, true);
+		e.removed += RemoveStraight(e.clean, v.gw, v.gh, false);
+	}
+	if (e.removed * 4 > std::count(v.mask.begin(), v.mask.end(), 2) * 3) {
+		e.clean = v.mask;
+		e.removed = 0;
+	}
 	e.rowMin.assign(v.gh, -1);
 	e.rowMax.assign(v.gh, -1);
 	e.colMin.assign(v.gw, -1);
@@ -3508,7 +4456,7 @@ static const MaskExtent& ExtentFor(int slot)
 	e.i1 = e.j1 = -1;
 	for (int j = 0; j < v.gh; ++j)
 		for (int i = 0; i < v.gw; ++i) {
-			if (v.mask[static_cast<size_t>(j) * v.gw + i] != 2)
+			if (e.clean[static_cast<size_t>(j) * v.gw + i] != 2)
 				continue;
 			if (e.rowMin[j] < 0) e.rowMin[j] = i;
 			e.rowMax[j] = i;
@@ -3538,6 +4486,83 @@ static void ViewAxes(int slot, double d[3][3])
 	}
 }
 
+// A view's screen axis a as a model axis: which one (0-2) and its sign.
+static void ScreenAxis(const double d[3][3], int a, int& m, double& s)
+{
+	m = 0;
+	s = 0;
+	for (int t = 0; t < 3; ++t)
+		if (fabs(d[a][t]) > 0.5) { m = t; s = d[a][t]; }
+}
+
+// The visible surface at the middle of C's viewport, by the silhouettes: a
+// point is the model's only if every other view with a silhouette sees model
+// there (the views' visual hull), and what C shows is the first such point
+// from its camera. g[3] is the point along each model axis, 0 to 1 across
+// the model's extent; g[] for C's two screen axes come in, the depth along
+// its camera axis goes out. Silhouette bounds stand for the same model extent
+// in every view (orthographic). ZBrush's own depth (PixolPick) is documented
+// as broken and is not used. False when no view sees across C's depth or the
+// ray misses the model; hullViews is how many views it was cast against.
+static bool HullDepth(int c, double g[3], int& hullViews)
+{
+	hullViews = 0;
+	double dc[3][3];
+	ViewAxes(c, dc);
+	int md;
+	double sd;
+	ScreenAxis(dc, 2, md, sd);
+	struct Hull { const View* v; const unsigned char* mask; int m[2]; double s[2]; double low[2], high[2]; };
+	Hull hulls[kViewSlots];
+	int nh = 0;
+	for (int w = 0; w < kDefaultView; ++w) {
+		if (w == c || !gViews[w].used)
+			continue;
+		const MaskExtent& e = ExtentFor(w);
+		if (!e.ok)
+			continue;
+		double dw[3][3];
+		ViewAxes(w, dw);
+		Hull h;
+		h.v = &gViews[w];
+		h.mask = e.clean.data();
+		bool sees = false;
+		for (int a = 0; a < 2; ++a) {
+			ScreenAxis(dw, a, h.m[a], h.s[a]);
+			sees |= h.m[a] == md;
+		}
+		if (!sees)
+			continue;
+		h.low[0] = h.v->u0 + e.i0 * h.v->cell;
+		h.high[0] = h.v->u0 + (e.i1 + 1) * h.v->cell;
+		h.low[1] = h.v->v0 + e.j0 * h.v->cell;
+		h.high[1] = h.v->v0 + (e.j1 + 1) * h.v->cell;
+		hulls[nh++] = h;
+	}
+	hullViews = nh;
+	if (!nh)
+		return false;
+	// From the camera's side inwards, in steps of half a percent.
+	for (int k = 0; k <= 200; ++k) {
+		g[md] = sd > 0 ? 1 - k / 200.0 : k / 200.0;
+		bool inside = true;
+		for (int t = 0; t < nh && inside; ++t) {
+			const Hull& h = hulls[t];
+			int cell[2];
+			for (int a = 0; a < 2; ++a) {
+				const double f = h.s[a] > 0 ? g[h.m[a]] : 1 - g[h.m[a]];
+				const double img = h.low[a] + f * (h.high[a] - h.low[a]);
+				cell[a] = static_cast<int>(floor((img - (a == 0 ? h.v->u0 : h.v->v0)) / h.v->cell));
+			}
+			inside = cell[0] >= 0 && cell[1] >= 0 && cell[0] < h.v->gw && cell[1] < h.v->gh &&
+				h.mask[static_cast<size_t>(cell[1]) * h.v->gw + cell[0]] == 2;
+		}
+		if (inside)
+			return true;
+	}
+	return false;
+}
+
 // Multiview: a view other than the one being looked at (C, the showing
 // view) shows the same part of the model. Both views' silhouettes (recorded
 // when their images were lined up with the model) give the model's extent
@@ -3545,8 +4570,10 @@ static void ViewAxes(int slot, double d[3][3])
 // Left) maps across: the same place along the model, zoomed alike. Along the
 // axis that is depth for C (across, in Left seen from Front), the part being
 // looked at is centred: the model's extent there within the band shown, so
-// zoomed into the face, the side view shows the head. Without both
-// silhouettes the view is placed by the camera as Classic would show it.
+// zoomed into the face, the side view shows the head. Zoomed in closer than
+// the head's depth, it goes to the surface C shows (HullDepth: the nose, not
+// the middle of the skull). Without both silhouettes the view is placed by
+// the camera as Classic would show it.
 static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out, std::string& path)
 {
 	if (!ViewLayout(slot, st, out, path))
@@ -3583,6 +4610,64 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 	double centreV[2] = {0, 0}, halfV[2] = {0, 0};
 	int depthAxis = -1;
 	double k = 0;
+	// The middle of C's viewport along each model axis (0 to 1 across the
+	// model), and its depth: the surface C shows there, when the middle is on
+	// C's silhouette and other views see across C's depth.
+	double g[3] = {0.5, 0.5, 0.5};
+	for (int b = 0; b < 2; ++b) {
+		int m;
+		double s;
+		ScreenAxis(dc, b, m, s);
+		const double f = (centreC[b] - lowC[b]) / (highC[b] - lowC[b]);
+		g[m] = s > 0 ? f : 1 - f;
+	}
+	int hullViews = 0;
+	bool focus = false;
+	{
+		const int ci = static_cast<int>(floor((centreC[0] - cv.u0) / cv.cell)), cj = static_cast<int>(floor((centreC[1] - cv.v0) / cv.cell));
+		bool onModel = false;
+		for (int dj = -1; dj <= 1; ++dj)
+			for (int di = -1; di <= 1; ++di) {
+				const int i = ci + di, j = cj + dj;
+				if (i >= 0 && j >= 0 && i < cv.gw && j < cv.gh && ce.clean[static_cast<size_t>(j) * cv.gw + i] == 2)
+					onModel = true;
+			}
+		focus = gAuto3D && onModel && HullDepth(c, g, hullViews);
+	}
+	{
+		// Each silhouette once a session in the log, as text (# model, .
+		// background, blank not seen; at most 100 columns), with its bounds
+		// and axes: build 122 found every surface 3% in from the near edge,
+		// at every height.
+		static bool dumped[kViewSlots] = {};
+		for (int w = 0; w < kDefaultView; ++w) {
+			const View& v = gViews[w];
+			if (dumped[w] || !v.used || v.mask.size() != static_cast<size_t>(v.gw) * v.gh || v.gw <= 0)
+				continue;
+			dumped[w] = true;
+			const MaskExtent& e = ExtentFor(w);
+			double d[3][3];
+			ViewAxes(w, d);
+			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				fprintf(f, "%lu silhouette of view %d (straight structures removed: %d cells): %d x %d cells of %.2f from %.1f %.1f, model cells %d..%d by %d..%d, right %+.0f %+.0f %+.0f down %+.0f %+.0f %+.0f towards %+.0f %+.0f %+.0f\n",
+					GetTickCount(), w, e.removed, v.gw, v.gh, v.cell, v.u0, v.v0, e.i0, e.i1, e.j0, e.j1,
+					d[0][0], d[0][1], d[0][2], d[1][0], d[1][1], d[1][2], d[2][0], d[2][1], d[2][2]);
+				const int step = (v.gw + 99) / 100;
+				for (int j = 0; j < v.gh; j += step) {
+					std::string line;
+					for (int i = 0; i < v.gw; i += step) {
+						unsigned char best = 0;
+						for (int dj = 0; dj < step && j + dj < v.gh; ++dj)
+							for (int di = 0; di < step && i + di < v.gw; ++di)
+								best = std::max(best, e.clean[static_cast<size_t>(j + dj) * v.gw + i + di]);
+						line += best == 2 ? '#' : best == 1 ? '.' : ' ';
+					}
+					fprintf(f, "  |%s|\n", line.c_str());
+				}
+				fclose(f);
+			}
+		}
+	}
 	for (int a = 0; a < 2; ++a) {
 		int b = -1;
 		double sign = 0;
@@ -3626,6 +4711,43 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 		const double across = depthAxis == 0 ? vv.u0 : vv.v0;
 		centreV[depthAxis] = lo >= 0 ? across + (lo + hi + 1) * 0.5 * vv.cell
 			: (lowV[depthAxis] + highV[depthAxis]) * 0.5;
+		// With the surface's depth: the band still shows whole when it fits
+		// (with a tenth of the window to spare); when it does not (zoomed into
+		// the nose, the head is deeper than the window), the window goes to
+		// the surface, kept inside the band, rather than the middle of the
+		// head.
+		if (focus) {
+			int m;
+			double s;
+			ScreenAxis(dv, depthAxis, m, s);
+			const double f = s > 0 ? g[m] : 1 - g[m];
+			const double at = lowV[depthAxis] + f * (highV[depthAxis] - lowV[depthAxis]);
+			const double room = halfV[depthAxis] * 0.9;
+			if (lo < 0) {
+				centreV[depthAxis] = at;
+			} else {
+				const double bandLo = across + lo * vv.cell, bandHi = across + (hi + 1) * vv.cell;
+				if (bandHi - bandLo > 2 * room)
+					centreV[depthAxis] = std::min(std::max(at, bandLo + room), bandHi - room);
+			}
+		}
+	}
+	{
+		// Logged when what it went by changes: the views, whether the surface
+		// was found, and where (in whole percent).
+		static int lastC = -1, lastSlot = -1, lastFocus = -1, lastG[3] = {-1, -1, -1};
+		const int gi[3] = {static_cast<int>(g[0] * 100), static_cast<int>(g[1] * 100), static_cast<int>(g[2] * 100)};
+		if (c != lastC || slot != lastSlot || focus != (lastFocus == 1) || abs(gi[0] - lastG[0]) > 4 || abs(gi[1] - lastG[1]) > 4 || abs(gi[2] - lastG[2]) > 4) {
+			lastC = c;
+			lastSlot = slot;
+			lastFocus = focus ? 1 : 0;
+			memcpy(lastG, gi, sizeof lastG);
+			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				fprintf(f, "%lu multiview %d from %d: %s (%d views across), model point %d%% %d%% %d%%, scale %.3f, depth axis %d\n", GetTickCount(), slot, c,
+					focus ? "surface found" : "band only", hullViews, gi[0], gi[1], gi[2], k, depthAxis);
+				fclose(f);
+			}
+		}
 	}
 	out.ratio = cs.ratio / k;
 	out.offX = out.offY = 0;
@@ -3642,8 +4764,8 @@ static std::wstring DisplayPath()
 static void SaveDisplay()
 {
 	if (FILE* f = _wfopen(DisplayPath().c_str(), L"wb")) {
-		fprintf(f, "%d %d %d %d %d %d %d %d %d %d\n", gMode, gPanelLeft, gMulti, gMultiA, gMultiB, gBackGrey,
-			gCells[0], gCells[1], gCells[2], gCells[3]);
+		fprintf(f, "%d %d %d %d %d %d %d %d %d %d %d\n", gMode, gPanelLeft, gMulti, gMultiA, gMultiB, gBackGrey,
+			gCells[0], gCells[1], gCells[2], gCells[3], gAuto3D);
 		fclose(f);
 	}
 }
@@ -3656,9 +4778,10 @@ static void LoadDisplay()
 		return;
 	gDisplayLoaded = true;
 	if (FILE* f = _wfopen(DisplayPath().c_str(), L"rb")) {
-		int v[10] = {0, 0, 0, 0, 3, 48, 0, 3, 4, 1};
-		const int n = fscanf(f, "%d %d %d %d %d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]);
-		if (n == 10)
+		int v[11] = {0, 0, 0, 0, 3, 48, 0, 3, 4, 1, 0};
+		const int n = fscanf(f, "%d %d %d %d %d %d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9], &v[10]);
+		gAuto3D = n == 11 && v[10] != 0;
+		if (n >= 10)
 			for (int i = 0; i < 4; ++i)
 				gCells[i] = v[6 + i] >= -1 && v[6 + i] < 6 ? v[6 + i] : -1;
 		if (n >= 6) {
@@ -4567,12 +5690,6 @@ static bool EnsureOverlay()
 // ZBrush's layout, canvas zoom or Windows display scaling.
 // ---------------------------------------------------------------------------
 
-struct Rgb {
-	std::vector<unsigned char> px;  // B, G, R per pixel
-	int w = 0, h = 0;
-	const unsigned char* at(int x, int y) const { return &px[(static_cast<size_t>(y) * w + x) * 3]; }
-};
-
 static bool LoadRgb(const std::wstring& path, Rgb& out)
 {
 	StartGdiplus();
@@ -5011,6 +6128,12 @@ ZFUNC RSOverlayStart(char* text, double, char*, int, char*, int, char**)
 	gCalibration = cal;
 	if (!found)
 		return -5;
+	// For finding a ZBrush menu that is open now (UpdateMenus).
+	gCalScreen = screen;
+	gCalFrame = frame;
+	gCalScreenX = r.left;
+	gCalScreenY = r.top;
+	gCalPending = true;
 
 	EnterCriticalSection(&gOverlayLock);
 	gOverlay.screenX = cal.screenX;
@@ -5314,7 +6437,8 @@ ZFUNC RSOverlayResetOffset(char*, double, char*, int, char*, int, char**)
 
 // text: "name value" sets a display setting and returns it: "mode" (0
 // Classic, 1 PureRef), "left" (PureRef panel on the left), "multi" (two
-// views in the panel), "a" and "b" (the two views, slots 0-5), "back" (the
+// views in the panel), "auto3d" (3D Auto Track), "a" and "b" (the two views,
+// slots 0-5), "back" (the
 // grey shown around the panel), "gamma" and "sat" (the reference's gamma
 // and saturation in percent). The value "-1" toggles mode, left and multi
 // and steps a and b to the next view. "name" alone returns the setting.
@@ -5348,7 +6472,7 @@ ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 	}
 	int* field = strcmp(name, "mode") == 0 ? &gMode : strcmp(name, "left") == 0 ? &gPanelLeft :
 		strcmp(name, "multi") == 0 ? &gMulti : strcmp(name, "a") == 0 ? &gMultiA : strcmp(name, "b") == 0 ? &gMultiB :
-		strcmp(name, "back") == 0 ? &gBackGrey : strcmp(name, "gamma") == 0 ? &gGamma : strcmp(name, "sat") == 0 ? &gSat : nullptr;
+		strcmp(name, "auto3d") == 0 ? &gAuto3D : strcmp(name, "back") == 0 ? &gBackGrey : strcmp(name, "gamma") == 0 ? &gGamma : strcmp(name, "sat") == 0 ? &gSat : nullptr;
 	float result = -1;
 	if (field) {
 		const bool view = field == &gMultiA || field == &gMultiB;
@@ -6655,7 +7779,7 @@ ZFUNC RSOverlayStop(char*, double, char*, int, char*, int, char**)
 }
 
 // text: a switch of the plugin's: "overlay", "overlayoff", "classic",
-// "pureref", "left", "multi", "adjust", or "a N" / "b N" (view N in the
+// "pureref", "left", "multi", "auto3d", "adjust", or "a N" / "b N" (view N in the
 // upper / lower Multiview image). Returns 1 if it is on, else 0: each switch
 // starts as this, and ZBrush loads the plugin again for every press.
 ZFUNC RSIsOn(char* text, double, char*, int, char*, int, char**)
@@ -6675,6 +7799,7 @@ ZFUNC RSIsOn(char* text, double, char*, int, char*, int, char**)
 	else if (strcmp(name, "pureref") == 0) on = gMode == 1;
 	else if (strcmp(name, "left") == 0) on = gPanelLeft != 0;
 	else if (strcmp(name, "multi") == 0) on = gMulti != 0;
+	else if (strcmp(name, "auto3d") == 0) on = gAuto3D != 0;
 	else if (strcmp(name, "adjust") == 0) on = gAdjust;
 	else if (strcmp(name, "a") == 0) on = gMultiA == n;
 	else if (strcmp(name, "b") == 0) on = gMultiB == n;
