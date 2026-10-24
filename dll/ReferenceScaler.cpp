@@ -251,7 +251,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 137;
+static const int kDllBuild = 143;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -774,14 +774,16 @@ static bool ZBrushInFront()
 
 // Adjust Image: while on, mouse buttons on the canvas go to the image (ZBrush
 // does not see them): drag inside it to move it, drag a corner (or drag with
-// the right button) to scale it about its centre.
+// the right button) to scale it about its centre, click off it to finish.
 static volatile bool gAdjust = false;
 // Mouse buttons held, and when one last went down or up (the camera only
 // turns while one is held, or in the snap animation just after).
 static volatile LONG gButtonsDown = 0;
 static volatile DWORD gLastButtonAt = 0;
-static volatile bool gAdjustEscape = false;  // Esc pressed: the overlay turns Adjust Image off
+static volatile bool gAdjustEscape = false;  // Esc pressed or clicked off the image: the overlay turns Adjust Image off
+static bool gAdjustEatUp = false;  // the click that ended Adjust Image: ZBrush sees neither its down nor its up
 static bool AdjustMouse(WPARAM wp, POINT pt);
+static bool CanvasCursor(HCURSOR cur);
 
 static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 {
@@ -798,6 +800,11 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 	}
 	const bool alt = gAltDown, ctrl = gCtrlDown;
 	EnterCriticalSection(&gOverlayLock);
+	if (gAdjustEatUp && (wp == WM_LBUTTONUP || wp == WM_RBUTTONUP)) {
+		gAdjustEatUp = false;
+		LeaveCriticalSection(&gOverlayLock);
+		return 1;
+	}
 	if (gAdjust) {
 		const bool eaten = AdjustMouse(wp, m->pt);
 		LeaveCriticalSection(&gOverlayLock);
@@ -1188,12 +1195,12 @@ static bool AdjustMouse(WPARAM wp, POINT pt)
 			return false;
 		x0 += st.screenX;
 		y0 += st.screenY;
-		// Only where the reference shows (the canvas background): clicks on
-		// the model, or on ZBrush's popups and menus over the canvas, go to
-		// ZBrush.
-		const int kx = static_cast<int>(pt.x - st.screenX), ky = static_cast<int>(pt.y - st.screenY);
-		if (kx < 0 || ky < 0 || kx >= gKeyW || ky >= gKeyH || gKeyShare.size() != static_cast<size_t>(gKeyW) * gKeyH ||
-			gKeyShare[static_cast<size_t>(ky) * gKeyW + kx] < 128)
+		// ZBrush's menus and popups over the canvas show an interface cursor:
+		// those clicks go to ZBrush. Every other click on the canvas is
+		// Adjust Image's, so ZBrush never turns the camera (or sculpts) while
+		// it is on, the model included.
+		CURSORINFO ci = {sizeof(ci)};
+		if (GetCursorInfo(&ci) && !CanvasCursor((ci.flags & CURSOR_SHOWING) ? ci.hCursor : nullptr))
 			return false;
 		gAdjustSX0 = st.imgSX;
 		gAdjustSY0 = st.imgSY;
@@ -1207,8 +1214,12 @@ static bool AdjustMouse(WPARAM wp, POINT pt)
 		const int sideY = fabs(pt.y - hy0) < r ? -1 : fabs(pt.y - hy1) < r ? 1 : 0;
 		const bool withinX = pt.x > hx0 - r && pt.x < hx1 + r, withinY = pt.y > hy0 - r && pt.y < hy1 + r;
 		const bool inside = pt.x >= x0 && pt.x < x0 + w && pt.y >= y0 && pt.y < y0 + h;
-		if (!(sideX && withinY) && !(sideY && withinX) && !inside)
-			return false;  // off the image: ZBrush gets the click
+		if (!(sideX && withinY) && !(sideY && withinX) && !inside) {
+			// Off the image: Adjust Image ends, as with Esc.
+			gAdjustEscape = true;
+			gAdjustEatUp = true;
+			return true;
+		}
 		gAdjustDown = pt;
 		gAdjustSideX = sideX;
 		gAdjustSideY = sideY;
@@ -1329,8 +1340,11 @@ static int gAuto3D = 0;
 // a view slot each, or -1 for none.
 static int gCells[4] = {0, 3, 4, 1};
 // The reference's gamma and saturation, in percent (100 leaves it as is),
-// from the plugin's sliders (not saved: the sliders start at 100).
+// from the plugin's sliders, saved in display.txt (the sliders start there).
 static int gGamma = 100, gSat = 100;
+// Model Opacity, in percent: under 100, Classic shows the reference through
+// the model as Image Plane does (from the plugin's slider, saved likewise).
+static int gModelOpacity = 75;
 static const double kPanelShare = 0.35;  // of the canvas width
 
 // The part of the document ZBrush shows (overlay pixels, x1 and y1 past the
@@ -2058,6 +2072,10 @@ static bool CanvasCursor(HCURSOR cur)
 {
 	if (!cur)
 		return true;
+	// Also asked from the mouse hook (Adjust Image).
+	static SRWLOCK lock = SRWLOCK_INIT;
+	AcquireSRWLockExclusive(&lock);
+	struct Release { ~Release() { ReleaseSRWLockExclusive(&lock); } } release;
 	static std::vector<std::pair<HCURSOR, bool>> known;
 	for (const auto& k : known)
 		if (k.first == cur)
@@ -2865,6 +2883,13 @@ static void UpdateMenus(const OverlayState& st, int w, int h)
 		if (alike * 2 < static_cast<int>(gMenuBakedPixels.size()))
 			unbake("start menu gone (under half its pixels as found)", static_cast<int>(gMenuBakedPixels.size()) - alike);
 	}
+	// The start menu is the one Overlay was pressed in, and ZBrush closes it
+	// when the cursor leaves: the cursor 48+ pixels outside its box means it
+	// is gone. Build 137 kept one made of the model (alike in the calibration
+	// capture, never changing) while the cursor sat below the viewport, a
+	// hole in the panel until the cursor came back to it.
+	if (gMenuBakedCount && (cx < gMenuBox.left - 48 || cx >= gMenuBox.right + 48 || cy < gMenuBox.top - 48 || cy >= gMenuBox.bottom + 48))
+		unbake("start menu gone (the cursor left it)", 0);
 	// A quarter of the viewport is not a menu but the model changing from
 	// the interface (a material): it is the canvas.
 	if (gMenuMaskCount * 4.0 > static_cast<double>(vx1 - vx0) * (vy1 - vy0)) {
@@ -3442,6 +3467,45 @@ static void Composite(HWND wnd, const OverlayState& st)
 	// Followed in every mode, so a menu open when the panel appears or moves
 	// is known.
 	UpdateMenus(st, w, h);
+	// Classic with Model Opacity under 100: the reference shows through the
+	// model too, as with Image Plane. ZBrush can only blend its model with
+	// the canvas, and the reference is not on it, so the overlay does it. Not
+	// over ZBrush's menu pixels, an open flyout (found from its backdrop, so
+	// always a real one; build 142 blended over the submenu) or the view
+	// gizmo. Build 141 also left out whole menu boxes: with the JRef palette
+	// open, strips of the model redrawn as the palette grew were taken as
+	// menus and stayed solid until the cursor reached the canvas.
+	if (gMode == 0 && gModelOpacity < 100) {
+		int vx0, vy0, vx1, vy1;
+		ViewportRect(w, h, vx0, vy0, vx1, vy1);
+		const int gizmoX = vx1 - static_cast<int>(std::min(vx1 - vx0, vy1 - vy0) * 0.3);
+		const int m = (100 - gModelOpacity) * 256 / 100;
+		const bool menus = gMenuOpen || gMenuBakedCount;
+		ParallelRows(vy0, vy1, [&](int ya, int yb) {
+		for (int y = ya; y < yb; ++y) {
+			const size_t i0 = static_cast<size_t>(y) * w;
+			const bool gizmoRow = y < gGizmoBottom;
+			const bool flyoutRow = gFlyout.right > gFlyout.left && y >= gFlyout.top && y < gFlyout.bottom;
+			for (int x = vx0; x < vx1; ++x) {
+				const size_t i = i0 + x;
+				const uint32_t rf = ref32[i];
+				const int a = static_cast<int>(rf >> 24);
+				if (!a || gKeyShare[i] || (gizmoRow && x >= gizmoX) || (menus && MenuPixel(i, cap32)) ||
+					(flyoutRow && x >= gFlyout.left && x < gFlyout.right))
+					continue;
+				// ref is premultiplied: rf - c * a is a * (reference - model).
+				const uint32_t c = cap32[i];
+				uint32_t o = 0xFF000000u;
+				for (int s = 0; s < 24; s += 8) {
+					const int cv = static_cast<int>(c >> s & 255), rv = static_cast<int>(rf >> s & 255);
+					const int v = cv + (rv - cv * a / 255) * m / 256;
+					o |= static_cast<uint32_t>(v < 0 ? 0 : v > 255 ? 255 : v) << s;
+				}
+				out32[i] = o;
+			}
+		}
+		});
+	}
 	if (gMode == 1) {
 		// PureRef: the panel is solid over the model and the view gizmo (the
 		// head in the viewport's top right). With the cursor over it, it is
@@ -4764,8 +4828,8 @@ static std::wstring DisplayPath()
 static void SaveDisplay()
 {
 	if (FILE* f = _wfopen(DisplayPath().c_str(), L"wb")) {
-		fprintf(f, "%d %d %d %d %d %d %d %d %d %d %d\n", gMode, gPanelLeft, gMulti, gMultiA, gMultiB, gBackGrey,
-			gCells[0], gCells[1], gCells[2], gCells[3], gAuto3D);
+		fprintf(f, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", gMode, gPanelLeft, gMulti, gMultiA, gMultiB, gBackGrey,
+			gCells[0], gCells[1], gCells[2], gCells[3], gAuto3D, gGamma, gSat, gModelOpacity);
 		fclose(f);
 	}
 }
@@ -4778,9 +4842,16 @@ static void LoadDisplay()
 		return;
 	gDisplayLoaded = true;
 	if (FILE* f = _wfopen(DisplayPath().c_str(), L"rb")) {
-		int v[11] = {0, 0, 0, 0, 3, 48, 0, 3, 4, 1, 0};
-		const int n = fscanf(f, "%d %d %d %d %d %d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9], &v[10]);
-		gAuto3D = n == 11 && v[10] != 0;
+		int v[14] = {0, 0, 0, 0, 3, 48, 0, 3, 4, 1, 0, 100, 100, 75};
+		const int n = fscanf(f, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9],
+			&v[10], &v[11], &v[12], &v[13]);
+		gAuto3D = n >= 11 && v[10] != 0;
+		// Gamma, Saturation and Model Opacity (build 142; older files keep the defaults).
+		if (n >= 14) {
+			gGamma = std::max(20, std::min(v[11], 300));
+			gSat = std::max(0, std::min(v[12], 200));
+			gModelOpacity = std::max(0, std::min(v[13], 100));
+		}
 		if (n >= 10)
 			for (int i = 0; i < 4; ++i)
 				gCells[i] = v[6 + i] >= -1 && v[6 + i] < 6 ? v[6 + i] : -1;
@@ -6440,7 +6511,7 @@ ZFUNC RSOverlayResetOffset(char*, double, char*, int, char*, int, char**)
 // views in the panel), "auto3d" (3D Auto Track), "a" and "b" (the two views,
 // slots 0-5), "back" (the
 // grey shown around the panel), "gamma" and "sat" (the reference's gamma
-// and saturation in percent). The value "-1" toggles mode, left and multi
+// and saturation in percent), "modelop" (Model Opacity in percent). The value "-1" toggles mode, left and multi
 // and steps a and b to the next view. "name" alone returns the setting.
 ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 {
@@ -6472,16 +6543,17 @@ ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 	}
 	int* field = strcmp(name, "mode") == 0 ? &gMode : strcmp(name, "left") == 0 ? &gPanelLeft :
 		strcmp(name, "multi") == 0 ? &gMulti : strcmp(name, "a") == 0 ? &gMultiA : strcmp(name, "b") == 0 ? &gMultiB :
-		strcmp(name, "auto3d") == 0 ? &gAuto3D : strcmp(name, "back") == 0 ? &gBackGrey : strcmp(name, "gamma") == 0 ? &gGamma : strcmp(name, "sat") == 0 ? &gSat : nullptr;
+		strcmp(name, "auto3d") == 0 ? &gAuto3D : strcmp(name, "back") == 0 ? &gBackGrey : strcmp(name, "gamma") == 0 ? &gGamma : strcmp(name, "sat") == 0 ? &gSat : strcmp(name, "modelop") == 0 ? &gModelOpacity : nullptr;
 	float result = -1;
 	if (field) {
 		const bool view = field == &gMultiA || field == &gMultiB;
-		const bool level = field == &gBackGrey || field == &gGamma || field == &gSat;
+		const bool level = field == &gBackGrey || field == &gGamma || field == &gSat || field == &gModelOpacity;
 		if (value == -1 && !level)
 			*field = view ? (*field + 1) % 6 : !*field;
 		else if (value >= 0)
 			*field = view ? value % 6 : field == &gBackGrey ? std::min(value, 255) :
-				field == &gGamma ? std::max(20, std::min(value, 300)) : field == &gSat ? std::min(value, 200) : value != 0;
+				field == &gGamma ? std::max(20, std::min(value, 300)) : field == &gSat ? std::min(value, 200) :
+				field == &gModelOpacity ? std::min(value, 100) : value != 0;
 		if (value != -2) {
 			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 				fprintf(f, "%lu display %s\n", GetTickCount(), text);
@@ -6501,13 +6573,34 @@ ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 }
 
 // text: "1" turns Adjust Image on, "0" off (keeping the image's size and
-// place for the showing view), "2" only checks whether it could go on.
-// Returns 1, 0 if no image is showing, -1 if the overlay is not on, -2 in
-// PureRef.
+// place for the showing view), "2" only checks whether it could go on, "3"
+// (Reset) turns it off and puts every view's image back to fitted and
+// centred. Returns 1, 0 if no image is showing, -1 if the overlay is not on,
+// -2 in PureRef.
 ZFUNC RSAdjust(char* text, double, char*, int, char*, int, char**)
 {
 	const int req = text ? atoi(text) : 0;
 	const bool on = req == 1 || req == 2;
+	if (req == 3) {
+		EnsureLock();
+		EnterCriticalSection(&gOverlayLock);
+		LoadViews();
+		gAdjust = false;
+		gAdjustDrag = 0;
+		for (int s = 0; s < kViewSlots; ++s) {
+			gViews[s].imgSX = gViews[s].imgSY = 1;
+			gViews[s].imgX = gViews[s].imgY = 0;
+		}
+		gOverlay.imgSX = gOverlay.imgSY = 1;
+		gOverlay.imgX = gOverlay.imgY = 0;
+		SaveViews();
+		gRedrawPending = true;
+		LeaveCriticalSection(&gOverlayLock);
+		if (gOverlayWnd)
+			PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+		ViewLog("image size and place reset", -1);
+		return 1;
+	}
 	if (!gOverlayWnd || !gOverlay.visible) {
 		gAdjust = false;
 		return -1;
