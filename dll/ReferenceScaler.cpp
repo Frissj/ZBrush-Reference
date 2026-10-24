@@ -251,7 +251,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 143;
+static const int kDllBuild = 144;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1388,8 +1388,21 @@ static bool ViewLayout(int slot, const OverlayState& st, OverlayState& out, std:
 static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out, std::string& path);
 static int ActiveViewSlot();
 
+template <typename Fn>
+static void ParallelRows(int y0, int y1, const Fn& fn);
+
+// v / 255, rounded, for v up to 255 * 255.
+static inline int Div255(int v)
+{
+	v += 128;
+	return (v + (v >> 8)) >> 8;
+}
+
 // Draws an image (premultiplied, scaled by alpha) over dst, its rectangle at
-// x0, y0 and dispW x dispH, only inside the clip rectangle.
+// x0, y0 and dispW x dispH, only inside the clip rectangle. Rows are drawn in
+// bands on every core, and opaque pixels or ones over nothing skip the blend:
+// a zoom redraws the whole reference, which took 71 ms a step on one core with
+// the image filling the canvas (bench, build 143), the lag seen zooming.
 static void DrawLevels(Buffer32& dst, const std::vector<Level>& levels, double x0, double y0, double dispW, double dispH,
 	int cx0, int cy0, int cx1, int cy1, int alphaScale)
 {
@@ -1424,7 +1437,8 @@ static void DrawLevels(Buffer32& dst, const std::vector<Level>& levels, double x
 		cw[x - cx0] = static_cast<int>((fu - ix) * 256);
 	}
 	uint32_t* out = reinterpret_cast<uint32_t*>(dst.bits);
-	for (int y = cy0; y < cy1; ++y) {
+	ParallelRows(cy0, cy1, [&](int ya, int yb) {
+	for (int y = ya; y < yb; ++y) {
 		const double v = (y + 0.5 - y0) / dispH * lv.h - 0.5;
 		if (v < -0.5 || v > lv.h - 0.5)
 			continue;
@@ -1455,19 +1469,30 @@ static void DrawLevels(Buffer32& dst, const std::vector<Level>& levels, double x
 					ch[k] = a == 255 ? gammaLut[v] : gammaLut[v * 255 / a] * a / 255;
 				}
 			}
-			const int alpha = ch[0] * alphaScale / 255;
+			const int alpha = alphaScale == 255 ? ch[0] : Div255(ch[0] * alphaScale);
+			if (alpha == 0)
+				continue;
+			if (alpha == 255) {
+				row[x] = 0xFF000000u | static_cast<uint32_t>(ch[1]) << 16 | static_cast<uint32_t>(ch[2]) << 8 | static_cast<uint32_t>(ch[3]);
+				continue;
+			}
+			const int sr = Div255(ch[1] * alpha), sg = Div255(ch[2] * alpha), sb = Div255(ch[3] * alpha);
 			// Over what is there already (premultiplied).
 			const uint32_t under = row[x];
+			if (!under) {
+				row[x] = static_cast<uint32_t>(alpha) << 24 | static_cast<uint32_t>(sr) << 16 | static_cast<uint32_t>(sg) << 8 | static_cast<uint32_t>(sb);
+				continue;
+			}
+			const int src[4] = {alpha, sr, sg, sb};
 			uint32_t result = 0;
 			for (int k = 0, c = 24; c >= 0; c -= 8, ++k) {
-				const int src = k == 0 ? alpha : ch[k] * alpha / 255;
-				const int dv = (under >> c) & 255;
-				const int v = src + dv * (255 - alpha) / 255;
+				const int v = src[k] + Div255(static_cast<int>((under >> c) & 255) * (255 - alpha));
 				result |= static_cast<uint32_t>(v > 255 ? 255 : v) << c;
 			}
 			row[x] = result;
 		}
 	}
+	});
 }
 
 static void FillRect(Buffer32& b, int x0, int y0, int x1, int y1, uint32_t argb)
@@ -3419,7 +3444,8 @@ static void Composite(HWND wnd, const OverlayState& st)
 		// 120 Hz).
 		LARGE_INTEGER now;
 		QueryPerformanceCounter(&now);
-		const double ms = 1000.0 * (now.QuadPart - compStart.QuadPart) / qpf.QuadPart;
+		// With the reference's redraw before it, when there was one.
+		const double ms = 1000.0 * (now.QuadPart - compStart.QuadPart) / qpf.QuadPart + gStageMs[2];
 		static double worstMs = 0, worstStage[8];
 		static int frames = 0, slow = 0;
 		++frames;
@@ -3433,12 +3459,14 @@ static void Composite(HWND wnd, const OverlayState& st)
 		if (GetTickCount() - statsAt >= 2000) {
 			statsAt = GetTickCount();
 			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				// "reference" is redrawing the reference (a zoom, pan or setting
+				// change), "menus" the last frame's menus, panel and Model Opacity.
 				fprintf(f, "%lu capture method %d, %.1f fps, magenta %.1f%%, background spans %d %d to %d %d, viewport %d %d to %d %d, mode %d, frame %.1f ms to here "
-					"(learn %.1f, match %.1f, regions %.1f, combine %.1f; last present %.1f); worst of %d frames %.1f ms "
-					"(learn %.1f, match %.1f, regions %.1f, combine %.1f, present %.1f), %d over 8 ms\n",
+					"(learn %.1f, match %.1f, regions %.1f, combine %.1f; last reference %.1f, menus %.1f, present %.1f); worst of %d frames %.1f ms "
+					"(reference %.1f, learn %.1f, match %.1f, regions %.1f, combine %.1f, menus %.1f, present %.1f), %d over 8 ms\n",
 					statsAt, gCaptureMethod, gFps, gMagentaShare, x0, y0, x1, y1, gViewX0, gViewY0, gViewX1, gViewY1, gMode, ms,
-					gStageMs[0], gStageMs[1], gStageMs[3], gStageMs[4], gStageMs[6], frames, worstMs,
-					worstStage[0], worstStage[1], worstStage[3], worstStage[4], worstStage[6], slow);
+					gStageMs[0], gStageMs[1], gStageMs[3], gStageMs[4], gStageMs[2], gStageMs[5], gStageMs[6], frames, worstMs,
+					worstStage[2], worstStage[0], worstStage[1], worstStage[3], worstStage[4], worstStage[5], worstStage[6], slow);
 				fclose(f);
 			}
 			worstMs = 0;
@@ -5619,11 +5647,18 @@ static bool OverlayStep(HWND wnd)
 			gRowBg.clear();
 			gGizmoBottom = 0;
 		}
+		LARGE_INTEGER b0, b1, bf;
+		QueryPerformanceCounter(&b0);
 		if (!BuildRefLayer(st)) {
 			ShowWindow(wnd, SW_HIDE);
 			return false;
 		}
+		QueryPerformanceCounter(&b1);
+		QueryPerformanceFrequency(&bf);
+		gStageMs[2] = 1000.0 * (b1.QuadPart - b0.QuadPart) / bf.QuadPart;
 		shown = st;
+	} else {
+		gStageMs[2] = 0;
 	}
 	if (gKeyState == 1 && !tested && !gUseWgc) {
 		tested = true;
