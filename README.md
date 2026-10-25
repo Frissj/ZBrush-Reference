@@ -1,72 +1,109 @@
-# ZBrush-Reference
+# JRef
 
-**Reference Scaler**: a ZBrush 2022 ZScript plugin. It makes the reference image
-loaded with **Texture > Image Plane** scale with the camera, so the image grows
-and shrinks with the model as you zoom in and out.
+A ZBrush 2023 plugin that keeps your reference images with the model. You load
+one image per view (Front, Back, Right, Left, Top, Bottom), and JRef shows the
+right one whenever you snap to that view. As you zoom, pan and turn, the image
+stays lined up with the model.
+
+You can show the references in two ways:
+
+- **Classic** draws the image behind the model, like Image Plane.
+- **PureRef** shows the images in a panel at the side of the canvas. With
+  **Multiview** on, the panel shows two views at once, and **3D Auto Track**
+  keeps the other view on the part of the model you're working on, at any
+  angle and in perspective.
+
+JRef draws in its own click-through window over ZBrush's canvas. You keep
+sculpting as normal, and ZBrush's menus, gizmo and cursor stay on top.
 
 ## Install
 
-1. In ZBrush 2022, go to **ZScript > Load** and pick `ReferenceScaler.txt`.
-   ZBrush compiles it to `ReferenceScaler.zsc` next to the source.
-2. Copy `ReferenceScaler.zsc` into `ZBrush 2022/ZStartup/ZPlugs64/` so it loads
-   on every start.
-3. The controls appear under **ZPlugin > Reference Scaler**.
+1. In ZBrush 2023, go to **ZScript > Load** and pick `JRef.txt`.
+2. That's it. JRef copies itself into `ZStartup\ZPlugs64` (as `ZZ_JRef.zsc`,
+   with its `JRef_Data` folder). From then on it loads every time ZBrush
+   starts, under **ZPlugin > JRef**.
 
-## Use
+When a newer build is in this folder, the installed copy updates itself the
+next time ZBrush starts. If `ZPlugs64` can't be written without admin rights,
+JRef keeps its log and settings in `C:\Users\Public\Documents\JRef` instead.
 
-1. Load your image with **Texture > Image Plane** and put the model in Edit mode.
-2. Line the image up with the model.
-3. Press **Anchor**. This sets the current zoom as 1:1.
-4. Turn on **Live**. Each time you zoom, the Image Plane size slider is set to
-   `anchored size × (current model scale ÷ anchored model scale)`, so the image
-   keeps the same scale relative to the model.
+## Getting started
+
+1. Put the model in Edit mode and snap to a view, for example Front.
+2. Open **ZPlugin > JRef > Views** and press **Load Front** to pick the image.
+3. Press **Overlay**. JRef finds the canvas, and the image appears behind the
+   model.
+4. If the image needs lining up, press **Adjust Image**. Drag inside it to move
+   it, and drag a corner or edge (or right-drag) to scale it. Click off the
+   image or press Esc when you're done.
+5. Load the other views the same way. Each one shows whenever you snap to its
+   view.
+
+## Controls
+
+All controls are under **ZPlugin > JRef**.
 
 | Control | What it does |
 | --- | --- |
-| Anchor | Records the model scale, its screen position and the Image Plane slider values. |
-| Live | Keeps updating on a timer and each time the mouse is released (when a zoom drag ends). |
-| Sync | Updates once. Give it a hotkey (Ctrl+Alt+click) if you'd rather sync by hand. |
-| Reset | Puts the Image Plane sliders back to their anchored values. |
-| Interval | Seconds between Live updates. |
-| Follow Position + Offset Gain | Also moves the image with Image Plane's Shift H/V so it stays under the model when zooming moves the model on screen. Offset Gain is how many canvas pixels the image moves per slider unit. Adjust it by eye, and use a negative value if the image moves the wrong way. |
-| Detect / Set Paths | Finds the Image Plane sliders, or lets you type their paths. |
+| Overlay | Turns the overlay on. Press it again if JRef loses the canvas. |
+| Overlay Off | Hides the overlay. |
+| Classic / PureRef | The display mode: the image behind the model, or in a panel at the side. |
+| Swap Side | Moves the PureRef panel to the other side of the canvas. |
+| Reset | Snaps to the Front view lined up with its image. Also resets Gamma, Saturation and every image's Adjust Image size and position. |
+| Adjust Image | Moves and scales the current image to line it up with the model. |
+| Anchor | Records the current zoom and position as the 1:1 match with the image. |
+| Views | **Load** and **Remove** each view's image. |
+| Image | **Gamma** and **Saturation** of the images; **Model Opacity** lets the reference show through the model in Classic. |
+| Multiview | **Multiview** shows two views in the PureRef panel. **3D Auto Track** keeps the other view on the part you're looking at. |
+| Upper Image / Lower Image | Which views Multiview shows, top and bottom. |
+| Project | **Open Project** opens a saved JRef project. **Snapshot** saves what the overlay captured and drew, for reporting a problem. **About** shows the running build. |
 
-## Debugging
+## Projects
 
-ZBrush has no script console. This plugin gives you three ways to see what it's doing:
+The first image you load starts a project: a `JRef` folder next to that image.
+It holds copies of the images, each view's outline and your settings. You can
+move the folder or copy it to another computer, then open it with
+**Project > Open Project**.
 
-- **Status**: a popup listing everything the plugin sees. That's edit mode, the
-  model scale/position from `TransformGet`, the anchor values, the Image Plane
-  slider value and the detected slider paths.
-- **Debug** switch: while it's on, each update writes a one-line summary to the
-  bar at the top of the canvas. **Sync** always writes that line.
-- **Dump UI**: writes every ZBrush interface item (ID, full path, value) to
-  `ReferenceScaler_UI.txt` and remembers the values. The popup shows where the
-  file was saved.
-- **Dump Changes**: writes only the items whose value changed since the last
-  dump to `ReferenceScaler_Changes.txt`, and lists the first 25 in the popup.
-  For example: Dump UI, zoom, then Dump Changes shows what zooming changes.
-- **Syntax errors**: ZBrush reports these in a popup with the line number
-  when you load the `.txt` via **ZScript > Load**.
+JRef also watches ZBrush open and save `.zpr` files. When you save a ZBrush
+project, JRef writes a `.jref` link file next to it. Opening that ZBrush
+project again, on any computer, reopens its references. A ZBrush project with
+no link opens with no references.
 
-After you edit `ReferenceScaler.txt`, load it again with **ZScript > Load**. That
-rebuilds the `.zsc`, and you then copy the new `.zsc` into `ZPlugs64`.
+## How 3D Auto Track works
 
-## Notes and limitations
+JRef reads ZBrush's camera (zoom, pan and rotation) straight from its memory.
+Each time ZBrush finishes drawing a frame and the camera has been still for a
+moment, JRef keeps the frame's depth as 3D points. It builds those up from
+every angle you look from. To place the other view, it takes the surface under
+the middle of your work area, from those points, and goes half the part's
+thickness into the model. So the side view shows the same part of the model as
+the main view, even when you've turned to an angle with no reference image.
 
-- **Not yet tested in ZBrush.** It was written against the ZScript 2022 command
-  reference.
-- **Slider names:** the plugin looks for the Image Plane size slider under names
-  such as `Texture:Image Plane:ImgSize` and `…:Size`, and for the shift sliders
-  under `…:Shift H` and `…:Shift V`. If **Detect** reports "not found", use
-  **Set Paths** and type the path shown in the slider's popup info (hold Ctrl
-  while hovering over it).
-- **Only one ZScript runs at a time.** Pressing a button in another plugin,
-  including Image Plane's own buttons, ends the Live loop, so turn Live back
-  on afterwards. If setting Image Plane's slider ends the loop on its own (Live
-  stops after one update), use **Sync** on a hotkey instead.
-- After you switch Image Plane views (Front/Side…) or load a new image, line it
-  up again and press **Anchor**.
-- In ZBrush 2022, zooming changes the model's scale on the canvas. The plugin
-  reads that scale with `TransformGet`, so it doesn't track Document zoom (the
-  2D canvas zoom).
+## Building the DLL
+
+The overlay, memory reading and project watching live in
+`JRef_Data\JRef64.dll`, built from `dll\ReferenceScaler.cpp`. To build it you
+need Visual Studio 2026 (x64 C++ tools):
+
+```bash
+cmd //c "dll\\build.bat"
+```
+
+That writes `JRef_Data\JRef64.dll` and `JRef_Data\build.txt`. The build number
+is `kDllBuild` in the source, and `zrsBuild`/`zrsDllBuild` in `JRef.txt`. Bump
+all three together. The plugin refuses a DLL whose build doesn't match.
+
+## Troubleshooting
+
+- JRef writes a log to `JRef_Data\nav_log.txt` next to the installed DLL. It
+  records what it found in ZBrush's memory, each project it opened and the
+  overlay's timings.
+- **Project > About** shows which build is running and whether the DLL loaded.
+- If the image doesn't follow the camera after a ZBrush restart, press
+  **Overlay** again. JRef searches ZBrush's memory for the camera when the
+  overlay starts. That takes about a second.
+
+## License
+
+See [LICENSE](LICENSE).
