@@ -12,6 +12,7 @@
 #include <tlhelp32.h>
 #include <winternl.h>
 #include <shlwapi.h>
+#include <psapi.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <gdiplus.h>
@@ -22,6 +23,8 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <map>
+#include <tuple>
 #include <algorithm>
 #include <cmath>
 #include <emmintrin.h>
@@ -257,7 +260,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 188;
+static const int kDllBuild = 190;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -4707,9 +4710,25 @@ static bool CameraRegion(const MEMORY_BASIC_INFORMATION& m)
 // Scans for x with y right after it (as float or double pairs), then for the
 // scale within 1 KB of each pair. Scanning for the scale on its own finds too
 // many matches when it is a common number such as 1.
-static void MemScan(double sx, double px, double py)
+// One search, in parts, so the rotation's can share its pass over memory
+// (CameraScan): set up, each piece of memory, then the results.
+struct MemScanJob {
+	static const size_t kMaxPairs = 200000;
+	double sx, px, py;
+	int workers;
+	std::vector<std::vector<MemCand>> xs, ys;
+	std::vector<size_t> rawXs, rawYs;
+	// MemMatch's ranges, for the quick test sixteen bytes at a time.
+	__m128d dxLo, dxHi, dyLo, dyHi;
+	__m128 fxLo, fxHi, fyLo, fyHi;
+	MemScanJob(double sx_, double px_, double py_);
+	void Piece(int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t got);
+	void Finish(size_t scanned, DWORD t0);
+};
+
+MemScanJob::MemScanJob(double sx_, double px_, double py_) : sx(sx_), px(px_), py(py_), workers(ScanWorkers()),
+	xs(workers), ys(workers), rawXs(workers), rawYs(workers)
 {
-	const DWORD t0 = GetTickCount();
 	MemTrack* tracks[3] = {&gMemScale, &gMemX, &gMemY};
 	const double targets[3] = {sx, px, py};
 	for (int t = 0; t < 3; ++t) {
@@ -4718,19 +4737,20 @@ static void MemScan(double sx, double px, double py)
 		tracks[t]->narrowings = 0;
 		tracks[t]->tooMany = false;
 	}
-	const size_t kMaxPairs = 200000;
-	const int workers = ScanWorkers();
-	std::vector<std::vector<MemCand>> xs(workers), ys(workers);
-	std::vector<size_t> rawXs(workers), rawYs(workers);
-	// MemMatch's ranges, for the quick test sixteen bytes at a time.
 	const double xTol = 0.0051 + fabs(px) * 1e-5, yTol = 0.0051 + fabs(py) * 1e-5;
-	const __m128d dxLo = _mm_set1_pd(px - xTol), dxHi = _mm_set1_pd(px + xTol);
-	const __m128d dyLo = _mm_set1_pd(py - yTol), dyHi = _mm_set1_pd(py + yTol);
-	const __m128 fxLo = _mm_set1_ps(nextafterf(static_cast<float>(px - xTol), -INFINITY));
-	const __m128 fxHi = _mm_set1_ps(nextafterf(static_cast<float>(px + xTol), INFINITY));
-	const __m128 fyLo = _mm_set1_ps(nextafterf(static_cast<float>(py - yTol), -INFINITY));
-	const __m128 fyHi = _mm_set1_ps(nextafterf(static_cast<float>(py + yTol), INFINITY));
-	const size_t scanned = ScanMemory(16, CameraRegion, [&](int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t got) {
+	dxLo = _mm_set1_pd(px - xTol);
+	dxHi = _mm_set1_pd(px + xTol);
+	dyLo = _mm_set1_pd(py - yTol);
+	dyHi = _mm_set1_pd(py + yTol);
+	fxLo = _mm_set1_ps(nextafterf(static_cast<float>(px - xTol), -INFINITY));
+	fxHi = _mm_set1_ps(nextafterf(static_cast<float>(px + xTol), INFINITY));
+	fyLo = _mm_set1_ps(nextafterf(static_cast<float>(py - yTol), -INFINITY));
+	fyHi = _mm_set1_ps(nextafterf(static_cast<float>(py + yTol), INFINITY));
+}
+
+void MemScanJob::Piece(int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t got)
+{
+	{
 		std::vector<MemCand>& wx = xs[w];
 		std::vector<MemCand>& wy = ys[w];
 		size_t rawX = 0, rawY = 0;
@@ -4779,7 +4799,11 @@ static void MemScan(double sx, double px, double py)
 		}
 		rawXs[w] += rawX;
 		rawYs[w] += rawY;
-	});
+	}
+}
+
+void MemScanJob::Finish(size_t scanned, DWORD t0)
+{
 	size_t rawX = 0, rawY = 0;
 	for (int w = 0; w < workers; ++w) {
 		rawX += rawXs[w];
@@ -4832,6 +4856,16 @@ static void MemScan(double sx, double px, double py)
 			GetTickCount(), sx, px, py, scanned >> 20, GetTickCount() - t0, rawX, rawY, gMemX.cands.size(), gMemScale.cands.size());
 		fclose(f);
 	}
+}
+
+static void MemScan(double sx, double px, double py)
+{
+	const DWORD t0 = GetTickCount();
+	MemScanJob job(sx, px, py);
+	const size_t scanned = ScanMemory(16, CameraRegion, [&](int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t got) {
+		job.Piece(w, at, buf, starts, got);
+	});
+	job.Finish(scanned, t0);
 }
 
 // Keeps the candidates that now hold target. Returns false if none are left.
@@ -6972,17 +7006,32 @@ static void DepthLog(const char* what)
 	}
 }
 
-// ZBrush 2023's own objects for the canvas (x64dbg, the DeathClaw in Edit
-// mode): an image object (vtable at ZBrush.exe + 0xCFD2DE8) with its width and
-// height as floats at +0x40 and +0x44, its pixels' object at +0x90, bits per
-// pixel at +0xA0 and bytes per row at +0xA4; the pixels' object (vtable at
-// + 0xCFFEF90) with its size at +0x38 and the first pixel's address at +0x40.
-// The document's own images are the ones its size, 32 bits a pixel; the
-// depth among them is the float plane whose empty value is far beyond the
-// model's. Found by the vtables, not by guessing at memory's contents
-// (builds 158-162: the depth missed in some sessions, a mask taken for it in
-// another).
-static const uintptr_t kImageVtable = 0xCFD2DE8, kPixelsVtable = 0xCFFEF90;
+// ZBrush's own objects for the canvas: an image object with the document's
+// width and height as floats and a pointer to a pixels object, which holds the
+// plane's size in bytes and the address of its first pixel. The document's own
+// images are the ones its size, 32 bits a pixel; the depth among them is the
+// float plane whose empty value is far beyond the model's. Found by these
+// objects, not by guessing at memory's contents (builds 158-162: the depth
+// missed in some sessions, a mask taken for it in another).
+//
+// Their layout is learned from memory each time (ImageLayoutLearn), not taken
+// from one ZBrush build: builds 163-188 had ZBrush 2023's vtables
+// (ZBrush.exe + 0xCFD2DE8 and + 0xCFFEF90) and field offsets written in, and
+// ZBrush.exe is packed and has no type names, so another build would have
+// moved them with nothing to find them by. Tried on the running ZBrush 2023
+// before build 189, learning gave those values back, and a second image class
+// (+ 0xCFD5568) the fixed vtable had left out.
+struct ImageKind {
+	uintptr_t vt;  // the image class's vtable
+	int pixels;    // offset of the pointer to the pixels object
+	int wh;        // offset of the width and height (floats)
+};
+struct ImageLayout {
+	uintptr_t pixVt = 0;            // the pixels class's vtable
+	int sizeOff = 0, firstOff = 0;  // offsets of the size and the first pixel's address
+	std::vector<ImageKind> kinds;
+};
+static ImageLayout gImgLayout;
 
 static bool ReadOwn(uintptr_t at, void* out, size_t n)
 {
@@ -6990,60 +7039,173 @@ static bool ReadOwn(uintptr_t at, void* out, size_t n)
 	return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(at), out, n, &got) && got == n;
 }
 
-// The first pixel of an image object's plane, checked against both vtables
-// and the document's size; 0 if it is not one.
+// The first pixel of an image object's plane, checked against the learned
+// layout and the document's size; 0 if it is not one.
 static uintptr_t ImagePixels(uintptr_t image, int dw, int dh)
 {
-	const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-	unsigned char o[0xA8];
-	if (!ReadOwn(image, o, sizeof o))
+	uintptr_t vt;
+	if (!gImgLayout.pixVt || !ReadOwn(image, &vt, 8))
 		return 0;
-	uintptr_t vt, pixels;
-	float w, h;
-	int bpp, pitch;
-	memcpy(&vt, o, 8);
-	memcpy(&w, o + 0x40, 4);
-	memcpy(&h, o + 0x44, 4);
-	memcpy(&pixels, o + 0x90, 8);
-	memcpy(&bpp, o + 0xA0, 4);
-	memcpy(&pitch, o + 0xA4, 4);
-	if (vt != exe + kImageVtable || w != dw || h != dh || bpp != 32 || pitch != dw * 4)
-		return 0;
-	unsigned char p[0x48];
-	if (!ReadOwn(pixels, p, sizeof p))
-		return 0;
-	uintptr_t pvt, first;
-	int64_t size;
-	memcpy(&pvt, p, 8);
-	memcpy(&size, p + 0x38, 8);
-	memcpy(&first, p + 0x40, 8);
-	return pvt == exe + kPixelsVtable && size == static_cast<int64_t>(dw) * dh * 4 ? first : 0;
+	for (const ImageKind& k : gImgLayout.kinds) {
+		if (k.vt != vt)
+			continue;
+		float wh[2];
+		uintptr_t pixels, pvt, first;
+		int64_t size;
+		if (!ReadOwn(image + k.wh, wh, sizeof wh) || wh[0] != dw || wh[1] != dh || !ReadOwn(image + k.pixels, &pixels, 8) ||
+			!ReadOwn(pixels, &pvt, 8) || pvt != gImgLayout.pixVt || !ReadOwn(pixels + gImgLayout.sizeOff, &size, 8) ||
+			size != static_cast<int64_t>(dw) * dh * 4 || !ReadOwn(pixels + gImgLayout.firstOff, &first, 8))
+			return 0;
+		return first;
+	}
+	return 0;
 }
 
-// The document's images, found by the image vtable in private memory, each
+// Learns the layout and finds the document's images, in two passes over
+// ZBrush's private memory. First the pixels objects: the plane's size in
+// bytes (w * h * 4), a pointer within 32 bytes after it to memory that holds
+// a plane that size, and the nearest pointer into ZBrush.exe within 256 bytes
+// before it, the object's vtable; the most common class so placed is the
+// pixels class. Then the image objects: a pointer to one of those, the
+// nearest pointer into ZBrush.exe within 512 bytes before it (the vtable),
+// and the width and height as floats between them (or just after). Returns
+// the image objects.
+static std::vector<uintptr_t> ImageLayoutLearn(int dw, int dh, size_t& scanned)
+{
+	const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+	MODULEINFO mi = {};
+	GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(nullptr), &mi, sizeof mi);
+	const uintptr_t exeEnd = exe + mi.SizeOfImage;
+	const uint64_t size = static_cast<uint64_t>(dw) * dh * 4;
+	auto privateRw = [](const MEMORY_BASIC_INFORMATION& m) { return m.Type == MEM_PRIVATE && (m.Protect & 0xff) == PAGE_READWRITE; };
+	auto planeAt = [&](uintptr_t q) {
+		MEMORY_BASIC_INFORMATION r;
+		return q && VirtualQuery(reinterpret_cast<LPCVOID>(q), &r, sizeof r) == sizeof r && r.State == MEM_COMMIT &&
+			reinterpret_cast<uintptr_t>(r.BaseAddress) + r.RegionSize >= q + size;
+	};
+	struct PixHit { uintptr_t obj, vt; int sizeOff, firstOff; };
+	const int workers = ScanWorkers();
+	std::vector<std::vector<PixHit>> pixHits(workers);
+	scanned = ScanMemory(0, privateRw, [&](int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t) {
+		for (size_t i = 0; i + 8 <= starts; i += 8) {
+			uint64_t v;
+			memcpy(&v, &buf[i], 8);
+			if (v != size)
+				continue;
+			unsigned char near[0x100 + 0x28];
+			const uintptr_t field = at + i, from = field - 0x100;
+			if (!ReadOwn(from, near, sizeof near))
+				continue;
+			int firstOff = -1;
+			for (int d = 8; d <= 0x20 && firstOff < 0; d += 8) {
+				uintptr_t q;
+				memcpy(&q, near + 0x100 + d, 8);
+				if (planeAt(q))
+					firstOff = d;
+			}
+			if (firstOff < 0)
+				continue;
+			for (int d = 8; d <= 0x100; d += 8) {
+				uintptr_t q;
+				memcpy(&q, near + 0x100 - d, 8);
+				if (q >= exe && q < exeEnd) {
+					pixHits[w].push_back({field - d, q, d, d + firstOff});
+					break;
+				}
+			}
+		}
+	});
+	// The pixels class: the most common (vtable, offsets).
+	std::map<std::tuple<uintptr_t, int, int>, int> counts;
+	for (const auto& hs : pixHits)
+		for (const PixHit& h : hs)
+			++counts[{h.vt, h.sizeOff, h.firstOff}];
+	gImgLayout = ImageLayout();
+	int most = 0;
+	for (const auto& c : counts)
+		if (c.second > most) {
+			most = c.second;
+			gImgLayout.pixVt = std::get<0>(c.first);
+			gImgLayout.sizeOff = std::get<1>(c.first);
+			gImgLayout.firstOff = std::get<2>(c.first);
+		}
+	std::vector<uintptr_t> pixObjs;
+	for (const auto& hs : pixHits)
+		for (const PixHit& h : hs)
+			if (h.vt == gImgLayout.pixVt && h.sizeOff == gImgLayout.sizeOff && h.firstOff == gImgLayout.firstOff)
+				pixObjs.push_back(h.obj);
+	std::sort(pixObjs.begin(), pixObjs.end());
+	if (pixObjs.empty())
+		return {};
+	const uintptr_t lo = pixObjs.front(), hi = pixObjs.back();
+	struct ImgHit { uintptr_t obj; ImageKind kind; };
+	std::vector<std::vector<ImgHit>> imgHits(workers);
+	scanned += ScanMemory(0, privateRw, [&](int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t) {
+		for (size_t i = 0; i + 8 <= starts; i += 8) {
+			uintptr_t v;
+			memcpy(&v, &buf[i], 8);
+			if (v < lo || v > hi || !std::binary_search(pixObjs.begin(), pixObjs.end(), v))
+				continue;
+			unsigned char near[0x200 + 0x40];
+			const uintptr_t field = at + i, from = field - 0x200;
+			if (!ReadOwn(from, near, sizeof near))
+				continue;
+			for (int d = 8; d <= 0x200; d += 8) {
+				uintptr_t q;
+				memcpy(&q, near + 0x200 - d, 8);
+				if (q < exe || q >= exeEnd)
+					continue;
+				// The width and height from the vtable to 64 bytes past the pointer.
+				const int o = 0x200 - d;
+				for (int k = o + 8; k + 8 <= static_cast<int>(sizeof near); k += 4) {
+					float a, b;
+					memcpy(&a, near + k, 4);
+					memcpy(&b, near + k + 4, 4);
+					if (a == dw && b == dh) {
+						imgHits[w].push_back({field - d, {q, d, k - o}});
+						break;
+					}
+				}
+				break;
+			}
+		}
+	});
+	std::vector<uintptr_t> images;
+	for (const auto& hs : imgHits)
+		for (const ImgHit& h : hs) {
+			bool known = false;
+			for (const ImageKind& k : gImgLayout.kinds)
+				known = known || (k.vt == h.kind.vt && k.pixels == h.kind.pixels && k.wh == h.kind.wh);
+			if (!known)
+				gImgLayout.kinds.push_back(h.kind);
+			images.push_back(h.obj);
+		}
+	std::sort(images.begin(), images.end());
+	images.erase(std::unique(images.begin(), images.end()), images.end());
+	return images;
+}
+
+// The document's images, found by their layout learned from memory, each
 // tried as depth (DepthFit, and its empty value far beyond the model's).
 static bool DepthFromObjects(const OverlayState& st, const std::vector<DepthSample>& samples, int dw, int dh)
 {
 	const DWORD t0 = GetTickCount();
-	const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)), want = exe + kImageVtable;
-	std::vector<std::vector<uintptr_t>> found(ScanWorkers());
-	const size_t scanned = ScanMemory(0,
-		[](const MEMORY_BASIC_INFORMATION& m) { return m.Type == MEM_PRIVATE && (m.Protect & 0xff) == PAGE_READWRITE; },
-		[&](int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t) {
-			for (size_t i = 0; i + 8 <= starts; i += 16) {
-				uintptr_t v;
-				memcpy(&v, &buf[i], 8);
-				if (v == want && ImagePixels(at + i, dw, dh))
-					found[w].push_back(at + i);
-			}
-		});
-	std::vector<uintptr_t> images;
-	for (const auto& f : found)
-		images.insert(images.end(), f.begin(), f.end());
-	std::sort(images.begin(), images.end());
+	size_t scanned = 0;
+	const std::vector<uintptr_t> images = ImageLayoutLearn(dw, dh, scanned);
 	gDepthImages.clear();
-	char line[300];
-	snprintf(line, sizeof line, "by ZBrush's image objects: %zu of the document's size in %zu MB, %lu ms", images.size(), scanned >> 20, GetTickCount() - t0);
+	char line[600];
+	{
+		const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+		std::string kinds;
+		for (const ImageKind& k : gImgLayout.kinds) {
+			char one[96];
+			snprintf(one, sizeof one, " [vtable +%llx, pixels at +%x, width and height at +%x]", static_cast<unsigned long long>(k.vt - exe), k.pixels, k.wh);
+			kinds += one;
+		}
+		snprintf(line, sizeof line, "by ZBrush's image objects: %zu of the document's size in %zu MB, %lu ms; learned: pixels class +%llx (size at +%x, first pixel at +%x), image classes%s",
+			images.size(), scanned >> 20, GetTickCount() - t0, static_cast<unsigned long long>(gImgLayout.pixVt ? gImgLayout.pixVt - exe : 0),
+			gImgLayout.sizeOff, gImgLayout.firstOff, kinds.empty() ? " none" : kinds.c_str());
+	}
 	DepthLog(line);
 	DepthBuffer best;
 	for (uintptr_t image : images) {
@@ -8238,19 +8400,30 @@ static std::vector<double> EulerTraces(const double* deg)
 	return traces;
 }
 
-static void RotScan(const double* deg)
+// The rotation's search in parts, like MemScanJob.
+struct RotScanJob {
+	static const size_t kMax = 200000;
+	std::vector<double> traces;
+	int workers;
+	std::vector<std::vector<RotCand>> found;
+	std::vector<size_t> rowsBy;
+	std::vector<std::vector<float>> normsF;
+	std::vector<std::vector<double>> normsD;
+	explicit RotScanJob(const double* deg);
+	void Piece(int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t got);
+	void Finish(size_t scanned, DWORD t0);
+};
+
+RotScanJob::RotScanJob(const double* deg) : traces(EulerTraces(deg)), workers(ScanWorkers()), found(workers), rowsBy(workers),
+	normsF(workers), normsD(workers)
 {
-	const std::vector<double> traces = EulerTraces(deg);
 	gRotCands.clear();
 	gRotNarrowings = 0;
-	const DWORD t0 = GetTickCount();
-	const size_t kMax = 200000;
-	const int workers = ScanWorkers();
-	std::vector<std::vector<RotCand>> found(workers);
-	std::vector<size_t> rowsBy(workers);
-	std::vector<std::vector<float>> normsF(workers);
-	std::vector<std::vector<double>> normsD(workers);
-	const size_t scanned = ScanMemory(11 * 8, CameraRegion, [&](int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t got) {
+}
+
+void RotScanJob::Piece(int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t got)
+{
+	{
 		std::vector<RotCand>& out = found[w];
 		size_t rows = 0;
 		// The squared length of the three values from every position, as
@@ -8322,7 +8495,11 @@ static void RotScan(const double* deg)
 			}
 		}
 		rowsBy[w] += rows;
-	});
+	}
+}
+
+void RotScanJob::Finish(size_t scanned, DWORD t0)
+{
 	size_t rows = 0;
 	for (int w = 0; w < workers; ++w) {
 		rows += rowsBy[w];
@@ -8336,6 +8513,31 @@ static void RotScan(const double* deg)
 			scanned >> 20, GetTickCount() - t0, workers, rows, gRotCands.size(), gRotCands.size() >= kMax ? " (FULL)" : "");
 		fclose(f);
 	}
+}
+
+static void RotScan(const double* deg)
+{
+	const DWORD t0 = GetTickCount();
+	RotScanJob job(deg);
+	const size_t scanned = ScanMemory(11 * 8, CameraRegion, [&](int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t got) {
+		job.Piece(w, at, buf, starts, got);
+	});
+	job.Finish(scanned, t0);
+}
+
+// Both searches in one pass over memory: reading ZBrush's 3.5-4 GB is most of
+// each (build 188: 1.4 s for the camera, then 1.3 s more for the rotation).
+static void CameraScan(double sx, double px, double py, const double* deg)
+{
+	const DWORD t0 = GetTickCount();
+	MemScanJob mem(sx, px, py);
+	RotScanJob rot(deg);
+	const size_t scanned = ScanMemory(11 * 8, CameraRegion, [&](int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t got) {
+		mem.Piece(w, at, buf, starts, got);
+		rot.Piece(w, at, buf, starts, got);
+	});
+	mem.Finish(scanned, t0);
+	rot.Finish(scanned, t0);
 }
 
 // Keeps the candidates that are still rotations and changed with the view.
@@ -9108,8 +9310,24 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out, con
 	};
 	const std::vector<Sample> coarse = grid(kBigBlocks, 0.5), medium = grid(4 * kBigBlocks, 0.5), fine = grid(110, 0.37);
 	const int d = 8;
-	std::vector<int> lums;
 	double best = -1e9, bestCorr = -1, bestK = 1, bestX = 0, bestY = 0;
+	// Each scale is tried on its own core, and the best of them taken (in
+	// scale order, so the result does not depend on which finishes first):
+	// on one core the full search took 10.5 s (build 188).
+	struct Best { double s = -1e9, corr = -1, k = 1, x = 0, y = 0; };
+	auto bestOf = [&](const std::vector<double>& ks, const auto& tryScale) {
+		std::vector<Best> each(ks.size());
+		concurrency::parallel_for(size_t(0), ks.size(), [&](size_t i) { tryScale(ks[i], each[i]); });
+		best = -1e9;
+		for (const Best& b : each)
+			if (b.s > best) {
+				best = b.s;
+				bestCorr = b.corr;
+				bestK = b.k;
+				bestX = b.x;
+				bestY = b.y;
+			}
+	};
 
 	// Refine at full resolution. The coarse fit is good to about half a large
 	// block, the medium one to about a small block.
@@ -9123,9 +9341,11 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out, con
 		for (size_t p = first; p < 3; ++p) {
 			const Pass& pass = passes[p];
 			const double k0 = bestK, x0 = bestX, y0 = bestY;
-			best = -1e9;
-			for (double f = 1 - pass.scaleRange; f <= 1 + pass.scaleRange + 1e-9; f += pass.scaleStep) {
-				const double k = k0 * f;
+			std::vector<double> ks;
+			for (double f = 1 - pass.scaleRange; f <= 1 + pass.scaleRange + 1e-9; f += pass.scaleStep)
+				ks.push_back(k0 * f);
+			bestOf(ks, [&](double k, Best& b) {
+				std::vector<int> lums;
 				SampleLums(frame, *pass.samples, 0.5 / k, lums);
 				// Keep the document centre fixed while trying scales.
 				const double cx = floor(x0 + (k0 - k) * frame.w * 0.5), cy = floor(y0 + (k0 - k) * frame.h * 0.5);
@@ -9134,15 +9354,10 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out, con
 						int n = 0;
 						const double c = Score(screen, *pass.samples, lums, cx + dx, cy + dy, k, &n);
 						const double s = c > -1 ? Significance(c, n) : -1e9;
-						if (s > best) {
-							best = s;
-							bestCorr = c;
-							bestK = k;
-							bestX = cx + dx;
-							bestY = cy + dy;
-						}
+						if (s > b.s)
+							b = {s, c, k, cx + dx, cy + dy};
 					}
-			}
+			});
 		}
 	};
 	auto done = [&]() {
@@ -9165,26 +9380,25 @@ static bool Calibrate(const Rgb& frame, const Rgb& screen, Calibration& out, con
 
 	// Coarse search on the capture shrunk by d, over scales 0.25 to 4.
 	const Rgb small = Shrink(screen, d);
-	for (double k = 0.25; k <= 4.0; k *= 1.04) {
-		const double ks = k / d;  // small-image pixels per document pixel
-		SampleLums(frame, coarse, 0.5 / ks, lums);
-		const double tw = ks * frame.w, th = ks * frame.h;
+	std::vector<double> ks;
+	for (double k = 0.25; k <= 4.0; k *= 1.04)
+		ks.push_back(k);
+	bestOf(ks, [&](double k, Best& b) {
+		const double kd = k / d;  // small-image pixels per document pixel
+		std::vector<int> lums;
+		SampleLums(frame, coarse, 0.5 / kd, lums);
+		const double tw = kd * frame.w, th = kd * frame.h;
 		// Step a quarter of a large block, at least one small-image pixel.
 		const double step = fmax(1.0, tw / kBigBlocks / 4);
 		for (double oy = -th * 0.85; oy <= small.h - th * 0.15; oy += step)
 			for (double ox = -tw * 0.85; ox <= small.w - tw * 0.15; ox += step) {
 				int n = 0;
-				const double c = Score(small, coarse, lums, ox, oy, ks, &n);
+				const double c = Score(small, coarse, lums, ox, oy, kd, &n);
 				const double s = c > -1 ? Significance(c, n) : -1e9;
-				if (s > best) {
-					best = s;
-					bestCorr = c;
-					bestK = k;
-					bestX = ox * d;
-					bestY = oy * d;
-				}
+				if (s > b.s)
+					b = {s, c, k, ox * d, oy * d};
 			}
-	}
+	});
 	refine(0);
 	return done();
 }
@@ -9539,8 +9753,9 @@ ZFUNC RSOverlaySet(char* text, double, char*, int, char*, int, char**)
 ZFUNC RSMemProbe(char* text, double, char*, int, char*, int, char**)
 {
 	char mode[16] = {0};
-	double sx, px, py, anchor;
-	if (!text || sscanf(text, "%15s %lf %lf %lf %lf", mode, &sx, &px, &py, &anchor) != 5 || sx <= 0 || anchor <= 0)
+	double sx, px, py, anchor, r[3];
+	const int got = text ? sscanf(text, "%15s %lf %lf %lf %lf %lf %lf %lf", mode, &sx, &px, &py, &anchor, &r[0], &r[1], &r[2]) : 0;
+	if (got < 5 || sx <= 0 || anchor <= 0)
 		return -1;
 	EnsureLock();
 	EnterCriticalSection(&gOverlayLock);
@@ -9548,6 +9763,12 @@ ZFUNC RSMemProbe(char* text, double, char*, int, char*, int, char**)
 	if (strcmp(mode, "start") == 0) {
 		gMemLocked = false;
 		gMemScanned = false;
+		// With the rotation ("start sx px py anchor rx ry rz", the view turned
+		// off a snap): its search shares the pass (RSRotProbe then narrows).
+		if (got == 8) {
+			gRotLocked = false;
+			CameraScan(sx, px, py, r);
+		}
 	}
 	gMemDisagree = 0;
 	MemReport(sx, px, py);
@@ -9599,7 +9820,7 @@ ZFUNC RSRotProbe(char* text, double, char*, int, char*, int, char**)
 
 // text: "scale x y", the view TransformGet reports now. Returns 1 if the
 // camera and rotation found by an earlier Overlay press are still read
-// right (the memory scans, about 15 seconds, are then not needed again),
+// right (the memory scans, a few seconds, are then not needed again),
 // else 0.
 ZFUNC RSProbeKeep(char* text, double, char*, int, char*, int, char**)
 {

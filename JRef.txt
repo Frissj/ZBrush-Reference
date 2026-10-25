@@ -22,9 +22,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 188"]
+[VarDef, zrsBuild, "build 190"]
 [VarDef, zrsDll, "JRef_Data\JRef64.dll"]
-[VarDef, zrsDllBuild, 188]
+[VarDef, zrsDllBuild, 190]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -350,21 +350,22 @@
 	[VarSet, zrsResult, 0]
 	[If, [FileExecute, zrsDll, "RSAnchorGet", "0"] > 0,
 		[TransformGet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
-		[VarSet, zrsArgs, [StrMerge, "start ", zrsKsx, " ", zrsKx, " ", zrsKy, " ", [FileExecute, zrsDll, "RSAnchorGet", "0"]]]
+		// Turned off the snap first, so the rotation (which the DLL sees snaps
+		// to a view by) is searched for in the same pass over memory as the
+		// view: one pass instead of two (build 189). The turn also rules out
+		// rotation entries that equal the scale, once the view is turned back.
+		[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx + 15, zrsKry + 25, zrsKrz]
+		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+		[VarSet, zrsArgs, [StrMerge, "start ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [FileExecute, zrsDll, "RSAnchorGet", "0"]]]
+		[VarSet, zrsArgs, [StrMerge, zrsArgs, " ", zrsRx, " ", zrsRy, " ", zrsRz]]
 		[FileExecute, zrsDll, "RSMemProbe", zrsArgs]
 		[Loop, 3,
 			[VarSet, zrsTick, zrsTick + 1]
-			[TransformSet, zrsKx + 11 * zrsTick, zrsKy + 7 * zrsTick, zrsKz, zrsKsx * (1 + 0.04 * zrsTick), zrsKsy * (1 + 0.04 * zrsTick), zrsKsz * (1 + 0.04 * zrsTick), zrsKrx, zrsKry, zrsKrz]
+			[TransformSet, zrsKx + 11 * zrsTick, zrsKy + 7 * zrsTick, zrsKz, zrsKsx * (1 + 0.04 * zrsTick), zrsKsy * (1 + 0.04 * zrsTick), zrsKsz * (1 + 0.04 * zrsTick), zrsKrx + 15, zrsKry + 25, zrsKrz]
 			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
 			[VarSet, zrsArgs, [StrMerge, "next ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [FileExecute, zrsDll, "RSAnchorGet", "0"]]]
 			[FileExecute, zrsDll, "RSMemProbe", zrsArgs]
 		]
-		[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx + 15, zrsKry + 25, zrsKrz]
-		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsArgs, [StrMerge, "next ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [FileExecute, zrsDll, "RSAnchorGet", "0"]]]
-		[FileExecute, zrsDll, "RSMemProbe", zrsArgs]
-		// The rotation too, so the DLL sees snaps to a view.
-		[FileExecute, zrsDll, "RSRotProbe", [StrMerge, "start ", zrsRx, " ", zrsRy, " ", zrsRz]]
 		[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx + 40, zrsKry - 30, zrsKrz + 10]
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
 		[FileExecute, zrsDll, "RSRotProbe", [StrMerge, "next ", zrsRx, " ", zrsRy, " ", zrsRz]]
@@ -502,11 +503,11 @@
 				]
 				[VarSet, zrsTick, 0]
 				// The camera and rotation found by an earlier press are kept
-				// while they still read right: the scans take about 15 s.
+				// while they still read right: the scans take a few seconds.
 				[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
 				[VarSet, zrsResult, [FileExecute, zrsDll, "RSProbeKeep", [StrMerge, zrsSx, " ", zrsPx, " ", zrsPy]]]
 				[If, zrsResult != 1,
-					[FileExecute, zrsDll, "RSStatus", "JRef: finding ZBrush's camera in memory (about 15 seconds, once per session)..."]
+					[FileExecute, zrsDll, "RSStatus", "JRef: finding ZBrush's camera in memory (a few seconds, once per session)..."]
 					[RoutineCall, ZRSMemProbe]
 				]
 				[If, zrsResult == 1,

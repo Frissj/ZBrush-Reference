@@ -85,6 +85,19 @@ the middle of your work area, from those points, and goes half the part's
 thickness into the model. So the side view shows the same part of the model as
 the main view, even when you've turned to an angle with no reference image.
 
+## Other ZBrush versions
+
+JRef has no addresses from one ZBrush build written into it, so it isn't tied
+to one build. It finds everything in memory each time:
+
+- the camera, by the values ZBrush's own TransformGet reports
+- the rotation, as a matrix turned by the angle ZBrush reports
+- ZBrush's canvas images, by working out their layout from the objects in
+  memory
+
+It has only been tested on ZBrush 2023. Another version could still store
+rotations or depth differently, which only testing there would show.
+
 ## Building the DLL
 
 Only needed if you change the source: the releases and the repo come with the
