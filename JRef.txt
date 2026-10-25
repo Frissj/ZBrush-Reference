@@ -22,9 +22,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 186"]
+[VarDef, zrsBuild, "build 188"]
 [VarDef, zrsDll, "JRef_Data\JRef64.dll"]
-[VarDef, zrsDllBuild, 186]
+[VarDef, zrsDllBuild, 188]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -401,7 +401,6 @@
 	[ISet, "ZPlugin:JRef:Overlay Off", [FileExecute, zrsDll, "RSIsOn", "overlayoff"]]
 	[ISet, "ZPlugin:JRef:Classic", [FileExecute, zrsDll, "RSIsOn", "classic"]]
 	[ISet, "ZPlugin:JRef:PureRef", [FileExecute, zrsDll, "RSIsOn", "pureref"]]
-	[ISet, "ZPlugin:JRef:Panel Left", [FileExecute, zrsDll, "RSIsOn", "left"]]
 	[ISet, "ZPlugin:JRef:Multiview:Multiview", [FileExecute, zrsDll, "RSIsOn", "multi"]]
 	[ISet, "ZPlugin:JRef:Multiview:3D Auto Track", [FileExecute, zrsDll, "RSIsOn", "auto3d"]]
 	[ISet, "ZPlugin:JRef:Upper Image:Front", [FileExecute, zrsDll, "RSIsOn", "a 0"]]
@@ -631,11 +630,11 @@
 	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressPureRef] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
 	, 0, 0.5
 ]
-// Each press moves the panel to the other side ("left -1" toggles it).
-[ISwitch, "ZPlugin:JRef:Panel Left", [FileExecute, zrsDll, "RSIsOn", "left"],
-	"PureRef: the panel on the left of the canvas (lit) or the right.",
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "left -1"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "left -1"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
+// Each press moves the panel to the other side ("left -1" toggles it): a
+// plain button, nothing to light.
+[IButton, "ZPlugin:JRef:Swap Side",
+	"PureRef: move the panel to the other side of the canvas.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "left -1"] [VarSet, zrsBusy, 0]]
 	, 0, 0.5
 ]
 
@@ -934,7 +933,7 @@
 [IEnable, "ZPlugin:JRef:Overlay Off"]
 [IEnable, "ZPlugin:JRef:Classic"]
 [IEnable, "ZPlugin:JRef:PureRef"]
-[IEnable, "ZPlugin:JRef:Panel Left"]
+[IEnable, "ZPlugin:JRef:Swap Side"]
 [IEnable, "ZPlugin:JRef:Adjust Image"]
 [IEnable, "ZPlugin:JRef:Multiview:Multiview"]
 [IEnable, "ZPlugin:JRef:Multiview:3D Auto Track"]

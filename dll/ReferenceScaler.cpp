@@ -257,7 +257,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 186;
+static const int kDllBuild = 188;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -10117,9 +10117,12 @@ static void ZprDone(const std::wstring& zpr, bool write)
 	} else {
 		const std::wstring dir = ReadLink(LinkFor(zpr));
 		ProjectLog(dir.empty() ? "zbrush project opened, no JRef project:" : "zbrush project opened:", zpr);
-		// A project without a link (saved before JRef watched it, or ZBrush's
-		// own startup files) keeps the references open now; saving it links it.
-		if (!dir.empty() && _wcsicmp(dir.c_str(), gProjectDir.c_str()) != 0)
+		// A project without a link starts with no references (the first image
+		// loaded makes it a JRef project, and saving links it). Builds 90-186
+		// kept the references open, and another project showed the last one's
+		// images. One saved before JRef watched it is reopened with Project >
+		// Open Project.
+		if (_wcsicmp(dir.c_str(), gProjectDir.c_str()) != 0)
 			SwitchProject(dir);
 	}
 	LeaveCriticalSection(&gOverlayLock);
