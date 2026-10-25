@@ -27,7 +27,12 @@
 #include <thread>
 #include <atomic>
 #include <ppl.h>
+#include <memory>
 #include <dwmapi.h>
+#include <dcomp.h>
+#include <d3dcompiler.h>
+#pragma comment(lib, "dcomp.lib")
+#pragma comment(lib, "d3dcompiler.lib")
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
@@ -251,7 +256,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 144;
+static const int kDllBuild = 146;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1040,12 +1045,16 @@ static std::string gOverlayPath;
 // Mip levels of an image, cached for the few images on show (PureRef's
 // multiview shows four at once), reloaded when the file changes (a project's
 // "Front.png" replaced by another image). Used by the overlay thread only.
+// The levels live on the heap so their address stays put while the cache's
+// entries move (the GPU's textures go by serial, one per image loaded).
 struct ImageCache {
 	std::wstring path;
-	std::vector<Level> levels;
+	std::shared_ptr<std::vector<Level>> levels;
 	DWORD usedAt;
 	FILETIME written;
+	unsigned serial;
 };
+static unsigned gImageSerial = 0;
 
 static FILETIME WrittenAt(const std::wstring& path)
 {
@@ -1114,7 +1123,7 @@ static const std::vector<Level>* LevelsFor(const std::string& path)
 			continue;
 		if (CompareFileTime(&c.written, &written) == 0) {
 			c.usedAt = GetTickCount();
-			return c.levels.empty() ? nullptr : &c.levels;
+			return c.levels->empty() ? nullptr : c.levels.get();
 		}
 		gImages.erase(gImages.begin() + i);
 		break;
@@ -1126,9 +1135,18 @@ static const std::vector<Level>* LevelsFor(const std::string& path)
 				oldest = i;
 		gImages.erase(gImages.begin() + oldest);
 	}
-	gImages.push_back({w, {}, GetTickCount(), written});
-	LoadLevels(w, gImages.back().levels);
-	return gImages.back().levels.empty() ? nullptr : &gImages.back().levels;
+	gImages.push_back({w, std::make_shared<std::vector<Level>>(), GetTickCount(), written, ++gImageSerial});
+	LoadLevels(w, *gImages.back().levels);
+	return gImages.back().levels->empty() ? nullptr : gImages.back().levels.get();
+}
+
+// The cache entry holding these levels (null if gone), for the GPU's copy.
+static const ImageCache* ImageEntry(const std::vector<Level>* levels)
+{
+	for (const ImageCache& c : gImages)
+		if (c.levels.get() == levels)
+			return &c;
+	return nullptr;
 }
 
 static int gImgW = 0, gImgH = 0;  // the shown image's size (0: none)
@@ -1284,47 +1302,59 @@ static bool AdjustMouse(WPARAM wp, POINT pt)
 	return false;
 }
 
-static void FillBox(Buffer32& b, int x0, int y0, int x1, int y1, uint32_t bgr)
+// One step of drawing a layer: a rectangle filled (replacing what is there),
+// or an image drawn over what is there, clipped to the rectangle. The CPU
+// runs the steps on a Buffer32 (RunOps), the GPU draws the same list
+// (GpuOverlay::DrawOps), so both show the same.
+struct DrawOp {
+	bool image = false;
+	int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+	uint32_t argb = 0;                       // a fill's colour, premultiplied
+	const std::vector<Level>* levels = nullptr;
+	double ix = 0, iy = 0, iw = 0, ih = 0;  // where an image is drawn
+	int alpha = 255;                         // an image's opacity
+};
+
+static void FillOp(std::vector<DrawOp>& ops, int x0, int y0, int x1, int y1, uint32_t argb)
 {
-	if (x0 < 0) x0 = 0;
-	if (y0 < 0) y0 = 0;
-	if (x1 > b.w) x1 = b.w;
-	if (y1 > b.h) y1 = b.h;
-	for (int y = y0; y < y1; ++y) {
-		uint32_t* row = reinterpret_cast<uint32_t*>(b.bits) + static_cast<size_t>(y) * b.w;
-		for (int x = x0; x < x1; ++x)
-			row[x] = 0xFF000000u | bgr;
-	}
+	DrawOp o;
+	o.x0 = x0;
+	o.y0 = y0;
+	o.x1 = x1;
+	o.y1 = y1;
+	o.argb = argb;
+	ops.push_back(o);
 }
 
-// Draws the Adjust Image handles: the image's outline, its corners and centre.
-static void DrawGizmo(const OverlayState& st, Buffer32& b)
+// The Adjust Image handles: the image's outline, its corners and centre, on
+// a w x h overlay.
+static void DrawGizmo(const OverlayState& st, int w, int h, std::vector<DrawOp>& ops)
 {
 	double fx, fy, fw, fh;
 	if (!ImageRect(st, fx, fy, fw, fh))
 		return;
 	const int x0 = static_cast<int>(fx), y0 = static_cast<int>(fy);
 	const int x1 = static_cast<int>(fx + fw), y1 = static_cast<int>(fy + fh);
-	const uint32_t orange = 0xFF9020;  // R, G, B as 0xRRGGBB in the BGRA buffer
-	FillBox(b, x0, y0, x1, y0 + 2, orange);
-	FillBox(b, x0, y1 - 2, x1, y1, orange);
-	FillBox(b, x0, y0, x0 + 2, y1, orange);
-	FillBox(b, x1 - 2, y0, x1, y1, orange);
+	const uint32_t orange = 0xFFFF9020u;  // A, R, G, B as 0xAARRGGBB in the BGRA buffer
+	FillOp(ops, x0, y0, x1, y0 + 2, orange);
+	FillOp(ops, x0, y1 - 2, x1, y1, orange);
+	FillOp(ops, x0, y0, x0 + 2, y1, orange);
+	FillOp(ops, x1 - 2, y0, x1, y1, orange);
 	const int c = 7;
 	// Corner handles stay on the canvas when the image is larger.
-	const int xs[2] = {std::max(x0, c), std::min(x1, b.w - c)}, ys[2] = {std::max(y0, c), std::min(y1, b.h - c)};
+	const int xs[2] = {std::max(x0, c), std::min(x1, w - c)}, ys[2] = {std::max(y0, c), std::min(y1, h - c)};
 	for (int i = 0; i < 2; ++i)
 		for (int j = 0; j < 2; ++j)
-			FillBox(b, xs[i] - c, ys[j] - c, xs[i] + c, ys[j] + c, orange);
+			FillOp(ops, xs[i] - c, ys[j] - c, xs[i] + c, ys[j] + c, orange);
 	// Edge handles (pull one side), at the middle of each visible edge.
 	const int mx = (xs[0] + xs[1]) / 2, my = (ys[0] + ys[1]) / 2, e = 5;
-	FillBox(b, xs[0] - e, my - 2 * e, xs[0] + e, my + 2 * e, orange);
-	FillBox(b, xs[1] - e, my - 2 * e, xs[1] + e, my + 2 * e, orange);
-	FillBox(b, mx - 2 * e, ys[0] - e, mx + 2 * e, ys[0] + e, orange);
-	FillBox(b, mx - 2 * e, ys[1] - e, mx + 2 * e, ys[1] + e, orange);
+	FillOp(ops, xs[0] - e, my - 2 * e, xs[0] + e, my + 2 * e, orange);
+	FillOp(ops, xs[1] - e, my - 2 * e, xs[1] + e, my + 2 * e, orange);
+	FillOp(ops, mx - 2 * e, ys[0] - e, mx + 2 * e, ys[0] + e, orange);
+	FillOp(ops, mx - 2 * e, ys[1] - e, mx + 2 * e, ys[1] + e, orange);
 	const int cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-	FillBox(b, cx - 10, cy - 1, cx + 10, cy + 1, orange);
-	FillBox(b, cx - 1, cy - 10, cx + 1, cy + 10, orange);
+	FillOp(ops, cx - 10, cy - 1, cx + 10, cy + 1, orange);
+	FillOp(ops, cx - 1, cy - 10, cx + 1, cy + 10, orange);
 }
 
 // Display: Classic shows the reference behind the model. PureRef shows it in
@@ -1508,11 +1538,43 @@ static void FillRect(Buffer32& b, int x0, int y0, int x1, int y1, uint32_t argb)
 	}
 }
 
-// One view in a panel cell: the canvas as Classic would show it (that view's
-// image placed by the camera), fitted into the cell.
-static void DrawPanelCell(const OverlayState& st, int slot, int x0, int y0, int cw, int ch)
+static void ImageOp(std::vector<DrawOp>& ops, const std::vector<Level>& levels, double ix, double iy, double iw, double ih,
+	int cx0, int cy0, int cx1, int cy1, int alpha)
 {
-	FillRect(gRefLayer, x0, y0, x0 + cw, y0 + ch, 0xFF181818u);
+	DrawOp o;
+	o.image = true;
+	o.levels = &levels;
+	o.ix = ix;
+	o.iy = iy;
+	o.iw = iw;
+	o.ih = ih;
+	o.x0 = cx0;
+	o.y0 = cy0;
+	o.x1 = cx1;
+	o.y1 = cy1;
+	o.alpha = alpha;
+	ops.push_back(o);
+}
+
+// Runs drawing steps on the CPU.
+static void RunOps(Buffer32& b, const std::vector<DrawOp>& ops)
+{
+	for (const DrawOp& o : ops)
+		if (o.image)
+			DrawLevels(b, *o.levels, o.ix, o.iy, o.iw, o.ih, o.x0, o.y0, o.x1, o.y1, o.alpha);
+		else
+			FillRect(b, o.x0, o.y0, o.x1, o.y1, o.argb);
+}
+
+// The GPU draws the reference layer when it composites (defined with it).
+// Returns false when the CPU has to.
+static bool GpuDrawRef(int w, int h, const std::vector<DrawOp>& ops);
+
+// One view in a panel cell: the canvas as Classic would show it (that view's
+// image placed by the camera), fitted into the cell, on a w x h overlay.
+static void DrawPanelCell(const OverlayState& st, int w, int h, int slot, int x0, int y0, int cw, int ch, std::vector<DrawOp>& ops)
+{
+	FillOp(ops, x0, y0, x0 + cw, y0 + ch, 0xFF181818u);
 	OverlayState vs;
 	std::string path;
 	if (slot < 0 || !MultiviewLayout(slot, st, vs, path))
@@ -1528,8 +1590,8 @@ static void DrawPanelCell(const OverlayState& st, int slot, int x0, int y0, int 
 	// the cell, so the model centred there has its reference centred in the
 	// cell.
 	int vx0, vy0, vx1, vy1, px, py, pw, ph;
-	ViewportRect(gRefLayer.w, gRefLayer.h, vx0, vy0, vx1, vy1);
-	PanelRect(gRefLayer.w, gRefLayer.h, px, py, pw, ph);
+	ViewportRect(w, h, vx0, vy0, vx1, vy1);
+	PanelRect(w, h, px, py, pw, ph);
 	if (gPanelLeft)
 		vx0 = px + pw;
 	else
@@ -1539,7 +1601,7 @@ static void DrawPanelCell(const OverlayState& st, int slot, int x0, int y0, int 
 		return;
 	const double s = std::min(cw / vw, ch / vh);
 	const double ox = x0 + (cw - vw * s) * 0.5 - vx0 * s, oy = y0 + (ch - vh * s) * 0.5 - vy0 * s;
-	DrawLevels(gRefLayer, *levels, ox + ix * s, oy + iy * s, iw * s, ih * s, x0, y0, x0 + cw, y0 + ch, 255);
+	ImageOp(ops, *levels, ox + ix * s, oy + iy * s, iw * s, ih * s, x0, y0, x0 + cw, y0 + ch, 255);
 }
 
 // Builds gRefLayer: what replaces the key colour (Classic: the reference,
@@ -1556,33 +1618,42 @@ static bool BuildRefLayer(const OverlayState& st)
 	const std::vector<Level>* levels = LevelsFor(gOverlayPath);
 	gImgW = levels ? (*levels)[0].w : 0;
 	gImgH = levels ? (*levels)[0].h : 0;
+	std::vector<DrawOp> ops;
 	if (gMode == 1) {
 		const uint32_t g = static_cast<uint32_t>(gBackGrey & 255);
-		FillRect(gRefLayer, 0, 0, w, h, 0xFF000000u | g << 16 | g << 8 | g);
+		FillOp(ops, 0, 0, w, h, 0xFF000000u | g << 16 | g << 8 | g);
 		int px, py, pw, ph;
 		PanelRect(w, h, px, py, pw, ph);
 		if (gMulti) {
 			// The upper image's view above the lower's (ZPlugin > JRef >
 			// Upper Image and Lower Image).
 			const int hh = ph / 2;
-			DrawPanelCell(st, gMultiA, px, py, pw, hh);
-			DrawPanelCell(st, gMultiB, px, py + hh, pw, ph - hh);
-			FillRect(gRefLayer, px, py + hh - 1, px + pw, py + hh + 1, 0xFF505050u);
+			DrawPanelCell(st, w, h, gMultiA, px, py, pw, hh, ops);
+			DrawPanelCell(st, w, h, gMultiB, px, py + hh, pw, ph - hh, ops);
+			FillOp(ops, px, py + hh - 1, px + pw, py + hh + 1, 0xFF505050u);
 		} else {
-			DrawPanelCell(st, ActiveViewSlot(), px, py, pw, ph);
+			DrawPanelCell(st, w, h, ActiveViewSlot(), px, py, pw, ph, ops);
 		}
-		return true;
+	} else {
+		// Classic. No image (none for this view): the document's background shows.
+		FillOp(ops, 0, 0, w, h, 0);
+		double x0, y0, dispW, dispH;
+		if (levels && ImageRect(st, x0, y0, dispW, dispH))
+			ImageOp(ops, *levels, x0, y0, dispW, dispH, 0, 0, w, h, st.alpha);
 	}
-	// Classic. No image (none for this view): the document's background shows.
-	memset(gRefLayer.bits, 0, static_cast<size_t>(w) * h * 4);
-	double x0, y0, dispW, dispH;
-	if (levels && ImageRect(st, x0, y0, dispW, dispH))
-		DrawLevels(gRefLayer, *levels, x0, y0, dispW, dispH, 0, 0, w, h, st.alpha);
+	if (!GpuDrawRef(w, h, ops))
+		RunOps(gRefLayer, ops);
 	return true;
 }
 
+// Shows a CPU-drawn overlay through the GPU's window (defined with it).
+// Returns false when the overlay is a layered window drawn by the CPU.
+static bool GpuPresentBuffer(const OverlayState& st, Buffer32& buf);
+
 static void Present(HWND wnd, const OverlayState& st, Buffer32& buf, BYTE alpha)
 {
+	if (GpuPresentBuffer(st, buf))
+		return;
 	POINT dst = {static_cast<LONG>(st.screenX), static_cast<LONG>(st.screenY)};
 	SIZE size = {buf.w, buf.h};
 	POINT src = {0, 0};
@@ -1860,8 +1931,10 @@ struct WindowCapture {
 	}
 
 	// As Duplicator::Grab: waits up to timeout ms for a new frame of ZBrush's
-	// window and copies the screen rectangle (sx, sy, w, h) from it.
-	int Grab(int sx, int sy, int w, int h, Buffer32& dst, DWORD timeout)
+	// window and copies the screen rectangle (sx, sy, w, h) from it; into
+	// gpuDst too (a w x h texture on this device) when the window covers it
+	// all, setting *gpuCopied.
+	int Grab(int sx, int sy, int w, int h, Buffer32& dst, DWORD timeout, ID3D11Texture2D* gpuDst = nullptr, bool* gpuCopied = nullptr)
 	{
 		using winrt::Windows::Graphics::DirectX::DirectXPixelFormat;
 		if (!session)
@@ -1925,6 +1998,10 @@ struct WindowCapture {
 					D3D11_BOX box = {static_cast<UINT>(left - wr.left), static_cast<UINT>(top - wr.top), 0,
 						static_cast<UINT>(right - wr.left), static_cast<UINT>(bottom - wr.top), 1};
 					context->CopySubresourceRegion(staging, 0, 0, 0, 0, tex.get(), 0, &box);
+					if (gpuDst && gpuCopied && cw == w && ch == h) {
+						context->CopySubresourceRegion(gpuDst, 0, 0, 0, 0, tex.get(), 0, &box);
+						*gpuCopied = true;
+					}
 					D3D11_MAPPED_SUBRESOURCE map;
 					if (SUCCEEDED(context->Map(staging, 0, D3D11_MAP_READ, 0, &map))) {
 						if (cw != w || ch != h)
@@ -1948,6 +2025,13 @@ struct WindowCapture {
 
 static WindowCapture gWgc;
 static bool gUseWgc = false;  // the overlay captures ZBrush's window, not the screen
+// The GPU compositor's frame texture (GpuOverlay keeps these): on the window
+// capture's device, the capture copies each frame into it there, so the
+// frame never goes up from the CPU.
+static ID3D11Device* gGpuDev = nullptr;
+static ID3D11Texture2D* gGpuCapTex = nullptr;
+static int gGpuCapW = 0, gGpuCapH = 0;
+static bool gGpuCapFresh = false;
 static double gMagentaShare = 0;  // percent of the overlay that was background
 // The document's background colour on screen, per overlay row (ZBrush's
 // background is flat or a vertical gradient), learned from the frames
@@ -1973,7 +2057,11 @@ static bool Capture(const OverlayState& st)
 	const int w = gCapture.w, h = gCapture.h;
 	const int sx = static_cast<int>(st.screenX), sy = static_cast<int>(st.screenY);
 	if (gUseWgc) {
-		const int got = gWgc.Grab(sx, sy, w, h, gCapture, 8);
+		const bool onGpu = gGpuCapTex && gGpuDev && gGpuDev == gWgc.device && gGpuCapW == w && gGpuCapH == h;
+		bool copied = false;
+		const int got = gWgc.Grab(sx, sy, w, h, gCapture, 8, onGpu ? gGpuCapTex : nullptr, &copied);
+		if (got == 1)
+			gGpuCapFresh = copied;  // the GPU's frame is this one too, or must be sent up
 		if (got >= 0) {
 			gCaptureMethod = 2;
 			return got == 1;
@@ -1990,6 +2078,8 @@ static bool Capture(const OverlayState& st)
 	}
 	if (gDup.dup) {
 		const int got = gDup.Grab(sx, sy, w, h, gCapture, 8);
+		if (got == 1)
+			gGpuCapFresh = false;
 		if (got >= 0) {
 			gCaptureMethod = 1;
 			return got == 1;
@@ -2011,6 +2101,7 @@ static bool Capture(const OverlayState& st)
 	BitBlt(gCapture.dc, 0, 0, w, h, screen, sx, sy, SRCCOPY);
 	ReleaseDC(nullptr, screen);
 	GdiFlush();
+	gGpuCapFresh = false;
 	return true;
 }
 
@@ -2307,8 +2398,22 @@ static bool OnMenu(int x, int y)
 	return MenuAt(x, y) >= 0;
 }
 
+// How long UpdateMenus's parts took last frame, in ms (for the log): the
+// flyout and cursor checks, the changes against the copy, the boxes.
+static double gMenuMs[3] = {0};
+
 static void UpdateMenus(const OverlayState& st, int w, int h)
 {
+	LARGE_INTEGER partStart, partFreq;
+	QueryPerformanceCounter(&partStart);
+	QueryPerformanceFrequency(&partFreq);
+	gMenuMs[0] = gMenuMs[1] = gMenuMs[2] = 0;
+	auto partAt = [&](int k) {
+		LARGE_INTEGER t;
+		QueryPerformanceCounter(&t);
+		gMenuMs[k] = 1000.0 * (t.QuadPart - partStart.QuadPart) / partFreq.QuadPart;
+		partStart = t;
+	};
 	if (!gCapture.bits)
 		return;
 	const uint32_t* cap = reinterpret_cast<const uint32_t*>(gCapture.bits);
@@ -2804,15 +2909,41 @@ static void UpdateMenus(const OverlayState& st, int w, int h)
 		lastCanvasAt = GetTickCount();
 	}
 	const bool justLeft = !(inView && canvasCursor) && GetTickCount() - lastCanvasAt < 500;
-	for (int y = vy0; y < vy1; ++y) {
+	partAt(0);
+	// Rows are independent, so they are done in bands on every core, each with
+	// its own counts (the whole canvas changes when ZBrush redraws, and on one
+	// core that took 5 to 11 ms a frame: nav_log, build 145).
+	std::atomic<int> sumAdded(0), sumGone(0), sumAbsorbed(0), sumBakedGone(0), sumRecent(0), sumFaint(0), sumMask(0);
+	// Nothing can become a menu this frame (the cursor on the canvas, or the
+	// canvas settling): a row without menu pixels takes every change as
+	// canvas in one tight pass and a row copy, the usual case while turning
+	// or zooming the model.
+	const bool mayAny = !gMenuSettling && rootGrow;
+	ParallelRows(vy0, vy1, [&](int ya, int yb) {
+	int bAdded = 0, bGone = 0, bAbsorbed = 0, bBakedGone = 0, bRecent = 0, bFaint = 0, bMask = 0;
+	for (int y = ya; y < yb; ++y) {
 		const size_t i0 = static_cast<size_t>(y) * w;
 		if (!memcmp(cap + i0 + vx0, &gMenuBase[i0 + vx0], static_cast<size_t>(vx1 - vx0) * 4)) {
 			if (gMenuRowCount[y]) {
-				gone += gMenuRowCount[y];
-				gMenuMaskCount -= gMenuRowCount[y];
+				bGone += gMenuRowCount[y];
+				bMask -= gMenuRowCount[y];
 				gMenuRowCount[y] = 0;
 				memset(&gMenuMask[i0], 0, w);
 			}
+			continue;
+		}
+		if (!mayAny && !gMenuRowCount[y] && !gMenuBakedCount) {
+			const uint32_t* c = cap + i0;
+			const uint32_t* b = &gMenuBase[i0];
+			uint16_t* at = &absorbedAt[i0];
+			int n = 0;
+			for (int x = vx0; x < vx1; ++x)
+				if ((c[x] ^ b[x]) & 0xFFFFFFu) {
+					at[x] = frame;
+					++n;
+				}
+			memcpy(&gMenuBase[i0 + vx0], c + vx0, static_cast<size_t>(vx1 - vx0) * 4);
+			bAbsorbed += n;
 			continue;
 		}
 		for (int x = vx0; x < vx1; ++x) {
@@ -2820,7 +2951,7 @@ static void UpdateMenus(const OverlayState& st, int w, int h)
 			const uint32_t c = cap[i], b = gMenuBase[i];
 			const bool diff = ((c ^ b) & 0xFFFFFFu) != 0;
 			if (gMenuBakedCount && gMenuBaked[i]) {
-				bakedGone += diff;
+				bBakedGone += diff;
 				continue;
 			}
 			if (diff) {
@@ -2837,23 +2968,39 @@ static void UpdateMenus(const OverlayState& st, int w, int h)
 				if (may && big && !wasCanvas && !(x >= gizmoX && y < gizmoY)) {
 					gMenuMask[i] = 3;  // added this frame
 					++gMenuRowCount[y];
-					++gMenuMaskCount;
-					++added;
+					++bMask;
+					++bAdded;
 				} else {
 					gMenuBase[i] = c;
 					absorbedAt[i] = frame;
-					++absorbed;
-					recent += may && wasCanvas;
-					faint += may && !big;
+					++bAbsorbed;
+					bRecent += may && wasCanvas;
+					bFaint += may && !big;
 				}
 			} else if (gMenuMask[i]) {
 				gMenuMask[i] = 0;
 				--gMenuRowCount[y];
-				--gMenuMaskCount;
-				++gone;
+				--bMask;
+				++bGone;
 			}
 		}
 	}
+	sumAdded += bAdded;
+	sumGone += bGone;
+	sumAbsorbed += bAbsorbed;
+	sumBakedGone += bBakedGone;
+	sumRecent += bRecent;
+	sumFaint += bFaint;
+	sumMask += bMask;
+	});
+	added += sumAdded;
+	gone += sumGone;
+	absorbed += sumAbsorbed;
+	bakedGone += sumBakedGone;
+	recent += sumRecent;
+	faint += sumFaint;
+	gMenuMaskCount += sumMask;
+	partAt(1);
 	// This frame's additions: kept, or a redraw taken as canvas.
 	// Half the viewport: a flyout's see-through backdrop over the canvas is
 	// a quarter or so (build 129 called the ZPlugin menu, 253277 pixels, a
@@ -3026,6 +3173,7 @@ static void UpdateMenus(const OverlayState& st, int w, int h)
 		log("pixels left from a closed menu taken as canvas", dropped);
 	gMenuOpen = gMenuMaskCount > 0 || gMenuBakedCount > 0;
 	gMenuBoxes = boxes;
+	partAt(2);
 	// Logged when the boxes change in number: each box, its pixels, and what
 	// this frame did (with the cursor where).
 	if (boxes.size() != boxesLogged) {
@@ -3169,8 +3317,14 @@ struct BgRun {
 	bool edge, keep;
 };
 
+// The GPU composites (defined with it): the CPU only finds the background
+// and the menus, and GpuCompose draws the frame from them.
+static bool GpuComposes();
+static void GpuCompose(const OverlayState& st, const std::vector<DrawOp>& on);
+
 static void Composite(HWND wnd, const OverlayState& st)
 {
+	const bool gpu = GpuComposes();
 	LARGE_INTEGER compStart;  // for the log: how long a frame takes
 	QueryPerformanceCounter(&compStart);
 	LARGE_INTEGER stageAt = compStart, qpf;
@@ -3334,8 +3488,9 @@ static void Composite(HWND wnd, const OverlayState& st)
 	std::atomic<size_t> keyed(0);
 	ParallelRows(0, h, [&](int ya, int yb) {
 	const size_t a0 = static_cast<size_t>(ya) * w, a1 = static_cast<size_t>(yb) * w;
-	for (size_t i = a0; i < a1; ++i)
-		out32[i] = cap32[i] | 0xFF000000u;
+	if (!gpu)
+		for (size_t i = a0; i < a1; ++i)
+			out32[i] = cap32[i] | 0xFF000000u;
 	memset(&gKeyShare[a0], 0, a1 - a0);
 	size_t mine = 0;
 	auto first = std::lower_bound(runs.begin(), runs.end(), ya, [](const BgRun& r, int y) { return r.y < y; });
@@ -3348,7 +3503,7 @@ static void Composite(HWND wnd, const OverlayState& st)
 		memset(&gKeyShare[i0 + run.x0], 255, len);
 		rowMagenta[run.y] += len;
 		mine += len;
-		for (int x = run.x0; x < run.x1; ++x) {
+		for (int x = run.x0; x < run.x1 && !gpu; ++x) {
 			const size_t i = i0 + x;
 			const uint32_t rf = ref32[i];
 			const unsigned a = rf >> 24;
@@ -3460,13 +3615,16 @@ static void Composite(HWND wnd, const OverlayState& st)
 			statsAt = GetTickCount();
 			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 				// "reference" is redrawing the reference (a zoom, pan or setting
-				// change), "menus" the last frame's menus, panel and Model Opacity.
+				// change), "menus" the last frame's menus, panel and Model Opacity
+				// (of it: flyout and cursor checks, changes against the copy,
+				// boxes), "present" handing the frame over (of it: the swap
+				// chain's Present, on the GPU).
 				fprintf(f, "%lu capture method %d, %.1f fps, magenta %.1f%%, background spans %d %d to %d %d, viewport %d %d to %d %d, mode %d, frame %.1f ms to here "
-					"(learn %.1f, match %.1f, regions %.1f, combine %.1f; last reference %.1f, menus %.1f, present %.1f); worst of %d frames %.1f ms "
-					"(reference %.1f, learn %.1f, match %.1f, regions %.1f, combine %.1f, menus %.1f, present %.1f), %d over 8 ms\n",
+					"(learn %.1f, match %.1f, regions %.1f, combine %.1f; last reference %.1f, menus %.1f (flyout %.1f, changes %.1f, boxes %.1f), present %.1f (swap %.1f)); "
+					"worst of %d frames %.1f ms (reference %.1f, learn %.1f, match %.1f, regions %.1f, combine %.1f, menus %.1f, present %.1f), %d over 8 ms\n",
 					statsAt, gCaptureMethod, gFps, gMagentaShare, x0, y0, x1, y1, gViewX0, gViewY0, gViewX1, gViewY1, gMode, ms,
-					gStageMs[0], gStageMs[1], gStageMs[3], gStageMs[4], gStageMs[2], gStageMs[5], gStageMs[6], frames, worstMs,
-					worstStage[2], worstStage[0], worstStage[1], worstStage[3], worstStage[4], worstStage[5], worstStage[6], slow);
+					gStageMs[0], gStageMs[1], gStageMs[3], gStageMs[4], gStageMs[2], gStageMs[5], gMenuMs[0], gMenuMs[1], gMenuMs[2], gStageMs[6],
+					gStageMs[7], frames, worstMs, worstStage[2], worstStage[0], worstStage[1], worstStage[3], worstStage[4], worstStage[5], worstStage[6], slow);
 				fclose(f);
 			}
 			worstMs = 0;
@@ -3495,6 +3653,16 @@ static void Composite(HWND wnd, const OverlayState& st)
 	// Followed in every mode, so a menu open when the panel appears or moves
 	// is known.
 	UpdateMenus(st, w, h);
+	if (gpu) {
+		// The rest, per pixel, is the GPU's (the same rules, in its shader).
+		std::vector<DrawOp> on;
+		if (gAdjust && gMode == 0)
+			DrawGizmo(st, w, h, on);
+		stage(5);
+		GpuCompose(st, on);
+		stage(6);
+		return;
+	}
 	// Classic with Model Opacity under 100: the reference shows through the
 	// model too, as with Image Plane. ZBrush can only blend its model with
 	// the canvas, and the reference is not on it, so the overlay does it. Not
@@ -3607,8 +3775,11 @@ static void Composite(HWND wnd, const OverlayState& st)
 					memset(o + static_cast<size_t>(y) * w + x0, 0, static_cast<size_t>(x1 - x0) * 4);
 		}
 	}
-	if (gAdjust && gMode == 0)
-		DrawGizmo(st, gOutput);
+	if (gAdjust && gMode == 0) {
+		std::vector<DrawOp> on;
+		DrawGizmo(st, w, h, on);
+		RunOps(gOutput, on);
+	}
 	stage(5);
 	Present(wnd, st, gOutput, 255);
 	stage(6);
@@ -3637,6 +3808,740 @@ static bool ExclusionWorks(HWND wnd, const OverlayState& st)
 		if ((cap[i] & 0xffffff) == 0x00ff00)
 			++green;
 	return green * 7 < n / 2;
+}
+
+// The GPU compositor (build 145). The CPU still finds the background and
+// ZBrush's menus (gKeyShare, gMenuMask, gMenuBaked); the GPU draws the
+// reference layer from the same drawing steps as the CPU (DrawOp), and one
+// shader makes each frame from ZBrush's frame, that layer and those masks by
+// the rules Composite's CPU path follows. The overlay window has no bitmap of
+// its own: a DirectComposition swap chain shows the frames (premultiplied
+// alpha). On the CPU, redrawing the reference for a zoom step took 6 ms
+// (71 ms before build 144) and the per-pixel combining 1.5 to 2.5 ms a frame.
+// A self-test at start checks that the window shows what it draws and lets
+// clicks through; otherwise the layered window drawn by the CPU is used.
+static const char kGpuShaders[] = R"(
+cbuffer C : register(b0) {
+	float4 rect;
+	float4 color;
+	float2 target; float alphaScale; float gammaExp;
+	float sat; int mode; int hover; int menus;
+	int4 viewport;
+	int4 panel;
+	int4 flyout;
+	int gizmoX; int gizmoBottom; float blendM; int boxCount;
+	int uiCount; int3 pad;
+	int4 boxes[16];
+	int4 ui[16];
+};
+Texture2D t0 : register(t0);
+Texture2D t1 : register(t1);
+Texture2D t2 : register(t2);
+Texture2D t3 : register(t3);
+Texture2D t4 : register(t4);
+SamplerState smp : register(s0);
+struct VO { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VO vs(uint id : SV_VertexID) {
+	float2 c = float2(id & 1, id >> 1);
+	float2 p = lerp(rect.xy, rect.zw, c);
+	VO o;
+	o.pos = float4(p.x / target.x * 2 - 1, 1 - p.y / target.y * 2, 0, 1);
+	o.uv = c;
+	return o;
+}
+float4 fill(VO i) : SV_Target { return color; }
+// An image (straight alpha): saturation, gamma, then premultiplied.
+float4 image(VO i) : SV_Target {
+	float4 c = t0.Sample(smp, i.uv);
+	float l = dot(c.rgb, float3(0.3008, 0.5859, 0.1133));
+	float3 rgb = pow(saturate(l + (c.rgb - l) * sat), gammaExp);
+	float a = c.a * alphaScale;
+	return float4(rgb * a, a);
+}
+bool In(int4 r, int2 p) { return p.x >= r.x && p.x < r.z && p.y >= r.y && p.y < r.w; }
+// t0 ZBrush's frame, t1 the reference layer (premultiplied), t2 background
+// (gKeyShare), t3 and t4 menu pixels (gMenuMask, gMenuBaked).
+float4 compose(VO i) : SV_Target {
+	int2 p = int2(i.pos.xy);
+	int3 l = int3(p, 0);
+	float4 cap = float4(t0.Load(l).rgb, 1);
+	float4 rf = t1.Load(l);
+	bool bg = t2.Load(l).r > 0.5;
+	float4 o = cap;
+	if (bg)
+		o = rf + cap * (1 - rf.a);
+	bool menuPix = ((menus & 1) != 0 && t3.Load(l).r > 0) || ((menus & 2) != 0 && t4.Load(l).r > 0);
+	bool inFly = In(flyout, p);
+	bool inView = In(viewport, p);
+	bool gizmo = p.y < gizmoBottom && p.x >= gizmoX;
+	if (mode == 0 && blendM > 0 && !bg && inView && rf.a > 0 && !gizmo && !menuPix && !inFly)
+		o = float4(cap.rgb + (rf.rgb - cap.rgb * rf.a) * blendM, 1);
+	if (mode == 1 && In(panel, p)) {
+		bool inBox = inFly;
+		for (int k = 0; k < boxCount; ++k)
+			inBox = inBox || In(boxes[k], p);
+		if (inBox || menuPix)
+			o = 0;
+		else if (hover == 0)
+			o = float4(rf.rgb, 1);
+		else if (gizmo && !bg)
+			o = 0;
+		else
+			o = float4(rf.rgb * 0.4, 0.4);
+	}
+	if (!inView)
+		o = 0;
+	for (int k = 0; k < uiCount; ++k)
+		if (In(ui[k], p))
+			o = 0;
+	return o;
+}
+)";
+
+struct GpuConsts {
+	float rect[4];
+	float color[4];
+	float target[2], alphaScale, gammaExp;
+	float sat;
+	int mode, hover, menus;
+	int viewport[4];
+	int panel[4];
+	int flyout[4];
+	int gizmoX, gizmoBottom;
+	float blendM;
+	int boxCount;
+	int uiCount, pad[3];
+	int boxes[16][4];
+	int ui[16][4];
+};
+
+template <typename T>
+static void SafeRelease(T*& p)
+{
+	if (p)
+		p->Release();
+	p = nullptr;
+}
+
+struct GpuTex {
+	ID3D11Texture2D* t = nullptr;
+	ID3D11ShaderResourceView* srv = nullptr;
+	ID3D11RenderTargetView* rtv = nullptr;
+	void Release()
+	{
+		SafeRelease(rtv);
+		SafeRelease(srv);
+		SafeRelease(t);
+	}
+	bool Create(ID3D11Device* dev, int w, int h, DXGI_FORMAT format, bool target)
+	{
+		Release();
+		D3D11_TEXTURE2D_DESC d = {};
+		d.Width = w;
+		d.Height = h;
+		d.MipLevels = 1;
+		d.ArraySize = 1;
+		d.Format = format;
+		d.SampleDesc.Count = 1;
+		d.Usage = D3D11_USAGE_DEFAULT;
+		d.BindFlags = D3D11_BIND_SHADER_RESOURCE | (target ? D3D11_BIND_RENDER_TARGET : 0);
+		if (FAILED(dev->CreateTexture2D(&d, nullptr, &t)) || FAILED(dev->CreateShaderResourceView(t, nullptr, &srv)) ||
+			(target && FAILED(dev->CreateRenderTargetView(t, nullptr, &rtv)))) {
+			Release();
+			return false;
+		}
+		return true;
+	}
+};
+
+struct GpuOverlay {
+	bool ready = false;
+	HWND wnd = nullptr;
+	ID3D11Device* dev = nullptr;
+	ID3D11DeviceContext* ctx = nullptr;
+	IDCompositionDevice* dcomp = nullptr;
+	IDCompositionTarget* target = nullptr;
+	IDCompositionVisual* visual = nullptr;
+	IDXGISwapChain1* chain = nullptr;
+	ID3D11RenderTargetView* backRtv = nullptr;
+	int chainW = 0, chainH = 0;
+	ID3D11VertexShader* vs = nullptr;
+	ID3D11PixelShader* psFill = nullptr;
+	ID3D11PixelShader* psImage = nullptr;
+	ID3D11PixelShader* psCompose = nullptr;
+	ID3D11Buffer* cb = nullptr;
+	ID3D11SamplerState* sampler = nullptr;
+	ID3D11BlendState* over = nullptr;
+	ID3D11RasterizerState* raster = nullptr;
+	GpuTex cap, ref, key, menuMask, menuBaked;
+	std::vector<unsigned char> keyCopy, maskCopy, bakedCopy;  // what those textures hold (UploadChanged)
+	ID3D11Texture2D* readback = nullptr;
+	int w = 0, h = 0;
+	LONG winX = 0, winY = 0;
+	int winW = 0, winH = 0;
+	struct ImageTex {
+		unsigned serial;
+		ID3D11Texture2D* t;
+		ID3D11ShaderResourceView* srv;
+		DWORD usedAt;
+	};
+	std::vector<ImageTex> images;
+	volatile bool snapWanted = false;
+	volatile bool snapDone = false;
+	std::string why;  // for the log: what failed
+
+	void Release()
+	{
+		for (ImageTex& im : images) {
+			SafeRelease(im.srv);
+			SafeRelease(im.t);
+		}
+		images.clear();
+		cap.Release();
+		ref.Release();
+		key.Release();
+		menuMask.Release();
+		menuBaked.Release();
+		SafeRelease(readback);
+		SafeRelease(backRtv);
+		SafeRelease(chain);
+		SafeRelease(visual);
+		SafeRelease(target);
+		SafeRelease(dcomp);
+		SafeRelease(raster);
+		SafeRelease(over);
+		SafeRelease(sampler);
+		SafeRelease(cb);
+		SafeRelease(psCompose);
+		SafeRelease(psImage);
+		SafeRelease(psFill);
+		SafeRelease(vs);
+		SafeRelease(ctx);
+		SafeRelease(dev);
+		gGpuDev = nullptr;
+		gGpuCapTex = nullptr;
+		gGpuCapW = gGpuCapH = 0;
+		chainW = chainH = w = h = 0;
+		ready = false;
+	}
+
+	bool Fail(const char* what)
+	{
+		why = what;
+		Release();
+		return false;
+	}
+
+	// On the window capture's device when there is one (shared), so its
+	// frames are copied on the GPU.
+	bool Init(HWND window, ID3D11Device* shared)
+	{
+		Release();
+		wnd = window;
+		if (shared) {
+			dev = shared;
+			dev->AddRef();
+			dev->GetImmediateContext(&ctx);
+		} else if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+					   D3D11_SDK_VERSION, &dev, nullptr, &ctx))) {
+			return Fail("no Direct3D 11 device");
+		}
+		auto compile = [&](const char* entry, const char* profile, ID3DBlob** out) {
+			ID3DBlob* errors = nullptr;
+			const HRESULT hr = D3DCompile(kGpuShaders, sizeof(kGpuShaders) - 1, "jref", nullptr, nullptr, entry, profile,
+				D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, out, &errors);
+			if (errors) {
+				if (FAILED(hr))
+					why = static_cast<const char*>(errors->GetBufferPointer());
+				errors->Release();
+			}
+			return SUCCEEDED(hr);
+		};
+		ID3DBlob* blob = nullptr;
+		if (!compile("vs", "vs_5_0", &blob))
+			return Fail(("vertex shader: " + why).c_str());
+		const HRESULT hv = dev->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &vs);
+		blob->Release();
+		if (FAILED(hv))
+			return Fail("vertex shader not created");
+		const char* entries[3] = {"fill", "image", "compose"};
+		ID3D11PixelShader** shaders[3] = {&psFill, &psImage, &psCompose};
+		for (int k = 0; k < 3; ++k) {
+			if (!compile(entries[k], "ps_5_0", &blob))
+				return Fail(("pixel shader: " + why).c_str());
+			const HRESULT hp = dev->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, shaders[k]);
+			blob->Release();
+			if (FAILED(hp))
+				return Fail("pixel shader not created");
+		}
+		D3D11_BUFFER_DESC bd = {};
+		bd.ByteWidth = sizeof(GpuConsts);
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		D3D11_SAMPLER_DESC sd = {};
+		sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.MaxLOD = D3D11_FLOAT32_MAX;
+		// Premultiplied "over", as DrawLevels blends.
+		D3D11_BLEND_DESC bl = {};
+		bl.RenderTarget[0].BlendEnable = TRUE;
+		bl.RenderTarget[0].SrcBlend = bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+		bl.RenderTarget[0].DestBlend = bl.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+		bl.RenderTarget[0].BlendOp = bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+		bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+		D3D11_RASTERIZER_DESC rd = {};
+		rd.FillMode = D3D11_FILL_SOLID;
+		rd.CullMode = D3D11_CULL_NONE;
+		rd.ScissorEnable = TRUE;
+		if (FAILED(dev->CreateBuffer(&bd, nullptr, &cb)) || FAILED(dev->CreateSamplerState(&sd, &sampler)) ||
+			FAILED(dev->CreateBlendState(&bl, &over)) || FAILED(dev->CreateRasterizerState(&rd, &raster)))
+			return Fail("pipeline states not created");
+		IDXGIDevice* dxgi = nullptr;
+		dev->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgi));
+		const HRESULT hc = dxgi ? DCompositionCreateDevice(dxgi, __uuidof(IDCompositionDevice), reinterpret_cast<void**>(&dcomp)) : E_FAIL;
+		if (dxgi)
+			dxgi->Release();
+		if (FAILED(hc) || FAILED(dcomp->CreateTargetForHwnd(wnd, TRUE, &target)) || FAILED(dcomp->CreateVisual(&visual)) ||
+			FAILED(target->SetRoot(visual)))
+			return Fail("DirectComposition not set up");
+		ready = true;
+		gGpuDev = dev;
+		return true;
+	}
+
+	bool EnsureChain(int cw, int ch)
+	{
+		if (chain && cw == chainW && ch == chainH)
+			return true;
+		SafeRelease(backRtv);
+		if (chain) {
+			ctx->OMSetRenderTargets(0, nullptr, nullptr);
+			if (FAILED(chain->ResizeBuffers(2, cw, ch, DXGI_FORMAT_B8G8R8A8_UNORM, 0)))
+				return false;
+		} else {
+			IDXGIDevice* dxgi = nullptr;
+			IDXGIAdapter* adapter = nullptr;
+			IDXGIFactory2* factory = nullptr;
+			dev->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgi));
+			if (dxgi)
+				dxgi->GetAdapter(&adapter);
+			if (adapter)
+				adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(&factory));
+			DXGI_SWAP_CHAIN_DESC1 d = {};
+			d.Width = cw;
+			d.Height = ch;
+			d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			d.SampleDesc.Count = 1;
+			d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+			d.BufferCount = 2;
+			d.Scaling = DXGI_SCALING_STRETCH;
+			d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+			d.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+			const HRESULT hr = factory ? factory->CreateSwapChainForComposition(dev, &d, nullptr, &chain) : E_FAIL;
+			SafeRelease(factory);
+			SafeRelease(adapter);
+			SafeRelease(dxgi);
+			if (FAILED(hr) || FAILED(visual->SetContent(chain)) || FAILED(dcomp->Commit()))
+				return false;
+		}
+		ID3D11Texture2D* back = nullptr;
+		if (FAILED(chain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back))))
+			return false;
+		const HRESULT hr = dev->CreateRenderTargetView(back, nullptr, &backRtv);
+		back->Release();
+		if (FAILED(hr))
+			return false;
+		chainW = cw;
+		chainH = ch;
+		return true;
+	}
+
+	// The w x h textures the frames are made from.
+	bool EnsureSize(int nw, int nh)
+	{
+		if (nw == w && nh == h && cap.t)
+			return true;
+		gGpuCapTex = nullptr;
+		gGpuCapW = gGpuCapH = 0;
+		gGpuCapFresh = false;
+		SafeRelease(readback);
+		keyCopy.clear();
+		maskCopy.clear();
+		bakedCopy.clear();
+		if (!cap.Create(dev, nw, nh, DXGI_FORMAT_B8G8R8A8_UNORM, false) || !ref.Create(dev, nw, nh, DXGI_FORMAT_B8G8R8A8_UNORM, true) ||
+			!key.Create(dev, nw, nh, DXGI_FORMAT_R8_UNORM, false) || !menuMask.Create(dev, nw, nh, DXGI_FORMAT_R8_UNORM, false) ||
+			!menuBaked.Create(dev, nw, nh, DXGI_FORMAT_R8_UNORM, false)) {
+			w = h = 0;
+			return false;
+		}
+		const float clear[4] = {0, 0, 0, 0};
+		ctx->ClearRenderTargetView(ref.rtv, clear);
+		w = nw;
+		h = nh;
+		gGpuCapTex = cap.t;
+		gGpuCapW = w;
+		gGpuCapH = h;
+		return true;
+	}
+
+	// A one-byte-per-pixel map sent to its texture: only the band of rows
+	// that changed since the last send (copy holds what the texture has), and
+	// nothing when none did. Sending the whole background map (2 MB) and both
+	// menu maps every frame made most of the 1.5 to 2.5 ms hand-off (build 145).
+	void UploadChanged(GpuTex& t, const unsigned char* src, std::vector<unsigned char>& copy, int tw, int th)
+	{
+		const size_t n = static_cast<size_t>(tw) * th;
+		int y0 = 0, y1 = th;
+		if (copy.size() == n) {
+			while (y0 < th && !memcmp(src + static_cast<size_t>(y0) * tw, &copy[static_cast<size_t>(y0) * tw], tw))
+				++y0;
+			if (y0 == th)
+				return;
+			while (y1 > y0 && !memcmp(src + static_cast<size_t>(y1 - 1) * tw, &copy[static_cast<size_t>(y1 - 1) * tw], tw))
+				--y1;
+		} else {
+			copy.resize(n);
+		}
+		const D3D11_BOX box = {0, static_cast<UINT>(y0), 0, static_cast<UINT>(tw), static_cast<UINT>(y1), 1};
+		ctx->UpdateSubresource(t.t, 0, &box, src + static_cast<size_t>(y0) * tw, tw, 0);
+		memcpy(&copy[static_cast<size_t>(y0) * tw], src + static_cast<size_t>(y0) * tw, static_cast<size_t>(y1 - y0) * tw);
+	}
+
+	void SetConsts(const GpuConsts& c)
+	{
+		D3D11_MAPPED_SUBRESOURCE m;
+		if (SUCCEEDED(ctx->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+			memcpy(m.pData, &c, sizeof(c));
+			ctx->Unmap(cb, 0);
+		}
+	}
+
+	// A texture of the image (its levels as mips), made once per image.
+	ID3D11ShaderResourceView* ImageSrv(const std::vector<Level>* levels)
+	{
+		const ImageCache* entry = ImageEntry(levels);
+		if (!entry || levels->empty())
+			return nullptr;
+		for (ImageTex& im : images)
+			if (im.serial == entry->serial) {
+				im.usedAt = GetTickCount();
+				return im.srv;
+			}
+		const Level& top = (*levels)[0];
+		if (top.w > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || top.h > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+			return nullptr;
+		if (images.size() >= 6) {
+			size_t oldest = 0;
+			for (size_t i = 1; i < images.size(); ++i)
+				if (static_cast<int>(images[i].usedAt - images[oldest].usedAt) < 0)
+					oldest = i;
+			SafeRelease(images[oldest].srv);
+			SafeRelease(images[oldest].t);
+			images.erase(images.begin() + oldest);
+		}
+		D3D11_TEXTURE2D_DESC d = {};
+		d.Width = top.w;
+		d.Height = top.h;
+		d.MipLevels = static_cast<UINT>(levels->size());
+		d.ArraySize = 1;
+		d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		d.SampleDesc.Count = 1;
+		d.Usage = D3D11_USAGE_IMMUTABLE;
+		d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		std::vector<D3D11_SUBRESOURCE_DATA> init(levels->size());
+		for (size_t i = 0; i < levels->size(); ++i) {
+			init[i].pSysMem = (*levels)[i].px.data();
+			init[i].SysMemPitch = (*levels)[i].w * 4;
+		}
+		ImageTex im = {entry->serial, nullptr, nullptr, GetTickCount()};
+		if (FAILED(dev->CreateTexture2D(&d, init.data(), &im.t)) || FAILED(dev->CreateShaderResourceView(im.t, nullptr, &im.srv))) {
+			SafeRelease(im.t);
+			return nullptr;
+		}
+		images.push_back(im);
+		return im.srv;
+	}
+
+	// The drawing steps on a tw x th target, as RunOps does them on the CPU.
+	void DrawOps(ID3D11RenderTargetView* rtv, int tw, int th, const std::vector<DrawOp>& ops)
+	{
+		if (ops.empty())
+			return;
+		D3D11_VIEWPORT vp = {0, 0, static_cast<float>(tw), static_cast<float>(th), 0, 1};
+		ctx->OMSetRenderTargets(1, &rtv, nullptr);
+		ctx->RSSetViewports(1, &vp);
+		ctx->RSSetState(raster);
+		ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		ctx->IASetInputLayout(nullptr);
+		ctx->VSSetShader(vs, nullptr, 0);
+		ctx->VSSetConstantBuffers(0, 1, &cb);
+		ctx->PSSetConstantBuffers(0, 1, &cb);
+		ctx->PSSetSamplers(0, 1, &sampler);
+		GpuConsts c = {};
+		c.target[0] = static_cast<float>(tw);
+		c.target[1] = static_cast<float>(th);
+		c.gammaExp = 100.0f / gGamma;
+		c.sat = gSat / 100.0f;
+		for (const DrawOp& o : ops) {
+			D3D11_RECT clip = {std::max(0, o.x0), std::max(0, o.y0), std::min(tw, o.x1), std::min(th, o.y1)};
+			if (o.image) {
+				clip.left = std::max<LONG>(clip.left, static_cast<LONG>(floor(o.ix)));
+				clip.top = std::max<LONG>(clip.top, static_cast<LONG>(floor(o.iy)));
+				clip.right = std::min<LONG>(clip.right, static_cast<LONG>(ceil(o.ix + o.iw)));
+				clip.bottom = std::min<LONG>(clip.bottom, static_cast<LONG>(ceil(o.iy + o.ih)));
+			}
+			if (clip.right <= clip.left || clip.bottom <= clip.top)
+				continue;
+			ID3D11ShaderResourceView* srv = nullptr;
+			if (o.image) {
+				srv = ImageSrv(o.levels);
+				if (!srv || o.iw <= 0 || o.ih <= 0)
+					continue;
+				c.rect[0] = static_cast<float>(o.ix);
+				c.rect[1] = static_cast<float>(o.iy);
+				c.rect[2] = static_cast<float>(o.ix + o.iw);
+				c.rect[3] = static_cast<float>(o.iy + o.ih);
+				c.alphaScale = o.alpha / 255.0f;
+			} else {
+				c.rect[0] = static_cast<float>(clip.left);
+				c.rect[1] = static_cast<float>(clip.top);
+				c.rect[2] = static_cast<float>(clip.right);
+				c.rect[3] = static_cast<float>(clip.bottom);
+				c.color[0] = (o.argb >> 16 & 255) / 255.0f;
+				c.color[1] = (o.argb >> 8 & 255) / 255.0f;
+				c.color[2] = (o.argb & 255) / 255.0f;
+				c.color[3] = (o.argb >> 24 & 255) / 255.0f;
+			}
+			SetConsts(c);
+			ctx->RSSetScissorRects(1, &clip);
+			ctx->OMSetBlendState(o.image ? over : nullptr, nullptr, 0xFFFFFFFFu);
+			ctx->PSSetShader(o.image ? psImage : psFill, nullptr, 0);
+			ctx->PSSetShaderResources(0, 1, &srv);
+			ctx->Draw(4, 0);
+		}
+		ID3D11ShaderResourceView* none = nullptr;
+		ctx->PSSetShaderResources(0, 1, &none);
+	}
+
+	bool DrawRef(int nw, int nh, const std::vector<DrawOp>& ops)
+	{
+		if (!EnsureSize(nw, nh))
+			return false;
+		DrawOps(ref.rtv, w, h, ops);
+		return true;
+	}
+
+	// Puts the window where the overlay is and shows the frame.
+	void Show(const OverlayState& st, int fw, int fh)
+	{
+		const LONG x = static_cast<LONG>(st.screenX), y = static_cast<LONG>(st.screenY);
+		if (x != winX || y != winY || fw != winW || fh != winH) {
+			SetWindowPos(wnd, nullptr, x, y, fw, fh, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+			winX = x;
+			winY = y;
+			winW = fw;
+			winH = fh;
+		}
+		LARGE_INTEGER p0, p1, pf;
+		QueryPerformanceCounter(&p0);
+		chain->Present(0, 0);
+		QueryPerformanceCounter(&p1);
+		QueryPerformanceFrequency(&pf);
+		gStageMs[7] = 1000.0 * (p1.QuadPart - p0.QuadPart) / pf.QuadPart;
+		if (!IsWindowVisible(wnd))
+			ShowWindow(wnd, SW_SHOWNOACTIVATE);
+	}
+
+	// A frame drawn by the CPU (premultiplied BGRA), straight into the swap chain.
+	bool PresentBuffer(const OverlayState& st, Buffer32& buf)
+	{
+		if (!EnsureChain(buf.w, buf.h))
+			return false;
+		ID3D11Texture2D* back = nullptr;
+		if (FAILED(chain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back))))
+			return false;
+		ctx->UpdateSubresource(back, 0, nullptr, buf.bits, buf.w * 4, 0);
+		back->Release();
+		Show(st, buf.w, buf.h);
+		return true;
+	}
+
+	// Copies the frame about to be shown into gOutput (RSSnapshot).
+	void Snapshot()
+	{
+		ID3D11Texture2D* back = nullptr;
+		if (FAILED(chain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back))))
+			return;
+		if (!readback) {
+			D3D11_TEXTURE2D_DESC d;
+			back->GetDesc(&d);
+			d.Usage = D3D11_USAGE_STAGING;
+			d.BindFlags = 0;
+			d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			d.MiscFlags = 0;
+			dev->CreateTexture2D(&d, nullptr, &readback);
+		}
+		if (readback && gOutput.w == chainW && gOutput.h == chainH) {
+			ctx->CopyResource(readback, back);
+			D3D11_MAPPED_SUBRESOURCE m;
+			if (SUCCEEDED(ctx->Map(readback, 0, D3D11_MAP_READ, 0, &m))) {
+				for (int y = 0; y < chainH; ++y)
+					memcpy(gOutput.bits + static_cast<size_t>(y) * chainW * 4, static_cast<BYTE*>(m.pData) + static_cast<size_t>(y) * m.RowPitch,
+						static_cast<size_t>(chainW) * 4);
+				ctx->Unmap(readback, 0);
+			}
+		}
+		back->Release();
+	}
+
+	// One frame, by Composite's rules (see the shader), with the drawing
+	// steps "on" (the Adjust Image handles) over it.
+	void Compose(const OverlayState& st, const std::vector<DrawOp>& on)
+	{
+		const int fw = gCapture.w, fh = gCapture.h;
+		if (!EnsureSize(fw, fh) || !EnsureChain(fw, fh))
+			return;
+		const size_t n = static_cast<size_t>(fw) * fh;
+		if (!gGpuCapFresh) {
+			ctx->UpdateSubresource(cap.t, 0, nullptr, gCapture.bits, fw * 4, 0);
+			gGpuCapFresh = true;
+		}
+		if (gKeyShare.size() == n)
+			UploadChanged(key, gKeyShare.data(), keyCopy, fw, fh);
+		GpuConsts c = {};
+		c.rect[2] = static_cast<float>(fw);
+		c.rect[3] = static_cast<float>(fh);
+		c.target[0] = static_cast<float>(fw);
+		c.target[1] = static_cast<float>(fh);
+		c.mode = gMode;
+		c.hover = gPanelAside ? 1 : 0;
+		if (gMenuMaskCount && gMenuMask.size() == n) {
+			UploadChanged(menuMask, gMenuMask.data(), maskCopy, fw, fh);
+			c.menus |= 1;
+		}
+		if (gMenuBakedCount && gMenuBaked.size() == n) {
+			UploadChanged(menuBaked, gMenuBaked.data(), bakedCopy, fw, fh);
+			c.menus |= 2;
+		}
+		int vx0, vy0, vx1, vy1, px, py, pw, ph;
+		ViewportRect(fw, fh, vx0, vy0, vx1, vy1);
+		PanelRect(fw, fh, px, py, pw, ph);
+		const int vp[4] = {vx0, vy0, vx1, vy1}, pn[4] = {px, py, px + pw, py + ph};
+		memcpy(c.viewport, vp, sizeof(vp));
+		memcpy(c.panel, pn, sizeof(pn));
+		if (gFlyout.right > gFlyout.left) {
+			const int fl[4] = {static_cast<int>(gFlyout.left), static_cast<int>(gFlyout.top), static_cast<int>(gFlyout.right),
+				static_cast<int>(gFlyout.bottom)};
+			memcpy(c.flyout, fl, sizeof(fl));
+		}
+		c.gizmoX = vx1 - static_cast<int>(std::min(vx1 - vx0, vy1 - vy0) * 0.3);
+		c.gizmoBottom = gGizmoBottom;
+		c.blendM = gModelOpacity < 100 ? (100 - gModelOpacity) / 100.0f : 0;
+		for (const RECT& r : gMenuBoxes) {
+			if (c.boxCount == 16)
+				break;
+			const int b[4] = {static_cast<int>(r.left), static_cast<int>(r.top), static_cast<int>(r.right), static_cast<int>(r.bottom)};
+			memcpy(c.boxes[c.boxCount++], b, sizeof(b));
+		}
+		const int sx = static_cast<int>(st.screenX), sy = static_cast<int>(st.screenY);
+		for (const RECT& r : gUiRects) {
+			if (c.uiCount == 16)
+				break;
+			const int u[4] = {static_cast<int>(r.left) - sx, static_cast<int>(r.top) - sy, static_cast<int>(r.right) - sx, static_cast<int>(r.bottom) - sy};
+			memcpy(c.ui[c.uiCount++], u, sizeof(u));
+		}
+		SetConsts(c);
+		D3D11_VIEWPORT viewport = {0, 0, static_cast<float>(fw), static_cast<float>(fh), 0, 1};
+		const D3D11_RECT all = {0, 0, fw, fh};
+		ctx->OMSetRenderTargets(1, &backRtv, nullptr);
+		ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+		ctx->RSSetViewports(1, &viewport);
+		ctx->RSSetState(raster);
+		ctx->RSSetScissorRects(1, &all);
+		ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		ctx->IASetInputLayout(nullptr);
+		ctx->VSSetShader(vs, nullptr, 0);
+		ctx->VSSetConstantBuffers(0, 1, &cb);
+		ctx->PSSetConstantBuffers(0, 1, &cb);
+		ctx->PSSetShader(psCompose, nullptr, 0);
+		ID3D11ShaderResourceView* srvs[5] = {cap.srv, ref.srv, key.srv, menuMask.srv, menuBaked.srv};
+		ctx->PSSetShaderResources(0, 5, srvs);
+		ctx->Draw(4, 0);
+		ID3D11ShaderResourceView* none[5] = {};
+		ctx->PSSetShaderResources(0, 5, none);
+		DrawOps(backRtv, fw, fh, on);
+		if (snapWanted) {
+			Snapshot();
+			snapWanted = false;
+			snapDone = true;
+		}
+		Show(st, fw, fh);
+	}
+
+	// Shows a test square and reads the screen back: the window must show
+	// what it draws, and clicks must go through it to ZBrush.
+	bool SelfTest(HWND zbrush)
+	{
+		RECT zr;
+		if (!zbrush || !GetWindowRect(zbrush, &zr))
+			return Fail("no ZBrush window for the self-test");
+		const int s = 16;
+		OverlayState st;
+		st.screenX = (zr.left + zr.right) / 2 - s / 2;
+		st.screenY = (zr.top + zr.bottom) / 2 - s / 2;
+		Buffer32 b;
+		if (!b.Resize(s, s))
+			return Fail("self-test buffer");
+		const uint32_t test = 0xFF13E78Cu;
+		for (int i = 0; i < s * s; ++i)
+			reinterpret_cast<uint32_t*>(b.bits)[i] = test;
+		if (!PresentBuffer(st, b))
+			return Fail("swap chain not created");
+		DwmFlush();
+		Sleep(50);
+		DwmFlush();
+		HDC screen = GetDC(nullptr);
+		const COLORREF seen = GetPixel(screen, static_cast<int>(st.screenX) + s / 2, static_cast<int>(st.screenY) + s / 2);
+		ReleaseDC(nullptr, screen);
+		const POINT mid = {static_cast<LONG>(st.screenX) + s / 2, static_cast<LONG>(st.screenY) + s / 2};
+		const HWND hit = WindowFromPoint(mid);
+		memset(b.bits, 0, static_cast<size_t>(s) * s * 4);
+		PresentBuffer(st, b);
+		ShowWindow(wnd, SW_HIDE);
+		const bool shows = abs(static_cast<int>(GetRValue(seen)) - 0x13) <= 3 && abs(static_cast<int>(GetGValue(seen)) - 0xE7) <= 3 &&
+			abs(static_cast<int>(GetBValue(seen)) - 0x8C) <= 3;
+		if (!shows) {
+			char line[96];
+			snprintf(line, sizeof(line), "self-test: the window did not show its frame (saw %06lX)", static_cast<unsigned long>(seen));
+			return Fail(line);
+		}
+		if (hit == wnd)
+			return Fail("self-test: clicks did not go through the window");
+		return true;
+	}
+};
+
+static GpuOverlay gGpu;
+
+static bool GpuComposes()
+{
+	return gGpu.ready && gKeyState == 1;
+}
+
+static void GpuCompose(const OverlayState& st, const std::vector<DrawOp>& on)
+{
+	gGpu.Compose(st, on);
+}
+
+static bool GpuDrawRef(int w, int h, const std::vector<DrawOp>& ops)
+{
+	return GpuComposes() && gGpu.DrawRef(w, h, ops);
+}
+
+static bool GpuPresentBuffer(const OverlayState& st, Buffer32& buf)
+{
+	return gGpu.ready && gGpu.PresentBuffer(st, buf);
 }
 
 // A left drag that starts on the model is sculpting, not navigation. Decided
@@ -5662,8 +6567,10 @@ static bool OverlayStep(HWND wnd)
 	}
 	if (gKeyState == 1 && !tested && !gUseWgc) {
 		tested = true;
-		if (!ExclusionWorks(wnd, st))
+		if (!ExclusionWorks(wnd, st)) {
 			gKeyState = -1;
+			BuildRefLayer(st);  // drawn by the CPU now (the GPU drew it only to composite)
+		}
 	}
 	if (gKeyState != 1) {
 		if (layoutChanged)
@@ -5705,6 +6612,9 @@ static LRESULT CALLBACK OverlayProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_MOUSEACTIVATE:
 		return MA_NOACTIVATE;
 	case WM_DESTROY:
+		// Not when the GPU's window is swapped for the CPU's (OverlayThread).
+		if (wnd != gOverlayWnd)
+			return 0;
 		gOverlayWnd = nullptr;
 		PostQuitMessage(0);
 		return 0;
@@ -5725,8 +6635,12 @@ static DWORD WINAPI OverlayThread(LPVOID ready)
 	RegisterClassW(&wc);
 	HWND owner = nullptr;
 	EnumWindows(FindZBrushWindow, reinterpret_cast<LPARAM>(&owner));
-	gOverlayWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+	// The GPU's window first: no bitmap of its own (DirectComposition shows
+	// its frames), layered and transparent so clicks go through to ZBrush.
+	gOverlayWnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
 		wc.lpszClassName, L"JRef", WS_POPUP, 0, 0, 1, 1, owner, nullptr, wc.hInstance, nullptr);
+	if (gOverlayWnd)
+		SetLayeredWindowAttributes(gOverlayWnd, 0, 255, LWA_ALPHA);
 	// Capturing ZBrush's window sees what is underneath the overlay, and
 	// screenshots still show the overlay. Without it, WDA_EXCLUDEFROMCAPTURE
 	// (Windows 10 2004 and later) hides the overlay from screen capture, its
@@ -5735,6 +6649,21 @@ static DWORD WINAPI OverlayThread(LPVOID ready)
 	gKeyState = 1;
 #else
 	gUseWgc = gOverlayWnd && owner && gWgc.Init(owner);
+	const bool gpu = gOverlayWnd && gGpu.Init(gOverlayWnd, gUseWgc ? gWgc.device : nullptr) && gGpu.SelfTest(owner);
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu overlay drawn by the %s%s%s\n", GetTickCount(), gpu ? "GPU" : "CPU (layered window)",
+			gpu ? (gUseWgc ? ", on the window capture's device" : ", on its own device") : ": ",
+			gpu ? "" : (gGpu.why.empty() ? "no window" : gGpu.why.c_str()));
+		fclose(f);
+	}
+	if (!gpu && gOverlayWnd) {
+		// The CPU's layered window instead (UpdateLayeredWindow needs the
+		// bitmap the GPU's window has not got).
+		const HWND old = gOverlayWnd;
+		gOverlayWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+			wc.lpszClassName, L"JRef", WS_POPUP, 0, 0, 1, 1, owner, nullptr, wc.hInstance, nullptr);
+		DestroyWindow(old);
+	}
 	gKeyState = gUseWgc || (gOverlayWnd && SetWindowDisplayAffinity(gOverlayWnd, 0x11)) ? 1 : 0;
 #endif
 	if (gOverlayWnd) {
@@ -6511,6 +7440,14 @@ ZFUNC RSSnapshot(char*, double, char*, int, char*, int, char**)
 	if (!gOverlayLockReady || !gCapture.bits || !gOutput.bits)
 		return 0;
 	StartGdiplus();
+	if (GpuComposes()) {
+		// The GPU copies its next frame into gOutput.
+		gGpu.snapDone = false;
+		gGpu.snapWanted = true;
+		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
+		for (int i = 0; i < 100 && !gGpu.snapDone; ++i)
+			Sleep(10);
+	}
 	EnterCriticalSection(&gOverlayLock);
 	Rgb cap, out;
 	cap.w = out.w = gCapture.w;
