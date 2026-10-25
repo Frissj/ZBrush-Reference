@@ -21,6 +21,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <algorithm>
 #include <cmath>
 #include <emmintrin.h>
@@ -256,7 +257,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 174;
+static const int kDllBuild = 186;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -687,6 +688,7 @@ static Gesture gPending;      // last finished navigation drag, until Live repor
 static int gPendingCount = 0; // navigation drags since Live last reported
 static int gStaleSets = 0;    // reports ignored as not including the drag yet
 static Gesture gGesture;
+static volatile DWORD gDragEndAt = 0;  // when the last drag on the canvas ended
 static HHOOK gMouseHook = nullptr, gKeyHook = nullptr;
 static int gHookEvents = 0;
 static volatile bool gAltDown = false, gCtrlDown = false;
@@ -879,7 +881,8 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 	case WM_RBUTTONUP:
 		if (g.active) {
 			g.active = false;
-			g.kind = g.mode == kDragIgnore ? kKindSculpt : g.scaleSegments > 0 ? kKindScale :
+			gDragEndAt = GetTickCount();
+			g.kind =g.mode == kDragIgnore ? kKindSculpt : g.scaleSegments > 0 ? kKindScale :
 				(g.moveX != 0 || g.moveY != 0) ? kKindMove : g.rotated ? kKindRotate : kKindNone;
 			gLastKind = g.kind;
 			g.done = g.kind == kKindMove || g.kind == kKindScale || g.kind == kKindRotate;
@@ -2889,8 +2892,14 @@ static void UpdateMenus(const OverlayState& st, int w, int h)
 		absorbedAt.assign(all, static_cast<uint16_t>(frame - 1000));
 	// Build 128 also grew menus with the canvas cursor inside a menu box,
 	// and ZBrush draws its brush circle over a list's empty part: rings.
-	// Only ZBrush's interface cursor grows them now.
-	const bool rootGrow = onInterface;
+	// Only ZBrush's interface cursor grows them now. Not during a drag that
+	// started on the canvas, nor for 300 ms after it (ZBrush's last redraws
+	// of it): ZBrush holds the mouse while it pans, turns or sculpts, so no
+	// menu can open, though the cursor goes onto the interface or off the
+	// window. Builds 125-185 took the model moving under it then for menus,
+	// blocks over the panel until the cursor passed over them.
+	const bool dragging = gGesture.active || GetTickCount() - gDragEndAt < 300;
+	const bool rootGrow = onInterface && !dragging;
 	const int gizmoX = vx1 - static_cast<int>(std::min(vx1 - vx0, vy1 - vy0) * 0.3);
 	const int gizmoY = std::max(gGizmoBottom, vy0 + (vx1 - gizmoX));
 	int added = 0, gone = 0, absorbed = 0, bakedGone = 0, recent = 0, faint = 0;
@@ -4623,6 +4632,78 @@ static bool MemMatch(double v, double target)
 // Last scan: MB scanned, x matches, x-y pairs, scales near pairs, ms.
 static double gScanStats[5] = {0, 0, 0, 0, 0};
 
+static int ScanWorkers()
+{
+	static const int n = std::max(1, std::min(32, static_cast<int>(std::thread::hardware_concurrency())));
+	return n;
+}
+
+// Runs fn(worker, at, bytes, starts, got) over every 4 MB piece of the
+// committed memory keep(region) accepts, on every core: the scans for the
+// camera and the depth images read 3-4 GB, 1.4-11 s on one core (build 182).
+// A piece is read `overlap` bytes past its end (within its region) so a value
+// across the boundary is whole; fn takes the values starting before `starts`,
+// so none is seen twice. The scan's own buffers are left out. Returns the
+// bytes scanned.
+template <typename Keep, typename Fn>
+static size_t ScanMemory(size_t overlap, const Keep& keep, const Fn& fn)
+{
+	const size_t piece = 1 << 22;
+	const int workers = ScanWorkers();
+	std::vector<std::vector<unsigned char>> bufs(workers, std::vector<unsigned char>(piece + overlap));
+	std::vector<std::pair<uintptr_t, size_t>> pieces;
+	MEMORY_BASIC_INFORMATION mbi;
+	for (uintptr_t addr = 0; VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof mbi) == sizeof mbi;) {
+		const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress), next = base + mbi.RegionSize;
+		if (mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD) && keep(mbi))
+			for (uintptr_t at = base; at < next; at += piece) {
+				const size_t len = std::min<size_t>(piece + overlap, next - at);
+				bool own = false;
+				for (const auto& b : bufs) {
+					const uintptr_t lo = reinterpret_cast<uintptr_t>(b.data());
+					own = own || (at < lo + b.size() && lo < at + len);
+				}
+				if (!own)
+					pieces.push_back({at, len});
+			}
+		if (next <= addr)
+			break;
+		addr = next;
+	}
+	std::atomic<size_t> nextPiece{0}, scanned{0};
+	concurrency::parallel_for(0, workers, [&](int w) {
+		unsigned char* buf = bufs[w].data();
+		for (size_t k; (k = nextPiece++) < pieces.size();) {
+			SIZE_T got = 0;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(pieces[k].first), buf, pieces[k].second, &got))
+				continue;
+			const size_t starts = std::min<size_t>(piece, got);
+			scanned += starts;
+			fn(w, pieces[k].first, buf, starts, static_cast<size_t>(got));
+		}
+	});
+	return scanned;
+}
+
+// Where ZBrush's camera can be: its writable memory, not this DLL's own
+// copies of the values, nor the calling thread's stack (it holds the values
+// being reported right now) or JRef's threads'.
+static bool CameraRegion(const MEMORY_BASIC_INFORMATION& m)
+{
+	static HMODULE self = nullptr;
+	if (!self)
+		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&CameraRegion), &self);
+	const NT_TIB* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+	const uintptr_t stackLow = reinterpret_cast<uintptr_t>(tib->StackLimit) & ~static_cast<uintptr_t>(0xfffff);
+	const uintptr_t stackHigh = reinterpret_cast<uintptr_t>(tib->StackBase);
+	const uintptr_t base = reinterpret_cast<uintptr_t>(m.BaseAddress), next = base + m.RegionSize;
+	const DWORD prot = m.Protect & 0xff;
+	return (prot == PAGE_READWRITE || prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READWRITE) &&
+		(m.Type == MEM_PRIVATE || m.Type == MEM_IMAGE) && m.AllocationBase != self &&
+		!(stackLow < next && base < stackHigh) && !OwnThreadStack(base, next);
+}
+
 // Scans for x with y right after it (as float or double pairs), then for the
 // scale within 1 KB of each pair. Scanning for the scale on its own finds too
 // many matches when it is a common number such as 1.
@@ -4638,73 +4719,79 @@ static void MemScan(double sx, double px, double py)
 		tracks[t]->tooMany = false;
 	}
 	const size_t kMaxPairs = 200000;
-	HMODULE self = nullptr;
-	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-		reinterpret_cast<LPCWSTR>(&MemScan), &self);
-	const NT_TIB* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
-	const uintptr_t stackLow = reinterpret_cast<uintptr_t>(tib->StackLimit) & ~static_cast<uintptr_t>(0xfffff);
-	const uintptr_t stackHigh = reinterpret_cast<uintptr_t>(tib->StackBase);
-	std::vector<unsigned char> buf(1 << 22);
-	const uintptr_t bufLo = reinterpret_cast<uintptr_t>(buf.data()), bufHi = bufLo + buf.size();
-	size_t scanned = 0, rawX = 0, rawY = 0;
-	MEMORY_BASIC_INFORMATION mbi;
-	uintptr_t addr = 0;
-	while (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == sizeof(mbi)) {
-		const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-		const uintptr_t next = base + mbi.RegionSize;
-		const DWORD prot = mbi.Protect & 0xff;
-		const bool writable = prot == PAGE_READWRITE || prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READWRITE;
-		if (mbi.State == MEM_COMMIT && writable && !(mbi.Protect & PAGE_GUARD) &&
-			(mbi.Type == MEM_PRIVATE || mbi.Type == MEM_IMAGE) &&
-			// Not this DLL's own copies of the values, nor the calling thread's
-			// stack (it holds the values being reported right now).
-			mbi.AllocationBase != self && !(stackLow < next && base < stackHigh) &&
-			!OwnThreadStack(base, next)) {
-			// Chunks overlap by 8 bytes so a pair across a boundary is found.
-			for (uintptr_t chunk = base; chunk < next; chunk += buf.size() - 8) {
-				const size_t len = next - chunk < buf.size() ? next - chunk : buf.size();
-				SIZE_T got = 0;
-				if (chunk < bufHi && bufLo < chunk + len)
-					continue;  // the scan's own copy of memory
-				if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(chunk), buf.data(), len, &got))
+	const int workers = ScanWorkers();
+	std::vector<std::vector<MemCand>> xs(workers), ys(workers);
+	std::vector<size_t> rawXs(workers), rawYs(workers);
+	// MemMatch's ranges, for the quick test sixteen bytes at a time.
+	const double xTol = 0.0051 + fabs(px) * 1e-5, yTol = 0.0051 + fabs(py) * 1e-5;
+	const __m128d dxLo = _mm_set1_pd(px - xTol), dxHi = _mm_set1_pd(px + xTol);
+	const __m128d dyLo = _mm_set1_pd(py - yTol), dyHi = _mm_set1_pd(py + yTol);
+	const __m128 fxLo = _mm_set1_ps(nextafterf(static_cast<float>(px - xTol), -INFINITY));
+	const __m128 fxHi = _mm_set1_ps(nextafterf(static_cast<float>(px + xTol), INFINITY));
+	const __m128 fyLo = _mm_set1_ps(nextafterf(static_cast<float>(py - yTol), -INFINITY));
+	const __m128 fyHi = _mm_set1_ps(nextafterf(static_cast<float>(py + yTol), INFINITY));
+	const size_t scanned = ScanMemory(16, CameraRegion, [&](int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t got) {
+		std::vector<MemCand>& wx = xs[w];
+		std::vector<MemCand>& wy = ys[w];
+		size_t rawX = 0, rawY = 0;
+		for (size_t blk = 0; blk < starts; blk += 16) {
+			// Sixteen bytes at a time first, as four floats and two doubles
+			// against x's and y's ranges (widened a step, so nothing that
+			// matches is skipped): nearly all of memory is neither.
+			if (blk + 16 <= got) {
+				const __m128 f4 = _mm_loadu_ps(reinterpret_cast<const float*>(buf + blk));
+				const __m128d d2 = _mm_loadu_pd(reinterpret_cast<const double*>(buf + blk));
+				const __m128 inF = _mm_or_ps(_mm_and_ps(_mm_cmpge_ps(f4, fxLo), _mm_cmple_ps(f4, fxHi)),
+					_mm_and_ps(_mm_cmpge_ps(f4, fyLo), _mm_cmple_ps(f4, fyHi)));
+				const __m128d inD = _mm_or_pd(_mm_and_pd(_mm_cmpge_pd(d2, dxLo), _mm_cmple_pd(d2, dxHi)),
+					_mm_and_pd(_mm_cmpge_pd(d2, dyLo), _mm_cmple_pd(d2, dyHi)));
+				if (!_mm_movemask_ps(inF) && !_mm_movemask_pd(inD))
 					continue;
-				scanned += got;
-				for (size_t i = 0; i + 8 <= got; i += 4) {
-					float f, g;
-					memcpy(&f, &buf[i], 4);
-					memcpy(&g, &buf[i + 4], 4);
-					if (MemMatch(f, px)) {
-						++rawX;
-						if (MemMatch(g, py) && gMemX.cands.size() < kMaxPairs) {
-							gMemX.cands.push_back({chunk + i, false, f, 0});
-							gMemY.cands.push_back({chunk + i + 4, false, g, 0});
-						}
-					}
-					if (MemMatch(f, py))
-						++rawY;
-					if (i % 8 == 0 && i + 16 <= got) {
-						double d, e;
-						memcpy(&d, &buf[i], 8);
-						memcpy(&e, &buf[i + 8], 8);
-						if (MemMatch(d, px)) {
-							++rawX;
-							if (MemMatch(e, py) && gMemX.cands.size() < kMaxPairs) {
-								gMemX.cands.push_back({chunk + i, true, d, 0});
-								gMemY.cands.push_back({chunk + i + 8, true, e, 0});
-							}
-						}
-						if (MemMatch(d, py))
-							++rawY;
+			}
+			for (size_t i = blk; i < blk + 16 && i < starts && i + 8 <= got; i += 4) {
+				float f, g;
+				memcpy(&f, &buf[i], 4);
+				memcpy(&g, &buf[i + 4], 4);
+				if (MemMatch(f, px)) {
+					++rawX;
+					if (MemMatch(g, py) && wx.size() < kMaxPairs) {
+						wx.push_back({at + i, false, f, 0});
+						wy.push_back({at + i + 4, false, g, 0});
 					}
 				}
-				if (len < buf.size())
-					break;
+				if (MemMatch(f, py))
+					++rawY;
+				if (i % 8 == 0 && i + 16 <= got) {
+					double d, e;
+					memcpy(&d, &buf[i], 8);
+					memcpy(&e, &buf[i + 8], 8);
+					if (MemMatch(d, px)) {
+						++rawX;
+						if (MemMatch(e, py) && wx.size() < kMaxPairs) {
+							wx.push_back({at + i, true, d, 0});
+							wy.push_back({at + i + 8, true, e, 0});
+						}
+					}
+					if (MemMatch(d, py))
+						++rawY;
+				}
 			}
 		}
-		if (next <= addr)
-			break;
-		addr = next;
+		rawXs[w] += rawX;
+		rawYs[w] += rawY;
+	});
+	size_t rawX = 0, rawY = 0;
+	for (int w = 0; w < workers; ++w) {
+		rawX += rawXs[w];
+		rawY += rawYs[w];
+		for (size_t k = 0; k < xs[w].size() && gMemX.cands.size() < kMaxPairs; ++k) {
+			gMemX.cands.push_back(xs[w][k]);
+			gMemY.cands.push_back(ys[w][k]);
+		}
 	}
+	// In address order, as one pass over memory found them.
+	for (MemTrack* tr : {&gMemX, &gMemY})
+		std::sort(tr->cands.begin(), tr->cands.end(), [](const MemCand& a, const MemCand& b) { return a.addr < b.addr; });
 	// The scale near each pair, of the same type.
 	std::vector<unsigned char> win(2048 + 16);
 	for (const MemCand& x : gMemX.cands) {
@@ -5478,12 +5565,29 @@ static const MaskExtent& ExtentFor(int slot)
 // turned the camera to the far side, reading the rows as right, down and
 // into the screen; the Left view then showed the tail for the hand. A
 // creature facing left in the Left image faces the Front camera this way.)
+// ZBrush's rotation copies (and the view codes read from them) hold the
+// camera's rotation transposed, with x's couplings the other way: the
+// camera's own is S m^T S, S = diag(-1, 1, 1). Snapped Front, Back, Right and
+// Left read the same either way, and so did turning about the vertical axis
+// alone; tilted, frames from different angles disagreed about where the
+// model was (builds 175-177: 34-62% of points impossible between angles;
+// build 178's saved frames: 4.5% this way, the outline's noise, against
+// 30% as read). Top and Bottom swap.
+static void RotFix(const double m[9], double out[9])
+{
+	static const double s[3] = {-1, 1, 1};
+	for (int r = 0; r < 3; ++r)
+		for (int c = 0; c < 3; ++c)
+			out[r * 3 + c] = s[r] * m[c * 3 + r] * s[c];
+}
+
 static void ViewAxes(int slot, double d[3][3])
 {
 	int code = kViewCodes[slot];
-	double m[9];
+	double raw[9], m[9];
 	for (int i = 0; i < 9; ++i, code /= 3)
-		m[i] = code % 3 - 1;
+		raw[i] = code % 3 - 1;
+	RotFix(raw, m);
 	for (int c = 0; c < 3; ++c) {
 		d[0][c] = m[c];
 		d[1][c] = -m[3 + c];
@@ -5817,8 +5921,50 @@ static bool DepthFound(double& empty);
 static bool DepthAtDoc(double x, double y, double& v);
 static bool DepthSame(double a, double b);
 static bool CanvasDepth(double x, double y, double reach, double kp, double& z, double& width, int& samples);
-static bool MapDepth(int view, const double centre[2], double reach, double& front, double& thick, int& samples);
-static bool MapHas(int view);
+// The camera as the depth planes need it: its axes (as ViewAxes gives them),
+// the pivot's document point, the zoom, the depth plane's value at the
+// pivot, and the document's middle, which perspective is taken about.
+// A point's depth Z towards the camera is gDepthK * (pivot - value) / zoom
+// model units; across, a document point is the pivot's offset / zoom scaled
+// by 1 - Z * gInvD (perspective: gInvD is one over the eye's distance from
+// the pivot; 0 flat). Both are measured from the frames themselves
+// (CloudCalibrate): build 175 took them as 1 and 0, and turned round behind
+// the model a frame found a fifth of the points from other angles where it
+// saw nothing or in front of what it saw.
+struct Cam {
+	double d[3][3];
+	double px, py, r, pivot, cx, cy;
+};
+static double gDepthK = 1, gInvD = 0;
+
+static void CamUnproject(const Cam& c, double x, double y, double z, double invD, double g[3])
+{
+	const double s = 1 - z * invD;
+	const double ax = ((x - c.cx) * s - (c.px - c.cx)) / c.r, ay = ((y - c.cy) * s - (c.py - c.cy)) / c.r;
+	for (int t = 0; t < 3; ++t)
+		g[t] = ax * c.d[0][t] + ay * c.d[1][t] + z * c.d[2][t];
+}
+
+static bool CamProject(const Cam& c, const float g[3], double invD, double& x, double& y, double& z)
+{
+	double s[3];
+	for (int a = 0; a < 3; ++a)
+		s[a] = g[0] * c.d[a][0] + g[1] * c.d[a][1] + g[2] * c.d[a][2];
+	z = s[2];
+	const double q = 1 - z * invD;
+	if (q <= 0.05)
+		return false;
+	x = c.cx + (s[0] * c.r + (c.px - c.cx)) / q;
+	y = c.cy + (s[1] * c.r + (c.py - c.cy)) / q;
+	return true;
+}
+
+static bool CloudDepth(const Cam& c, double qx, double qy, double reach, double& front, double& thick, int& samples);
+static bool CloudHas();
+static bool LiveCam(const OverlayState& st, const double d[3][3], Cam& c);
+static void CamPoint(const Cam& c, double x, double y, double z, double g[3]);
+static bool CameraAxes(double d[3][3]);
+static void RotDump(FILE* f);
 // Canvas readings since the last multiview log line: used, not covering the
 // screen's model, still being drawn.
 static int gCanvasUsed = 0, gCanvasUncovered = 0, gCanvasDrawing = 0;
@@ -5839,16 +5985,24 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 {
 	if (!ViewLayout(slot, st, out, path))
 		return false;
-	const int c = gActiveView;
-	if (c < 0 || c >= kDefaultView || c == slot || !gViews[c].used)
+	// The camera: at view c when snapped to one (its image, if it has one,
+	// only for the silhouettes); its axes from ZBrush's rotation at any angle
+	// (turned freely, in perspective, in a view without an image: builds
+	// 137-174 tracked only snapped to a view with an image), a snapped view's
+	// when the rotation copies are not found.
+	const int c = gActiveView >= 0 && gActiveView < kDefaultView && !gViewAway ? gActiveView : -1;
+	if (c == slot || st.ratio <= 0)
 		return true;
-	OverlayState cs;
-	std::string cpath;
-	if (!ViewLayout(c, st, cs, cpath) || cs.ratio <= 0)
-		return true;
+	const bool haveC = c >= 0 && gViews[c].used;
+	double dc[3][3];
+	if (!CameraAxes(dc)) {
+		if (c < 0)
+			return true;
+		ViewAxes(c, dc);
+	}
 	const MaskExtent& ve = ExtentFor(slot);
 	const View& vv = gViews[slot];
-	const ViewFrame cf = FrameFor(c, cs.offX, cs.offY), vf = FrameFor(slot, 0, 0);
+	const ViewFrame vf = FrameFor(slot, 0, 0);
 	// C's window in its image space: centre and half size per screen axis.
 	// The window is the part of the viewport beside the panel, where the
 	// model is worked on and which the cell shows (DrawPanelCell). Builds
@@ -5869,70 +6023,71 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 			vx1 = px;
 	}
 	const double midX = (vx0 + vx1) * 0.5 / kp, midY = (vy0 + vy1) * 0.5 / kp;
-	const double centreC[2] = {(midX - cs.px) / cs.ratio + cs.ax + cs.offX, (midY - cs.py) / cs.ratio + cs.ay + cs.offY};
-	const double halfC[2] = {(vx1 - vx0) * 0.5 / kp / cs.ratio, (vy1 - vy0) * 0.5 / kp / cs.ratio};
-	double dc[3][3];
-	ViewAxes(c, dc);
+	// The window's middle and half size in model units: from the pivot along
+	// the camera's right and down, at zoom 1 (a view's image point is G = s *
+	// (img - anchor) * f, and C's image placed by the camera reduces to this,
+	// its anchor and scale cancelling: no image of C is needed).
+	const double gx = (midX - st.px) / st.ratio, gy = (midY - st.py) / st.ratio;
+	const double halfM[2] = {(vx1 - vx0) * 0.5 / kp / st.ratio, (vy1 - vy0) * 0.5 / kp / st.ratio};
 	double centreV[2] = {0, 0}, halfV[2] = {0, 0};
 	int depthAxis = -1;
-	// V's image units per C's: both are placed at the same model scale.
-	const double k = cf.f / vf.f;
-	// The middle of C's viewport in model units, and its depth: the surface
-	// C shows there, when other views see across C's depth.
-	double g[3] = {0, 0, 0};
-	for (int b = 0; b < 2; ++b)
-		g[cf.m[b]] = ToModel(cf, b, centreC[b]);
-	// The depth: the surface round the middle (SurfaceDepth), within a
-	// quarter of the viewport's smaller side. With none in reach (the middle
-	// off the model), the last depth found stays until C changes: the band's
-	// middle instead is a jump.
+	// The middle of the window in model units, and its depth: the surface the
+	// camera shows there, along its axis towards the camera.
+	double g[3];
+	for (int t = 0; t < 3; ++t)
+		g[t] = gx * dc[0][t] + gy * dc[1][t];
+	Cam cam;
+	const bool camOk = LiveCam(st, dc, cam);
 	int samples = 0;
 	bool focus = false, held = false, fromCanvas = false;
-	double back = 0;  // the far side of the part, along C's camera axis
+	double front = 0, thick = 0;  // the surface towards the camera, the part's thickness behind it
 	{
-		static double heldDepth = 0, heldBack = 0;
-		static int heldFrom = -1;
-		int md;
-		double sd;
-		ScreenAxis(dc, 2, md, sd);
-		double depth = 0, z = 0, width = 0;
-		// ZBrush's own depth first (CanvasDepth: document pixels, negative
-		// towards the camera, measured from the model's pivot, PivotDepth: so
-		// (pivot - z) / zoom in model units towards it), the part as thick as
-		// it is wide on screen; the silhouettes when the buffer or the pivot
-		// is not found.
-		const double reachDoc = 0.25 * std::min(vx1 - vx0, vy1 - vy0) / kp;
-		// From the depth map of ZBrush's finished frames (MapDepth), never the
+		// From the points of ZBrush's finished frames (CloudDepth), never the
 		// plane as it is: ZBrush draws it part by part nearly all the time
 		// the view moves, and builds 164-171 read it mid-draw (the body behind
 		// the face, a few pixels, an empty plane) however they checked it.
-		double front = 0, thick = 0;
-		if (gAuto3D && MapDepth(c, centreC, reachDoc / cs.ratio, front, thick, samples)) {
-			depth = sd * front;
-			back = sd * (front - thick);
-			g[md] = depth;
-			heldDepth = depth;
-			heldBack = back;
-			heldFrom = c;
+		// Within a quarter of the window's smaller side. With too little in
+		// reach (a part no finished frame has shown yet, or the middle off the
+		// model) the last reading stays: the silhouettes put the far side
+		// elsewhere (build 172: -120 for the map's 268, the cell 60 px off
+		// and back within 5 layouts), and are used only before any frame.
+		static double heldFront = 0, heldThick = 0;
+		static bool haveHeld = false;
+		const double reach = 0.25 * std::min(vx1 - vx0, vy1 - vy0) / kp / st.ratio;
+		if (gAuto3D && camOk && CloudDepth(cam, midX, midY, reach, front, thick, samples)) {
 			focus = fromCanvas = true;
-		} else if (gAuto3D && heldFrom == c && MapHas(c)) {
-			// The map has too little round the middle (a part no finished
-			// frame has shown yet): the last reading stays. The silhouettes
-			// instead put the far side elsewhere (build 172: -120 for the
-			// map's 268, the cell 60 px off and back within 5 layouts).
-			g[md] = heldDepth;
-			back = heldBack;
+		} else if (gAuto3D && haveHeld && CloudHas()) {
+			front = heldFront;
+			thick = heldThick;
 			focus = held = true;
-		} else if (gAuto3D && SurfaceDepth(c, cf, centreC, 0.5 * std::min(halfC[0], halfC[1]), depth, back, samples)) {
-			g[md] = depth;
-			heldDepth = depth;
-			heldBack = back;
-			heldFrom = c;
-			focus = true;
-		} else if (gAuto3D && heldFrom == c) {
-			g[md] = heldDepth;
-			back = heldBack;
+		} else if (gAuto3D && haveC) {
+			OverlayState cs;
+			std::string cpath;
+			if (ViewLayout(c, st, cs, cpath) && cs.ratio > 0) {
+				const ViewFrame cf = FrameFor(c, cs.offX, cs.offY);
+				const double centreC[2] = {(midX - cs.px) / cs.ratio + cs.ax + cs.offX, (midY - cs.py) / cs.ratio + cs.ay + cs.offY};
+				const double halfC[2] = {(vx1 - vx0) * 0.5 / kp / cs.ratio, (vy1 - vy0) * 0.5 / kp / cs.ratio};
+				double cd[3][3], depth = 0, back = 0;
+				ViewAxes(c, cd);
+				int md;
+				double sd;
+				ScreenAxis(cd, 2, md, sd);
+				if (SurfaceDepth(c, cf, centreC, 0.5 * std::min(halfC[0], halfC[1]), depth, back, samples)) {
+					front = sd * depth;
+					thick = front - sd * back;
+					focus = true;
+				}
+			}
+		}
+		if (!focus && gAuto3D && haveHeld) {
+			front = heldFront;
+			thick = heldThick;
 			focus = held = true;
+		}
+		if (focus && !held) {
+			heldFront = front;
+			heldThick = thick;
+			haveHeld = true;
 		}
 		// A jump in the depth (the middle moving onto a part nearer or
 		// farther: build 173, 140 to 297 in a frame, the cell 190 px) is eased
@@ -5940,38 +6095,40 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 		// smaller changes, as the middle moves over one part, are followed as
 		// they are. The layout is asked for again until it has arrived.
 		if (focus) {
-			static double easedDepth = 0, easedBack = 0;
+			static double easedFront = 0, easedThick = 0;
 			static LARGE_INTEGER easedAt = {};
-			static int easedFrom = -1;
-			static bool easing = false;
+			static bool started = false, easing = false;
 			LARGE_INTEGER t, qf;
 			QueryPerformanceCounter(&t);
 			QueryPerformanceFrequency(&qf);
-			if (easedFrom != c) {
-				easing = false;
-			} else if (easing || fabs(g[md] - easedDepth) > 15 || fabs(back - easedBack) > 15) {
+			if (started && (easing || fabs(front - easedFront) > 15 || fabs(thick - easedThick) > 15)) {
 				// At most a frame's time a step (the layout is not asked for
 				// while the camera is still: the first step after a pause
 				// would otherwise be the whole jump).
 				const double ms = std::min(33.0, 1000.0 * (t.QuadPart - easedAt.QuadPart) / qf.QuadPart);
 				const double a = 1 - exp(-ms / 50.0);
-				easedDepth += (g[md] - easedDepth) * a;
-				easedBack += (back - easedBack) * a;
-				easing = fabs(g[md] - easedDepth) > 0.5 || fabs(back - easedBack) > 0.5;
+				easedFront += (front - easedFront) * a;
+				easedThick += (thick - easedThick) * a;
+				easing = fabs(front - easedFront) > 0.5 || fabs(thick - easedThick) > 0.5;
+			} else {
+				easing = false;
 			}
 			if (!easing) {
-				easedDepth = g[md];
-				easedBack = back;
+				easedFront = front;
+				easedThick = thick;
 			}
-			easedFrom = c;
+			started = true;
 			easedAt = t;
-			g[md] = easedDepth;
-			back = easedBack;
+			front = easedFront;
+			thick = easedThick;
 			if (easing) {
 				EnterCriticalSection(&gOverlayLock);
 				gRedrawPending = true;
 				LeaveCriticalSection(&gOverlayLock);
 			}
+			// The point on the ray through the window's middle at that depth
+			// (in perspective the ray is not along the camera's axis).
+			CamPoint(cam, midX, midY, front, g);
 		}
 	}
 	{
@@ -6008,20 +6165,35 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 			}
 		}
 	}
-	// Each of V's screen axes: one C shares (the same model point), or C's
-	// depth. The cell shows a window the size of C's (DrawPanelCell fits the
-	// same screen area), so its half size per screen axis is C's, in V's
-	// units. (Builds 150-154 left it 0 along the depth: the window went to the
-	// front surface whatever the part's thickness.)
+	// The cell shows a window the size of the camera's (DrawPanelCell fits the
+	// same screen area), so its half size per screen axis is the camera's, in
+	// V's units. (Builds 150-154 left it 0 along the depth: the window went to
+	// the front surface whatever the part's thickness.) Its middle: the part,
+	// from the surface into the model by half its thickness, at most a quarter
+	// of the window along V's screen axis most along the camera's.
+	double along = 0;
+	int da = 0;
 	for (int a = 0; a < 2; ++a) {
-		halfV[a] = halfC[a] * k;
-		const int b = cf.m[0] == vf.m[a] ? 0 : cf.m[1] == vf.m[a] ? 1 : -1;
-		if (b < 0) {
-			depthAxis = a;
-			centreV[a] = vf.anchor[a];
-			continue;
+		halfV[a] = halfM[a] / vf.f;
+		if (fabs(dc[2][vf.m[a]]) > along) {
+			along = fabs(dc[2][vf.m[a]]);
+			da = a;
 		}
-		centreV[a] = ToImage(vf, a, g[vf.m[a]]);
+	}
+	{
+		const double into = focus ? std::min(thick * 0.5, halfM[da] * 0.5) : 0;
+		double p[3];
+		for (int t = 0; t < 3; ++t)
+			p[t] = g[t] - into * dc[2][t];
+		for (int a = 0; a < 2; ++a)
+			centreV[a] = ToImage(vf, a, p[vf.m[a]]);
+	}
+	// The camera snapped, V seeing straight across its depth: the band of V's
+	// silhouette the window spans along the axis they share, as before.
+	if (along > 0.999) {
+		depthAxis = da;
+		if (!focus)
+			centreV[da] = vf.anchor[da];
 	}
 	if (depthAxis >= 0 && ve.ok) {
 		// The band shown along the shared axis, and the model's extent
@@ -6040,6 +6212,7 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 				hi = std::max(hi, maxs[i]);
 			}
 		const double across = depthAxis == 0 ? vv.u0 : vv.v0;
+		const double part = centreV[depthAxis];
 		if (lo >= 0)
 			centreV[depthAxis] = across + (lo + hi + 1) * 0.5 * vv.cell;
 		// With the surface's depth: the band still shows whole when it fits;
@@ -6053,9 +6226,6 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 		// blend, so zooming does not jump.
 		if (focus) {
 			const double half = halfV[depthAxis];
-			const double front = ToImage(vf, depthAxis, g[vf.m[depthAxis]]), rear = ToImage(vf, depthAxis, back);
-			const double thick = fabs(rear - front);
-			const double part = front + (rear >= front ? 1 : -1) * std::min(thick * 0.5, half * 0.5);
 			if (lo < 0) {
 				centreV[depthAxis] = part;
 			} else {
@@ -6067,58 +6237,76 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 	}
 	{
 		// Logged when what it went by changes: the views, whether the surface
-		// was found, and where (model units; moves of a 25th of the window).
+		// was found, and where (model units; moves of a 25th of the window), at
+		// most every 100 ms for moves. Builds 147-183 also read ZBrush's depth
+		// plane over the window for the line, 25,000 reads of a few bytes:
+		// 25-40 ms a layout, nearly every frame while the model moved (the
+		// overlay at 21 fps, its reference stage 44 ms of a 51 ms frame).
 		static int lastC = -1, lastSlot = -1, lastFocus = -1;
 		static double lastG[3] = {0, 0, 0};
-		const double tol = std::max(halfC[0], halfC[1]) * cf.f * 2 / 25;
+		static DWORD loggedAt = 0;
+		const double tol = std::max(halfM[0], halfM[1]) * 2 / 25;
 		const int how = held ? 2 : focus ? 1 : 0;
-		if (c != lastC || slot != lastSlot || how != lastFocus || fabs(g[0] - lastG[0]) > tol || fabs(g[1] - lastG[1]) > tol || fabs(g[2] - lastG[2]) > tol) {
+		const bool moved = fabs(g[0] - lastG[0]) > tol || fabs(g[1] - lastG[1]) > tol || fabs(g[2] - lastG[2]) > tol;
+		if (c != lastC || slot != lastSlot || how != lastFocus || (moved && GetTickCount() - loggedAt >= 100)) {
 			lastC = c;
 			lastSlot = slot;
 			lastFocus = how;
+			loggedAt = GetTickCount();
 			memcpy(lastG, g, sizeof lastG);
-			// ZBrush's own depth (DepthAtDoc), for working out its units: at
-			// the middle (the median of the model's pixels within 10 document
-			// pixels) and over the model in the window.
-			char canvas[320] = "canvas depth not found";
-			double empty = 0;
-			if (DepthFound(empty)) {
-				std::vector<double> mid;
-				double lo = 1e300, hi = -1e300;
-				for (int dy = -10; dy <= 10; dy += 2)
-					for (int dx = -10; dx <= 10; dx += 2) {
-						double z;
-						if (DepthAtDoc(midX + dx, midY + dy, z) && !DepthSame(z, empty))
-							mid.push_back(z);
-					}
-				for (int y = vy0; y < vy1; y += 8)
-					for (int x = vx0; x < vx1; x += 8) {
-						double z;
-						if (DepthAtDoc(x / kp, y / kp, z) && !DepthSame(z, empty)) {
-							lo = std::min(lo, z);
-							hi = std::max(hi, z);
-						}
-					}
-				std::sort(mid.begin(), mid.end());
-				double pivot = 0;
-				const bool havePivot = PivotDepth(st, pivot);
-				snprintf(canvas, sizeof canvas, "canvas depth middle %.6g (%zu px), model %.6g to %.6g, empty %.6g, zoom %.5f, pivot %s%.6g; readings used %d, not covering %d, mid-draw %d",
-					mid.empty() ? 0.0 : mid[mid.size() / 2], mid.size(), lo, hi, empty, st.ratio, havePivot ? "" : "not found ", pivot,
-					gCanvasUsed, gCanvasUncovered, gCanvasDrawing);
-				gCanvasUsed = gCanvasUncovered = gCanvasDrawing = 0;
-			}
 			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
-				fprintf(f, "%lu   %s\n", GetTickCount(), canvas);
-				fprintf(f, "%lu multiview %d from %d: %s (%d cells), model point %.0f %.0f %.0f (far side %.0f), V centre %.0f %.0f half %.0f %.0f, scale %.3f, depth axis %d\n",
+				fprintf(f, "%lu multiview %d from %d: %s (%d cells), model point %.0f %.0f %.0f (front %.0f, thick %.0f), towards the camera %+.2f %+.2f %+.2f, V centre %.0f %.0f half %.0f %.0f, depth axis %d\n",
 					GetTickCount(), slot, c, held ? "surface held (none in reach)" : fromCanvas ? "surface from the canvas depth" : focus ? "surface from the silhouettes" : "band only",
-					samples, g[0], g[1], g[2], back,
-					centreV[0], centreV[1], halfV[0], halfV[1], k, depthAxis);
+					samples, g[0], g[1], g[2], front, thick, dc[2][0], dc[2][1], dc[2][2],
+					centreV[0], centreV[1], halfV[0], halfV[1], depthAxis);
 				fclose(f);
 			}
 		}
 	}
-	out.ratio = cs.ratio / k;
+	// Document pixels per V image pixel: the camera's per model unit, by V's
+	// model units per image pixel.
+	out.ratio = st.ratio * vf.f;
 	out.offX = out.offY = 0;
+	// ZBrush's camera can jump in a frame (a zoom step: build 175, 595 to 382,
+	// the cell 217 px; the model framed): a jump of the cell's middle by over
+	// half its window, or of its zoom by over 15%, is eased over about 150 ms
+	// like the depth's; moves smaller than that, as the view is panned, are
+	// followed as they are.
+	if (slot >= 0 && slot < kViewSlots) {
+		struct Eased { double x, y, logR; LARGE_INTEGER at; bool started, easing; };
+		static Eased eased[kViewSlots] = {};
+		Eased& e = eased[slot];
+		LARGE_INTEGER t, qf;
+		QueryPerformanceCounter(&t);
+		QueryPerformanceFrequency(&qf);
+		const double logR = log(out.ratio);
+		const bool jump = fabs(centreV[0] - e.x) > halfV[0] * 0.5 || fabs(centreV[1] - e.y) > halfV[1] * 0.5 || fabs(logR - e.logR) > log(1.15);
+		if (e.started && (e.easing || jump)) {
+			const double ms = std::min(33.0, 1000.0 * (t.QuadPart - e.at.QuadPart) / qf.QuadPart);
+			const double a = 1 - exp(-ms / 50.0);
+			e.x += (centreV[0] - e.x) * a;
+			e.y += (centreV[1] - e.y) * a;
+			e.logR += (logR - e.logR) * a;
+			e.easing = fabs(centreV[0] - e.x) > halfV[0] * 0.01 || fabs(centreV[1] - e.y) > halfV[1] * 0.01 || fabs(logR - e.logR) > 0.002;
+		} else {
+			e.easing = false;
+		}
+		if (!e.easing) {
+			e.x = centreV[0];
+			e.y = centreV[1];
+			e.logR = logR;
+		}
+		e.started = true;
+		e.at = t;
+		centreV[0] = e.x;
+		centreV[1] = e.y;
+		out.ratio = exp(e.logR);
+		if (e.easing) {
+			EnterCriticalSection(&gOverlayLock);
+			gRedrawPending = true;
+			LeaveCriticalSection(&gOverlayLock);
+		}
+	}
 	out.px = midX - out.ratio * (centreV[0] - out.ax);
 	out.py = midY - out.ratio * (centreV[1] - out.ay);
 	return true;
@@ -6838,29 +7026,21 @@ static bool DepthFromObjects(const OverlayState& st, const std::vector<DepthSamp
 {
 	const DWORD t0 = GetTickCount();
 	const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)), want = exe + kImageVtable;
-	std::vector<uintptr_t> images;
-	std::vector<unsigned char> buf(1 << 22);
-	MEMORY_BASIC_INFORMATION mbi;
-	size_t scanned = 0;
-	for (uintptr_t addr = 0; VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof mbi) == sizeof mbi;) {
-		const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress), next = base + mbi.RegionSize;
-		if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && (mbi.Protect & 0xff) == PAGE_READWRITE && !(mbi.Protect & PAGE_GUARD))
-			for (uintptr_t chunk = base; chunk < next; chunk += buf.size()) {
-				const size_t len = std::min<size_t>(buf.size(), next - chunk);
-				if (!ReadOwn(chunk, buf.data(), len))
-					continue;
-				scanned += len;
-				for (size_t i = 0; i + 8 <= len; i += 16) {
-					uintptr_t v;
-					memcpy(&v, &buf[i], 8);
-					if (v == want && ImagePixels(chunk + i, dw, dh))
-						images.push_back(chunk + i);
-				}
+	std::vector<std::vector<uintptr_t>> found(ScanWorkers());
+	const size_t scanned = ScanMemory(0,
+		[](const MEMORY_BASIC_INFORMATION& m) { return m.Type == MEM_PRIVATE && (m.Protect & 0xff) == PAGE_READWRITE; },
+		[&](int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t) {
+			for (size_t i = 0; i + 8 <= starts; i += 16) {
+				uintptr_t v;
+				memcpy(&v, &buf[i], 8);
+				if (v == want && ImagePixels(at + i, dw, dh))
+					found[w].push_back(at + i);
 			}
-		if (next <= addr)
-			break;
-		addr = next;
-	}
+		});
+	std::vector<uintptr_t> images;
+	for (const auto& f : found)
+		images.insert(images.end(), f.begin(), f.end());
+	std::sort(images.begin(), images.end());
 	gDepthImages.clear();
 	char line[300];
 	snprintf(line, sizeof line, "by ZBrush's image objects: %zu of the document's size in %zu MB, %lu ms", images.size(), scanned >> 20, GetTickCount() - t0);
@@ -7141,34 +7321,52 @@ static bool PivotDepth(const OverlayState& st, double& z)
 }
 
 // ---------------------------------------------------------------------------
-// The model's depth as the active view sees it, from ZBrush's finished frames
-// only, kept in that view's image space (where MultiviewLayout's centreC
-// is), so panning and zooming only change which part of it is looked up.
+// The model's surface, from ZBrush's finished frames only, kept as points in
+// model units (G: from the model's pivot along the model's axes, as the
+// canvas shows them at zoom 1), so the camera's pan, zoom and rotation only
+// change how it is looked up: from any angle, with or without an image for
+// the view the camera is in (builds 172-174 kept one view's image space, and
+// tracked only in a snapped view with an image).
 // ZBrush keeps two depth planes: it draws into one, part by part, almost all
 // the time the view moves, and copies a finished frame into the other, which
 // it clears as soon as it draws again (watching both from outside, 100 ms
-// apart). The two alike, with the model in them, is a finished frame: it is
-// taken into the map whole, every pixel, so the map holds the front surface
-// of all the model a finished frame has shown, and is refreshed by every
-// finished frame after (an edit included). Values: the model's front in
-// model units towards the camera, (pivot - depth) / zoom; kMapEmpty where a
-// finished frame showed no model; NaN never seen.
+// apart). The two alike, with the model in them, is a finished frame. Each
+// pixel of it is a point of the surface: (x - pivot x) / zoom along the
+// camera's right, (y - pivot y) / zoom along its down, (pivot depth - depth)
+// / zoom towards it. One point is kept a cell of kCloudCell model units,
+// the latest frame's; a point a finished frame shows in front of what it
+// sees, or where it sees no model, is gone (an edit, a part moved).
 // ---------------------------------------------------------------------------
-static const float kMapEmpty = -1e30f;
-struct DepthMap {
-	int view = -1;
-	double x0 = 0, y0 = 0, cell = 2;  // image point of cell (0, 0); image units a cell
-	int w = 0, h = 0;
-	std::vector<float> front;
-	std::vector<int> stamp;  // the frame that last wrote each cell
-	int frames = 0;
+struct CloudPoint {
+	uint64_t key;
+	float p[3];
 };
-static DepthMap gDepthMap;
+static std::vector<CloudPoint> gCloud;
+static std::unordered_map<uint64_t, uint32_t> gCloudAt;
+static const double kCloudCell = 2;
+static int gCloudVersion = 0;  // changes with every frame taken in
 
-// A finished frame of this view is in the map.
-static bool MapHas(int view)
+static bool CloudHas()
 {
-	return gDepthMap.view == view && gDepthMap.frames > 0;
+	return !gCloud.empty();
+}
+
+static uint64_t CloudKey(const double p[3])
+{
+	uint64_t k = 0;
+	for (int t = 0; t < 3; ++t)
+		k = k << 21 | (static_cast<uint64_t>(static_cast<int64_t>(floor(p[t] / kCloudCell)) + (1 << 20)) & 0x1FFFFF);
+	return k;
+}
+
+static void CloudErase(uint32_t i)
+{
+	gCloudAt.erase(gCloud[i].key);
+	if (i + 1 != gCloud.size()) {
+		gCloud[i] = gCloud.back();
+		gCloudAt[gCloud[i].key] = i;
+	}
+	gCloud.pop_back();
 }
 
 // The pivot depth, kept from its last read (the camera triplet runs a frame
@@ -7186,11 +7384,244 @@ static bool PivotKept(const OverlayState& st, double& pivot)
 	return have;
 }
 
-// Each overlay step: a finished frame, when there is a new one, into the map.
+static bool LiveCam(const OverlayState& st, const double d[3][3], Cam& c)
+{
+	memcpy(c.d, d, sizeof c.d);
+	c.px = st.px;
+	c.py = st.py;
+	c.r = st.ratio;
+	c.cx = st.docW * 0.5;
+	c.cy = st.docH * 0.5;
+	return PivotKept(st, c.pivot) && c.r > 0;
+}
+
+static void CamPoint(const Cam& c, double x, double y, double z, double g[3])
+{
+	CamUnproject(c, x, y, z, gInvD, g);
+}
+
+// A finished frame kept for measuring and rebuilding: its camera and its
+// depth plane at half size.
+struct FrameRec {
+	Cam cam;
+	float bg;
+	int w, h;  // the half-size plane's
+	std::vector<float> plane;
+	bool Model(int x, int y, float& v) const
+	{
+		if (x < 0 || y < 0 || x >= w || y >= h)
+			return false;
+		v = plane[static_cast<size_t>(y) * w + x];
+		return v != bg && fabs(v) < 1e6;
+	}
+	bool Inside(double x, double y) const
+	{
+		return x >= 0 && y >= 0 && x < 2 * w && y < 2 * h;
+	}
+};
+static std::vector<FrameRec> gFrames;  // at most kFrames, from different angles
+static const size_t kFrames = 6;
+
+// A frame into the points: those it shows to be gone (where it sees no
+// model, or in front of the surface it sees, by more than a cell) out, then
+// its own in. Counts for the log. A frame that finds over a quarter of the
+// points it sees gone (at least 2000 seen) is out of step with the camera
+// read with it and is not taken: false. (Build 179 took a frame of two
+// cleared planes, alike and empty, during a turn, and lost 27025 points.)
+static bool CloudIngest(const FrameRec& f, size_t& added, size_t& gone, size_t& modelPx)
+{
+	added = gone = modelPx = 0;
+	const Cam& c = f.cam;
+	auto goneAt = [&](uint32_t i, bool& seen) {
+		double x, y, z;
+		seen = CamProject(c, gCloud[i].p, gInvD, x, y, z) && f.Inside(x, y);
+		if (!seen)
+			return false;
+		float v;
+		const bool model = f.Model(static_cast<int>(x / 2), static_cast<int>(y / 2), v);
+		return !model || z > gDepthK * (c.pivot - v) / c.r + 2 * kCloudCell;
+	};
+	size_t seenCount = 0, goneCount = 0;
+	for (uint32_t i = 0; i < gCloud.size(); ++i) {
+		bool seen;
+		goneCount += goneAt(i, seen);
+		seenCount += seen;
+	}
+	if (seenCount >= 2000 && goneCount * 4 > seenCount) {
+		gone = goneCount;
+		return false;
+	}
+	for (uint32_t i = 0; i < gCloud.size();) {
+		bool seen;
+		if (goneAt(i, seen)) {
+			CloudErase(i);
+			++gone;
+		} else {
+			++i;
+		}
+	}
+	// Every half-size pixel, or every few when a cell spans several.
+	const int step = std::max(1, static_cast<int>(kCloudCell * c.r / 4));
+	for (int y = 0; y < f.h; y += step)
+		for (int x = 0; x < f.w; x += step) {
+			float v;
+			if (!f.Model(x, y, v))
+				continue;
+			++modelPx;
+			double p[3];
+			CamUnproject(c, 2 * x + 1, 2 * y + 1, gDepthK * (c.pivot - v) / c.r, gInvD, p);
+			const uint64_t k = CloudKey(p);
+			const auto it = gCloudAt.find(k);
+			CloudPoint* cp;
+			if (it != gCloudAt.end()) {
+				cp = &gCloud[it->second];
+			} else {
+				gCloudAt[k] = static_cast<uint32_t>(gCloud.size());
+				gCloud.push_back({k, {0, 0, 0}});
+				cp = &gCloud.back();
+				++added;
+			}
+			for (int t = 0; t < 3; ++t)
+				cp->p[t] = static_cast<float>(p[t]);
+		}
+	modelPx *= static_cast<size_t>(step) * step * 4;
+	return true;
+}
+
+// The share of frame a's points (a sample) that frame b, at an angle to it,
+// sees as impossible: where b sees no model, or in front of b's surface by
+// more than a cell and a half. Behind b's surface is fine (hidden).
+static double FrameDisagree(const FrameRec& a, const FrameRec& b, double k, double invD)
+{
+	int tested = 0, bad = 0;
+	for (int y = 1; y < a.h; y += 4)
+		for (int x = 1; x < a.w; x += 4) {
+			float v;
+			if (!a.Model(x, y, v) || !a.Model(x - 1, y, v) || !a.Model(x + 1, y, v) || !a.Model(x, y - 1, v) || !a.Model(x, y + 1, v))
+				continue;  // off the outline, where a pixel either way is not the model's
+			a.Model(x, y, v);
+			double g[3];
+			CamUnproject(a.cam, 2 * x + 1, 2 * y + 1, k * (a.cam.pivot - v) / a.cam.r, invD, g);
+			const float gf[3] = {static_cast<float>(g[0]), static_cast<float>(g[1]), static_cast<float>(g[2])};
+			double bx, by, bz;
+			if (!CamProject(b.cam, gf, invD, bx, by, bz) || !b.Inside(bx, by))
+				continue;
+			++tested;
+			float w;
+			if (!b.Model(static_cast<int>(bx / 2), static_cast<int>(by / 2), w) || bz > k * (b.cam.pivot - w) / b.cam.r + 3 * kCloudCell)
+				++bad;
+		}
+	return tested >= 200 ? static_cast<double>(bad) / tested : -1;
+}
+
+// The depth scale and perspective that make the kept frames agree best,
+// over every pair 20 degrees or more apart. True when they changed.
+static bool CloudCalibrate()
+{
+	std::vector<std::pair<size_t, size_t>> pairs;
+	for (size_t i = 0; i < gFrames.size(); ++i)
+		for (size_t j = 0; j < gFrames.size(); ++j) {
+			const double* a = gFrames[i].cam.d[2];
+			const double* b = gFrames[j].cam.d[2];
+			if (i != j && a[0] * b[0] + a[1] * b[1] + a[2] * b[2] < cos(20 * 3.14159265358979 / 180))
+				pairs.push_back({i, j});
+		}
+	if (pairs.empty())
+		return false;
+	static const double kInvD[] = {0, 1.0 / 8000, 1.0 / 4000, 1.0 / 2500, 1.0 / 1800, 1.0 / 1400, 1.0 / 1100, 1.0 / 900, 1.0 / 700, 1.0 / 550};
+	const DWORD t0 = GetTickCount();
+	double best = 2, bestK = gDepthK, bestInvD = gInvD, flat = -1;
+	char table[1200] = "";
+	for (double invD : kInvD) {
+		double rowBest = 2, rowK = 0;
+		for (int ki = 0; ki <= 16; ++ki) {
+			const double k = 0.8 + 0.025 * ki;
+			double sum = 0;
+			int n = 0;
+			for (const auto& p : pairs) {
+				const double e = FrameDisagree(gFrames[p.first], gFrames[p.second], k, invD);
+				if (e >= 0) {
+					sum += e;
+					++n;
+				}
+			}
+			if (n == 0)
+				continue;
+			const double e = sum / n;
+			if (invD == 0 && ki == 8)
+				flat = e;
+			if (e < rowBest) {
+				rowBest = e;
+				rowK = k;
+			}
+			if (e < best) {
+				best = e;
+				bestK = k;
+				bestInvD = invD;
+			}
+		}
+		const size_t len = strlen(table);
+		snprintf(table + len, sizeof table - len, " [eye %s%.0f: depth x%.3f, %.1f%%]", invD ? "at " : "flat", invD ? 1 / invD : 0, rowK, 100 * rowBest);
+	}
+	if (best > 1)
+		return false;
+	// Depth as read, flat, unless something is clearly better (half a point):
+	// with every setting alike (build 179, two frames barely overlapping, 0%
+	// everywhere) the first tried, depth x0.8, was taken.
+	if (flat >= 0 && best >= flat - 0.005) {
+		best = flat;
+		bestK = 1;
+		bestInvD = 0;
+	}
+	const bool changed = fabs(bestK - gDepthK) > 1e-6 || fabs(bestInvD - gInvD) > 1e-9;
+	char line[1500];
+	snprintf(line, sizeof line, "frames measured (%zu, %zu pairs, %lu ms): depth x%.3f, eye %s%.0f, %.1f%% of points impossible (%.1f%% as taken before);%s", gFrames.size(), pairs.size(),
+		GetTickCount() - t0, bestK, bestInvD ? "at " : "flat", bestInvD ? 1 / bestInvD : 0, 100 * best, 100 * flat, table);
+	DepthLog(line);
+	gDepthK = bestK;
+	gInvD = bestInvD;
+	return changed;
+}
+
+// Each overlay step: a finished frame, when there is a new one, into the
+// points; and the cells laid out again when the camera turns (the layout is
+// otherwise asked for only when the pan or zoom changes).
 static void DepthMapStep(const OverlayState& st)
 {
-	const int c = gActiveView;
-	if (!gDepth.image || gDepthImages.size() < 2 || c < 0 || c >= kDefaultView || !gViews[c].used || st.ratio <= 0)
+	double d[3][3];
+	if (!CameraAxes(d)) {
+		const int c = gActiveView;
+		if (c < 0 || c >= kDefaultView || gViewAway)
+			return;
+		ViewAxes(c, d);
+	}
+	// The camera still for a quarter second before a frame is taken: ZBrush
+	// moves its camera before it starts drawing, and a frame read in that gap
+	// is the old view under the new camera (build 181: the first frame, read
+	// 360 ms into a pan, went in where nothing could check it, and every
+	// right frame after it was turned down as out of step).
+	static DWORD cameraMovedAt = 0;
+	{
+		static double lastD[3][3] = {}, lastCam[3] = {};
+		bool turned = false;
+		for (int i = 0; i < 3; ++i)
+			for (int j = 0; j < 3; ++j)
+				turned = turned || fabs(d[i][j] - lastD[i][j]) > 1e-4;
+		const bool moved = st.px != lastCam[0] || st.py != lastCam[1] || st.ratio != lastCam[2];
+		if (turned || moved) {
+			memcpy(lastD, d, sizeof lastD);
+			lastCam[0] = st.px;
+			lastCam[1] = st.py;
+			lastCam[2] = st.ratio;
+			cameraMovedAt = GetTickCount();
+		}
+		if (turned) {
+			EnterCriticalSection(&gOverlayLock);
+			gRedrawPending = true;
+			LeaveCriticalSection(&gOverlayLock);
+		}
+	}
+	if (!gDepth.image || gDepthImages.size() < 2 || st.ratio <= 0 || GetTickCount() - cameraMovedAt < 250)
 		return;
 	const int w = gDepth.w, h = gDepth.h;
 	const uintptr_t a = ImagePixels(gDepthImages[0].first, w, h), b = ImagePixels(gDepthImages[1].first, w, h);
@@ -7234,10 +7665,8 @@ static void DepthMapStep(const OverlayState& st)
 			bg = s[i];
 		}
 	}
-	OverlayState cs;
-	std::string path;
 	double pivot;
-	if (!PivotKept(st, pivot) || !ViewLayout(c, st, cs, path) || cs.ratio <= 0)
+	if (!PivotKept(st, pivot))
 		return;
 	// The same frame as last time, seen again: nothing new.
 	uint64_t key = 1469598103934665603ull;
@@ -7247,130 +7676,228 @@ static void DepthMapStep(const OverlayState& st)
 	};
 	for (size_t i = 0; i < n; i += 61)
 		mix(&planeA[i], 4);
-	const double cam[6] = {cs.px, cs.py, cs.ratio, cs.offX, cs.offY, pivot};
+	const double cam[4] = {st.px, st.py, st.ratio, pivot};
 	mix(cam, sizeof cam);
-	mix(&c, sizeof c);
+	mix(d, sizeof d);
 	static uint64_t lastKey = 0;
 	if (key == lastKey)
 		return;
 	lastKey = key;
-	DepthMap& m = gDepthMap;
-	if (m.view != c || m.front.empty()) {
-		m.view = c;
-		m.cell = 2;
-		m.w = static_cast<int>(3 * st.docW / m.cell);
-		m.h = static_cast<int>(3 * st.docH / m.cell);
-		m.x0 = cs.ax - 1.5 * st.docW;
-		m.y0 = cs.ay - 1.5 * st.docH;
-		m.front.assign(static_cast<size_t>(m.w) * m.h, std::numeric_limits<float>::quiet_NaN());
-		m.stamp.assign(static_cast<size_t>(m.w) * m.h, 0);
-		m.frames = 0;
+	// Kept at half size: the frame from this angle (within 20 degrees) it
+	// replaces, else a new angle, the oldest dropped past kFrames.
+	FrameRec f;
+	memcpy(f.cam.d, d, sizeof d);
+	f.cam.px = st.px;
+	f.cam.py = st.py;
+	f.cam.r = st.ratio;
+	f.cam.pivot = pivot;
+	f.cam.cx = w * 0.5;
+	f.cam.cy = h * 0.5;
+	f.bg = bg;
+	f.w = w / 2;
+	f.h = h / 2;
+	f.plane.resize(static_cast<size_t>(f.w) * f.h);
+	for (int y = 0; y < f.h; ++y)
+		for (int x = 0; x < f.w; ++x)
+			f.plane[static_cast<size_t>(y) * f.w + x] = planeA[static_cast<size_t>(2 * y + 1) * w + 2 * x + 1];
+	// No model in it (ZBrush clears both planes when a turn starts, and two
+	// cleared planes are alike too): not a finished frame.
+	size_t modelHalf = 0;
+	for (float v : f.plane)
+		modelHalf += v != bg && fabs(v) < 1e6;
+	if (modelHalf < 200)
+		return;
+	size_t added = 0, gone = 0, modelPx = 0;
+	static int rejected = 0;
+	if (!CloudIngest(f, added, gone, modelPx)) {
+		// Three in a row: the points are what is out of step (the model
+		// replaced, say), and start again from this frame.
+		const bool restart = ++rejected >= 3;
+		char line[200];
+		snprintf(line, sizeof line, "finished frame %s: it finds %zu of the points it sees gone", restart ? "taken alone, the points started again" : "not taken (out of step with the camera)", gone);
+		DepthLog(line);
+		if (!restart)
+			return;
+		gCloud.clear();
+		gCloudAt.clear();
+		gFrames.clear();
+		CloudIngest(f, added, gone, modelPx);
 	}
-	++m.frames;
-	// Every document pixel, or every few when a cell spans several.
-	const int step = std::max(1, static_cast<int>(m.cell * cs.ratio / 2));
-	size_t modelPx = 0;
-	for (int y = 0; y < h; y += step)
-		for (int x = 0; x < w; x += step) {
-			const double u = (x - cs.px) / cs.ratio + cs.ax + cs.offX, v = (y - cs.py) / cs.ratio + cs.ay + cs.offY;
-			const int i = static_cast<int>(floor((u - m.x0) / m.cell)), j = static_cast<int>(floor((v - m.y0) / m.cell));
-			if (i < 0 || j < 0 || i >= m.w || j >= m.h)
-				continue;
-			const size_t k = static_cast<size_t>(j) * m.w + i;
-			const float d = planeA[static_cast<size_t>(y) * w + x];
-			const bool fresh = m.stamp[k] != m.frames;
-			if (d != bg && fabs(d) < 1e6) {
-				const float f = static_cast<float>((pivot - d) / st.ratio);
-				if (fresh || !(m.front[k] >= f))  // the nearest in the cell
-					m.front[k] = f;
-				++modelPx;
-			} else if (fresh) {
-				m.front[k] = kMapEmpty;
-			}
-			m.stamp[k] = m.frames;
+	rejected = 0;
+	bool newAngle = true;
+	for (size_t i = 0; i < gFrames.size(); ++i) {
+		const double* a = gFrames[i].cam.d[2];
+		if (a[0] * d[2][0] + a[1] * d[2][1] + a[2] * d[2][2] >= cos(20 * 3.14159265358979 / 180)) {
+			gFrames.erase(gFrames.begin() + i);
+			newAngle = false;
+			break;
 		}
+	}
+	// Each kept frame saved for working out offline how the planes, the
+	// pivot and the rotation fit (build 177: the best depth scale and
+	// perspective still left 34-62% of points impossible between angles):
+	// JRef_Data\frames\frame<n>.txt, the camera and every value it was taken
+	// from, and frame<n>.bin, the half-size plane.
+	{
+		static int saved = 0;
+		const std::wstring dir = DataFolder() + L"frames\\";
+		CreateDirectoryW(dir.c_str(), nullptr);
+		const int n = saved++ % 16;
+		if (FILE* t = _wfopen((dir + L"frame" + std::to_wstring(n) + L".txt").c_str(), L"wb")) {
+			fprintf(t, "tick %lu\nsize %d %d\nempty %.9g\npivot %.9g\nzoom %.9g\npos %.9g %.9g\ncentre %.9g %.9g\ndoc %.9g %.9g\noff %.9g %.9g\nanchorscale %.9g\n",
+				now, f.w, f.h, f.bg, pivot, st.ratio, st.px, st.py, f.cam.cx, f.cam.cy, st.docW, st.docH, st.offX, st.offY, gAnchorScale);
+			fprintf(t, "axes %.9g %.9g %.9g  %.9g %.9g %.9g  %.9g %.9g %.9g\n", d[0][0], d[0][1], d[0][2], d[1][0], d[1][1], d[1][2], d[2][0], d[2][1], d[2][2]);
+			if (gTripletInUse >= 0 && gTripletInUse < static_cast<int>(gTriplets.size())) {
+				const MemTriplet& tr = gTriplets[gTripletInUse];
+				float v[8] = {};
+				ReadOwn(tr.x.addr - 16, v, sizeof v);
+				fprintf(t, "triplet x at %p, scale at %+lld: around x", reinterpret_cast<void*>(tr.x.addr), static_cast<long long>(tr.s.addr) - static_cast<long long>(tr.x.addr));
+				for (float a : v)
+					fprintf(t, " %.9g", a);
+				fprintf(t, "\n");
+			}
+			RotDump(t);
+			fclose(t);
+		}
+		if (FILE* b = _wfopen((dir + L"frame" + std::to_wstring(n) + L".bin").c_str(), L"wb")) {
+			fwrite(f.plane.data(), 4, f.plane.size(), b);
+			fclose(b);
+		}
+	}
+	gFrames.push_back(std::move(f));
+	if (gFrames.size() > kFrames)
+		gFrames.erase(gFrames.begin());
+	if (newAngle && CloudCalibrate()) {
+		// Measured again: every kept frame in again, oldest first.
+		gCloud.clear();
+		gCloudAt.clear();
+		for (const FrameRec& k : gFrames)
+			CloudIngest(k, added, gone, modelPx);
+	}
+	++gCloudVersion;
 	static DWORD lastLog = 0;
 	if (now - lastLog > 5000) {
 		lastLog = now;
-		char line[200];
-		snprintf(line, sizeof line, "finished frame %d into view %d's map: %zu model pixels, empty %g, pivot %.3f, zoom %.5f", m.frames, c, modelPx * step * step, bg, pivot, st.ratio);
+		char line[300];
+		snprintf(line, sizeof line, "finished frame into the model's points: %zu model pixels, %zu points new, %zu gone, %zu in all, %zu angles kept; empty %g, pivot %.3f, zoom %.5f, towards the camera %+.3f %+.3f %+.3f",
+			modelPx, added, gone, gCloud.size(), gFrames.size(), bg, pivot, st.ratio, d[2][0], d[2][1], d[2][2]);
 		DepthLog(line);
 	}
-	// The cell is laid out again with it.
+	// The cells are laid out again with it.
 	EnterCriticalSection(&gOverlayLock);
 	gRedrawPending = true;
 	LeaveCriticalSection(&gOverlayLock);
 }
 
-// The surface round an image point of a view, from its map, as CanvasDepth
-// read it from the plane: the model's front within reach, averaged with
-// weights falling smoothly to nothing at the reach; thick, the median width
-// of the model's runs across the rows within half the reach, standing in for
-// the part's thickness. In image (model) units. False with fewer than 10
-// cells of the model in reach.
-static bool MapDepth(int view, const double centre[2], double reach, double& front, double& thick, int& samples)
+// The surface round the camera's ray through a document point (x, y), from
+// the points: each point seen from the camera (Cam, with the measured depth
+// scale and perspective), the nearest in each bin of a grid round the point
+// (bins in model units at the pivot's depth), then the bins within reach
+// averaged with weights falling smoothly to nothing at the reach; thick, the
+// width of the model's runs across the rows within reach, weighted the same
+// way (a row whose run changes part, an arm crossing it, moves it by its
+// small share: build 172's median of 7 rows moved the cell 50 px for 20 px
+// of panning), standing in for the part's thickness. In model units,
+// front towards the camera. False with fewer than 10 bins of the model in
+// reach. The last answer is kept for the same question (each cell asks).
+static bool CloudDepth(const Cam& c, double qx, double qy, double reach, double& front, double& thick, int& samples)
 {
 	samples = 0;
 	thick = 0;
-	const DepthMap& m = gDepthMap;
-	if (m.view != view || m.front.empty() || reach <= 0)
+	if (gCloud.empty() || reach <= 0 || c.r <= 0)
 		return false;
-	auto at = [&](double u, double v, float& f) {
-		const int i = static_cast<int>(floor((u - m.x0) / m.cell)), j = static_cast<int>(floor((v - m.y0) / m.cell));
-		if (i < 0 || j < 0 || i >= m.w || j >= m.h)
-			return false;
-		f = m.front[static_cast<size_t>(j) * m.w + i];
-		return f == f && f != kMapEmpty;
-	};
-	const double step = std::max(m.cell, reach / 12);
-	double sum = 0, weights = 0;
-	for (double dy = -reach; dy <= reach; dy += step)
-		for (double dx = -reach; dx <= reach; dx += step) {
-			const double d2 = (dx * dx + dy * dy) / (reach * reach);
-			float f;
-			if (d2 >= 1 || !at(centre[0] + dx, centre[1] + dy, f))
+	static double lastQ[18] = {};
+	static int lastVersion = -1, lastSamples = 0;
+	static double lastFront = 0, lastThick = 0;
+	static bool lastOk = false;
+	const double q[18] = {qx, qy, reach, c.px, c.py, c.r, c.cx, c.cy, gInvD, c.d[0][0], c.d[0][1], c.d[0][2], c.d[1][0], c.d[1][1], c.d[1][2], c.d[2][0], c.d[2][1], c.d[2][2]};
+	if (lastVersion == gCloudVersion && !memcmp(q, lastQ, sizeof q)) {
+		front = lastFront;
+		thick = lastThick;
+		samples = lastSamples;
+		return lastOk;
+	}
+	memcpy(lastQ, q, sizeof q);
+	lastVersion = gCloudVersion;
+	const double b = std::max(kCloudCell, reach / 12);
+	const int nu = static_cast<int>(ceil(3 * reach / b)), nv = static_cast<int>(ceil(reach / b));
+	const int gw = 2 * nu + 1, gh = 2 * nv + 1;
+	// The points in bands, one per core, each into its own grid (up to 180,000
+	// points with six angles kept, every layout the camera moves).
+	static std::vector<float> grid;
+	static std::vector<std::vector<float>> bandGrids;
+	const size_t cells = static_cast<size_t>(gw) * gh;
+	grid.assign(cells, -1e30f);
+	const int n = static_cast<int>(gCloud.size());
+	const int bands = std::max(1, std::min(ScanWorkers(), n / 8192));
+	bandGrids.resize(bands);
+	concurrency::parallel_for(0, bands, [&](int band) {
+		std::vector<float>& bg = bandGrids[band];
+		bg.assign(cells, -1e30f);
+		for (int k = n * band / bands, end = n * (band + 1) / bands; k < end; ++k) {
+			double x, y, z;
+			if (!CamProject(c, gCloud[k].p, gInvD, x, y, z))
 				continue;
-			const double wgt = (1 - d2) * (1 - d2);
-			sum += wgt * f;
+			const double su = (x - qx) / c.r, sv = (y - qy) / c.r;
+			if (fabs(su) > 3 * reach || fabs(sv) > reach)
+				continue;
+			const long i = lround(su / b) + nu, j = lround(sv / b) + nv;
+			if (i < 0 || j < 0 || i >= gw || j >= gh)
+				continue;
+			const float f = static_cast<float>(z);
+			float& cell = bg[static_cast<size_t>(j) * gw + i];
+			cell = std::max(cell, f);
+		}
+	});
+	for (const auto& bg : bandGrids)
+		for (size_t k = 0; k < cells; ++k)
+			grid[k] = std::max(grid[k], bg[k]);
+	auto at = [&](int i, int j) { return i >= 0 && j >= 0 && i < gw && j < gh && grid[static_cast<size_t>(j) * gw + i] > -1e29f; };
+	double sum = 0, weights = 0;
+	for (int j = 0; j < gh; ++j)
+		for (int i = 0; i < gw; ++i) {
+			const double du = (i - nu) * b, dv = (j - nv) * b, r2 = (du * du + dv * dv) / (reach * reach);
+			if (r2 >= 1 || !at(i, j))
+				continue;
+			const double wgt = (1 - r2) * (1 - r2);
+			sum += wgt * grid[static_cast<size_t>(j) * gw + i];
 			weights += wgt;
 			++samples;
 		}
-	if (samples < 10 || weights <= 0)
+	lastOk = samples >= 10 && weights > 0;
+	lastSamples = samples;
+	if (!lastOk)
 		return false;
 	front = sum / weights;
-	// Every row within reach, a cell apart, each with the same weight as the
-	// depth's, falling to nothing at the reach: a row whose run changes part
-	// (an arm crossing it) moves the width by its small share, where the
-	// median of 7 rows let one row move it whole (build 172: the far side
-	// 207, then 90, the cell 50 px for 20 px of panning).
-	float f;
 	double runSum = 0, runWeights = 0;
-	for (double dy = -reach; dy <= reach; dy += m.cell) {
-		const double wgt = (1 - dy * dy / (reach * reach)) * (1 - dy * dy / (reach * reach));
-		if (wgt <= 0)
+	for (int j = 0; j < gh; ++j) {
+		const double dv = (j - nv) * b, wgt = (1 - dv * dv / (reach * reach)) * (1 - dv * dv / (reach * reach));
+		if (wgt <= 0 || fabs(dv) >= reach)
 			continue;
-		for (double r = 0; r <= reach; r += m.cell) {
-			bool found = false;
-			for (int side : {-1, 1}) {
-				const double u = centre[0] + side * r, v = centre[1] + dy;
-				if (!at(u, v, f))
-					continue;
-				double lo = u, hi = u;
-				while (hi - lo < 8 * reach && at(lo - m.cell, v, f))
-					lo -= m.cell;
-				while (hi - lo < 8 * reach && at(hi + m.cell, v, f))
-					hi += m.cell;
-				runSum += wgt * (hi - lo + m.cell);
-				runWeights += wgt;
-				found = true;
-				break;
-			}
-			if (found)
-				break;
+		// The run through the model bin nearest the ray's column.
+		for (int r = 0; r <= nv; ++r) {
+			int hit = -1;
+			if (at(nu - r, j))
+				hit = nu - r;
+			else if (at(nu + r, j))
+				hit = nu + r;
+			if (hit < 0)
+				continue;
+			int lo = hit, hi = hit;
+			while (at(lo - 1, j))
+				--lo;
+			while (at(hi + 1, j))
+				++hi;
+			runSum += wgt * (hi - lo + 1) * b;
+			runWeights += wgt;
+			break;
 		}
 	}
 	if (runWeights > 0)
 		thick = runSum / runWeights;
+	front = sum / weights;
+	lastFront = front;
+	lastThick = thick;
 	return true;
 }
 
@@ -7717,92 +8244,96 @@ static void RotScan(const double* deg)
 	gRotCands.clear();
 	gRotNarrowings = 0;
 	const DWORD t0 = GetTickCount();
-	HMODULE self = nullptr;
-	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-		reinterpret_cast<LPCWSTR>(&RotScan), &self);
-	const NT_TIB* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
-	const uintptr_t stackLow = reinterpret_cast<uintptr_t>(tib->StackLimit) & ~static_cast<uintptr_t>(0xfffff);
-	const uintptr_t stackHigh = reinterpret_cast<uintptr_t>(tib->StackBase);
-	std::vector<unsigned char> buf(1 << 22);
-	const uintptr_t bufLo = reinterpret_cast<uintptr_t>(buf.data()), bufHi = bufLo + buf.size();
-	const size_t overlap = 11 * 8;
-	size_t scanned = 0, rows = 0;
-	MEMORY_BASIC_INFORMATION mbi;
-	uintptr_t addr = 0;
-	while (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == sizeof(mbi)) {
-		const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-		const uintptr_t next = base + mbi.RegionSize;
-		const DWORD prot = mbi.Protect & 0xff;
-		const bool writable = prot == PAGE_READWRITE || prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READWRITE;
-		if (mbi.State == MEM_COMMIT && writable && !(mbi.Protect & PAGE_GUARD) &&
-			(mbi.Type == MEM_PRIVATE || mbi.Type == MEM_IMAGE) && mbi.AllocationBase != self &&
-			!(stackLow < next && base < stackHigh) && !OwnThreadStack(base, next)) {
-			for (uintptr_t chunk = base; chunk < next; chunk += buf.size() - overlap) {
-				const size_t len = next - chunk < buf.size() ? next - chunk : buf.size();
-				SIZE_T got = 0;
-				if (chunk < bufHi && bufLo < chunk + len)
+	const size_t kMax = 200000;
+	const int workers = ScanWorkers();
+	std::vector<std::vector<RotCand>> found(workers);
+	std::vector<size_t> rowsBy(workers);
+	std::vector<std::vector<float>> normsF(workers);
+	std::vector<std::vector<double>> normsD(workers);
+	const size_t scanned = ScanMemory(11 * 8, CameraRegion, [&](int w, uintptr_t at, const unsigned char* buf, size_t starts, size_t got) {
+		std::vector<RotCand>& out = found[w];
+		size_t rows = 0;
+		// The squared length of the three values from every position, as
+		// floats and as doubles, in plain loops the compiler does several at
+		// a time; the quick tests below then only compare (build 183 worked
+		// each out per position and type: most of the scan's time). A 4 KB
+		// block at a time, so the lengths stay in the core's cache (build
+		// 184 did the whole 4 MB piece first, and wrote and read back 8 MB
+		// more per piece than it scanned: 1.5 s against 183's 1.0 s).
+		const size_t cf = got / 4, cd = got / 8;
+		std::vector<float>& nf = normsF[w];
+		std::vector<double>& nd = normsD[w];
+		nf.resize(cf);
+		nd.resize(cd);
+		const float* fv = reinterpret_cast<const float*>(buf);
+		const double* dv = reinterpret_cast<const double*>(buf);
+		const size_t kBlock = 4096;
+		for (size_t i = 0; i < starts && i + 11 * 4 <= got; i += 4) {
+			if (i % kBlock == 0) {
+				// Lengths for this block's positions and the 4 rows past it.
+				const size_t fEnd = std::min(cf >= 2 ? cf - 2 : 0, (i + kBlock) / 4 + 4);
+				const size_t dEnd = std::min(cd >= 2 ? cd - 2 : 0, (i + kBlock) / 8 + 4);
+				for (size_t k = i / 4; k < fEnd; ++k)
+					nf[k] = fv[k] * fv[k] + fv[k + 1] * fv[k + 1] + fv[k + 2] * fv[k + 2];
+				for (size_t k = i / 8; k < dEnd; ++k)
+					nd[k] = dv[k] * dv[k] + dv[k + 1] * dv[k + 1] + dv[k + 2] * dv[k + 2];
+			}
+			for (int isDouble = 0; isDouble < 2; ++isDouble) {
+				const size_t sz = isDouble ? 8 : 4;
+				if (isDouble && (i % 8 != 0 || i + 11 * 8 > got))
 					continue;
-				if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(chunk), buf.data(), len, &got))
+				// Quick tests first: the first row has a sensible length, and
+				// the second row the same length (Unscale's test without the
+				// square roots; most memory fails it, and the full test on
+				// every sensible row was most of the scan's time).
+				const size_t k = i / sz;
+				const double n0 = isDouble ? nd[k] : nf[k];
+				if (!(n0 > 1e-12 && n0 < 1e18))
 					continue;
-				scanned += got;
-				for (size_t i = 0; i + 11 * 4 <= got; i += 4) {
-					for (int isDouble = 0; isDouble < 2; ++isDouble) {
-						const size_t sz = isDouble ? 8 : 4;
-						if (isDouble && (i % 8 != 0 || i + 11 * 8 > got))
-							continue;
-						// Quick test first: the first row has a sensible length.
-						double r0[3];
-						for (int c = 0; c < 3; ++c) {
-							if (isDouble) {
-								memcpy(&r0[c], &buf[i + c * sz], 8);
-							} else {
-								float f;
-								memcpy(&f, &buf[i + c * sz], 4);
-								r0[c] = f;
-							}
-						}
-						const double n0 = r0[0] * r0[0] + r0[1] * r0[1] + r0[2] * r0[2];
-						if (!(n0 > 1e-12 && n0 < 1e18))
-							continue;
-						++rows;
-						for (int stride = 3; stride <= 4; ++stride) {
-							if (i + static_cast<size_t>(2 * stride + 3) * sz > got)
-								continue;
-							double m[9];
-							RotFromBytes(&buf[i], isDouble != 0, stride, m);
-							if (!Unscale(m) || !IsRotation(m) || RotCode(m) >= 0 || gRotCands.size() >= 200000)
-								continue;
-							// With any axis flipped (a copy may be in screen
-							// coordinates), its diagonal entries change sign.
-							bool angle = false;
-							for (int flips = 0; flips < 8 && !angle; ++flips) {
-								const double tr = (flips & 1 ? -m[0] : m[0]) + (flips & 2 ? -m[4] : m[4]) + (flips & 4 ? -m[8] : m[8]);
-								for (double t : traces)
-									if (fabs(tr - t) < 3e-3)
-										angle = true;
-							}
-							if (!angle)
-								continue;
-							double raw[9];
-							RotFromBytes(&buf[i], isDouble != 0, stride, raw);
-							RotCand c = {chunk + i, isDouble != 0, stride, {}, 0, {}, fabs(sqrt(raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]) - 1) < 2e-3, {}, {}, -1};
-							memcpy(c.m, m, sizeof(m));
-							memcpy(c.m1, m, sizeof(m));
-							gRotCands.push_back(c);
-						}
+				++rows;
+				for (int stride = 3; stride <= 4; ++stride) {
+					if (i + static_cast<size_t>(2 * stride + 3) * sz > got || out.size() >= kMax)
+						continue;
+					const double n1 = isDouble ? nd[k + stride] : nf[k + stride];
+					if (!(fabs(n1 / n0 - 1) <= 4.1e-3))
+						continue;
+					double m[9];
+					RotFromBytes(&buf[i], isDouble != 0, stride, m);
+					if (!Unscale(m) || !IsRotation(m) || RotCode(m) >= 0)
+						continue;
+					// With any axis flipped (a copy may be in screen
+					// coordinates), its diagonal entries change sign.
+					bool angle = false;
+					for (int flips = 0; flips < 8 && !angle; ++flips) {
+						const double tr = (flips & 1 ? -m[0] : m[0]) + (flips & 2 ? -m[4] : m[4]) + (flips & 4 ? -m[8] : m[8]);
+						for (double t : traces)
+							if (fabs(tr - t) < 3e-3)
+								angle = true;
 					}
+					if (!angle)
+						continue;
+					double raw[9];
+					RotFromBytes(&buf[i], isDouble != 0, stride, raw);
+					RotCand c = {at + i, isDouble != 0, stride, {}, 0, {}, fabs(sqrt(raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]) - 1) < 2e-3, {}, {}, -1};
+					memcpy(c.m, m, sizeof(m));
+					memcpy(c.m1, m, sizeof(m));
+					out.push_back(c);
 				}
-				if (len < buf.size())
-					break;
 			}
 		}
-		if (next <= addr)
-			break;
-		addr = next;
+		rowsBy[w] += rows;
+	});
+	size_t rows = 0;
+	for (int w = 0; w < workers; ++w) {
+		rows += rowsBy[w];
+		for (size_t k = 0; k < found[w].size() && gRotCands.size() < kMax; ++k)
+			gRotCands.push_back(found[w][k]);
 	}
+	// In address order, as one pass over memory found them.
+	std::sort(gRotCands.begin(), gRotCands.end(), [](const RotCand& a, const RotCand& b) { return a.addr < b.addr; });
 	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
-		fprintf(f, "%lu rotation matrix scan: %zu MB in %lu ms, %zu rows tried, %zu rotations by this angle found%s\n", GetTickCount(),
-			scanned >> 20, GetTickCount() - t0, rows, gRotCands.size(), gRotCands.size() >= 200000 ? " (FULL)" : "");
+		fprintf(f, "%lu rotation matrix scan: %zu MB in %lu ms on %d cores, %zu rows tried, %zu rotations by this angle found%s\n", GetTickCount(),
+			scanned >> 20, GetTickCount() - t0, workers, rows, gRotCands.size(), gRotCands.size() >= kMax ? " (FULL)" : "");
 		fclose(f);
 	}
 }
@@ -7838,6 +8369,81 @@ static void RotApply(int rel, const double* m, double* out)
 			const double s1 = (rel >> (1 + r)) & 1 ? -1 : 1, s2 = (rel >> (4 + c)) & 1 ? -1 : 1;
 			out[r * 3 + c] = s1 * v * s2;
 		}
+}
+
+// Every rotation copy as read now, raw and in the reference layout.
+static void RotDump(FILE* f)
+{
+	for (const RotCand& c : gRotCands) {
+		double m[9], canon[9];
+		if (!RotRead(c, m))
+			continue;
+		fprintf(f, "rotation %s %s stride %d relation %d raw", c.unit ? "pure" : "scaled", c.isDouble ? "double" : "float", c.stride, c.rel);
+		for (double v : m)
+			fprintf(f, " %.6f", v);
+		if (c.rel >= 0) {
+			RotApply(c.rel, m, canon);
+			fprintf(f, " canon");
+			for (double v : canon)
+				fprintf(f, " %.6f", v);
+		}
+		fprintf(f, "\n");
+	}
+}
+
+// The camera's axes in the model's frame at any angle, as ViewAxes gives a
+// snapped view's (d[0] screen right, d[1] screen down, d[2] towards the
+// camera), from the rotation copies: each put in the reference layout (the
+// one kViewCodes was read from) and its rows made unit length (some copies
+// carry the zoom); the one most others agree with. False until the copies
+// are found.
+static bool CameraAxes(double d[3][3])
+{
+	if (!gRotLocked)
+		return false;
+	std::vector<std::vector<double>> got;
+	for (const RotCand& c : gRotCands) {
+		if (c.rel < 0)
+			continue;
+		double m[9], canon[9];
+		if (!RotRead(c, m))
+			continue;
+		RotApply(c.rel, m, canon);
+		bool ok = true;
+		for (int r = 0; r < 3 && ok; ++r) {
+			const double len = sqrt(canon[r * 3] * canon[r * 3] + canon[r * 3 + 1] * canon[r * 3 + 1] + canon[r * 3 + 2] * canon[r * 3 + 2]);
+			ok = len > 1e-6;
+			for (int k = 0; k < 3 && ok; ++k)
+				canon[r * 3 + k] /= len;
+		}
+		if (ok)
+			got.push_back(std::vector<double>(canon, canon + 9));
+	}
+	if (got.empty())
+		return false;
+	size_t best = 0;
+	int bestAgree = -1;
+	for (size_t i = 0; i < got.size(); ++i) {
+		int agree = 0;
+		for (size_t j = 0; j < got.size(); ++j) {
+			double diff = 0;
+			for (int k = 0; k < 9; ++k)
+				diff = std::max(diff, fabs(got[i][k] - got[j][k]));
+			agree += diff < 1e-3;
+		}
+		if (agree > bestAgree) {
+			bestAgree = agree;
+			best = i;
+		}
+	}
+	double m[9];
+	RotFix(got[best].data(), m);
+	for (int c = 0; c < 3; ++c) {
+		d[0][c] = m[c];
+		d[1][c] = -m[3 + c];
+		d[2][c] = m[6 + c];
+	}
+	return true;
 }
 
 // Every copy is put in the reference copy's layout before its view is
