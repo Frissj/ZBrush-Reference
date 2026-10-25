@@ -18,14 +18,19 @@ sculpting as normal, and ZBrush's menus, gizmo and cursor stay on top.
 
 ## Install
 
-1. In ZBrush 2023, go to **ZScript > Load** and pick `JRef.txt`.
-2. That's it. JRef copies itself into `ZStartup\ZPlugs64` (as `ZZ_JRef.zsc`,
-   with its `JRef_Data` folder). From then on it loads every time ZBrush
-   starts, under **ZPlugin > JRef**.
+JRef needs ZBrush 2023 on Windows 10 or 11. Nothing needs building.
 
-When a newer build is in this folder, the installed copy updates itself the
-next time ZBrush starts. If `ZPlugs64` can't be written without admin rights,
-JRef keeps its log and settings in `C:\Users\Public\Documents\JRef` instead.
+1. Download `JRef-buildN.zip` from the
+   [latest release](https://github.com/Frissj/ZBrush-Reference/releases/latest)
+   and unzip it anywhere.
+2. In ZBrush 2023, go to **ZScript > Load** and pick `JRef\JRef.txt`.
+3. That's it. JRef copies itself into `ZStartup\ZPlugs64` (as `ZZ_JRef.zsc`,
+   with its `JRef_Data` folder). From then on it loads every time ZBrush
+   starts, under **ZPlugin > JRef**. You can delete the unzipped folder.
+
+To update, load `JRef.txt` from a newer release the same way. If `ZPlugs64`
+can't be written without admin rights, JRef keeps its log and settings in
+`C:\Users\Public\Documents\JRef` instead.
 
 ## Getting started
 
@@ -82,7 +87,8 @@ the main view, even when you've turned to an angle with no reference image.
 
 ## Building the DLL
 
-The overlay, memory reading and project watching live in
+Only needed if you change the source: the releases and the repo come with the
+DLL built. The overlay, memory reading and project watching live in
 `JRef_Data\JRef64.dll`, built from `dll\ReferenceScaler.cpp`. To build it you
 need Visual Studio 2026 (x64 C++ tools):
 
@@ -92,7 +98,9 @@ cmd //c "dll\\build.bat"
 
 That writes `JRef_Data\JRef64.dll` and `JRef_Data\build.txt`. The build number
 is `kDllBuild` in the source, and `zrsBuild`/`zrsDllBuild` in `JRef.txt`. Bump
-all three together. The plugin refuses a DLL whose build doesn't match.
+all three together. The plugin refuses a DLL whose build doesn't match. A
+copy installed from this folder updates itself when ZBrush starts and finds a
+newer build here.
 
 ## Troubleshooting
 
