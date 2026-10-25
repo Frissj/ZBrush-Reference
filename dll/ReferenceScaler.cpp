@@ -256,7 +256,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 146;
+static const int kDllBuild = 174;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1363,7 +1363,7 @@ static void DrawGizmo(const OverlayState& st, int w, int h, std::vector<DrawOp>&
 // (gMultiA above gMultiB) share the panel. Outside the panel the background
 // shows gBackGrey.
 static int gMode = 0, gPanelLeft = 0, gMulti = 0, gMultiA = 0, gMultiB = 3, gBackGrey = 48;
-// 3D Auto Track: Multiview goes to the surface being looked at (HullDepth),
+// 3D Auto Track: Multiview goes to the surface being looked at (SurfaceDepth),
 // not only the band; off unless switched on.
 static int gAuto3D = 0;
 // Multiview's four cells (top left, top right, bottom right, bottom left):
@@ -4905,7 +4905,12 @@ static bool TripletValues(double& sx, double& px, double& py, int mode)
 	if (best < 0)
 		return false;
 	const MemTriplet& t = gTriplets[best];
-	const bool jump = sx > 0 && (fabs(t.s.last / sx - 1) > 0.3 || fabs(t.x.last - px) > 200 || fabs(t.y.last - py) > 200);
+	// A jump: well beyond the last step taken (40 document pixels more than
+	// twice it), so a pan already moving fast is not one. 200 pixels from any
+	// step missed a read 170 pixels off between two alike, the camera still
+	// before it (build 173: y -85, -28, -79, the cell 82 px and back).
+	static double stepX = 0, stepY = 0;
+	const bool jump = sx > 0 && (fabs(t.s.last / sx - 1) > 0.3 || fabs(t.x.last - px) > 40 + 2 * fabs(stepX) || fabs(t.y.last - py) > 40 + 2 * fabs(stepY));
 	// ZBrush briefly reuses the view's memory, for example to draw the
 	// navigation head. A big jump is only taken once the next read carries
 	// on from it (close to it, not equal: a fast zoom or pan keeps changing,
@@ -4931,6 +4936,8 @@ static bool TripletValues(double& sx, double& px, double& py, int mode)
 		}
 		gTripletInUse = best;
 	}
+	stepX = t.x.last - px;
+	stepY = t.y.last - py;
 	sx = t.s.last;
 	px = t.x.last;
 	py = t.y.last;
@@ -5371,15 +5378,6 @@ static int RemoveStraight(std::vector<unsigned char>& m, int gw, int gh, bool co
 		}
 	}
 	auto straight = [&](int line) { return line >= 0 && line < n && a[line] >= 0 && b[line] - a[line] + 1 >= need; };
-	// The share of model beside a line (0 off the grid).
-	auto beside = [&](int line, int from, int to) {
-		if (line < 0 || line >= n)
-			return 0.0;
-		int model = 0;
-		for (int k = from; k <= to; ++k)
-			model += at(line, k) == 2;
-		return static_cast<double>(model) / (to - from + 1);
-	};
 	int removed = 0;
 	for (int line = 0; line < n;) {
 		if (!straight(line)) {
@@ -5390,22 +5388,29 @@ static int RemoveStraight(std::vector<unsigned char>& m, int gw, int gh, bool co
 		while (straight(end + 1) && abs(a[end + 1] - a[line]) <= 2 && abs(b[end + 1] - b[line]) <= 2)
 			++end;
 		const int from = a[line], to = b[line];
+		// (Not limited by width: build 155 kept wide runs as the model, and
+		// kept a ZBrush palette strip recorded beside the DeathClaw's arm, the
+		// same image columns in Front and Left, cut off at the canvas's edge.)
 		// Clear on one side, at most 60% model on the other (the frame's top
 		// edge with the head touching it, 52% in the Left dump; a creature's
-		// own edge has its body right beside it).
-		const double before = beside(line - 2, from, to), after = beside(end + 2, from, to);
+		// own edge has its body right beside it). Where model is on both sides
+		// something crosses the line (the blockout's leg through the frame's
+		// bars) and counts on neither; its cells stay.
+		auto model = [&](int l, int k) { return l >= 0 && l < n && at(l, k) == 2; };
+		auto crossing = [&](int k) { return model(line - 2, k) && model(end + 2, k); };
+		int onlyBefore = 0, onlyAfter = 0;
+		for (int k = from; k <= to; ++k) {
+			const bool b0 = model(line - 2, k), b1 = model(end + 2, k);
+			onlyBefore += b0 && !b1;
+			onlyAfter += b1 && !b0;
+		}
+		const double before = static_cast<double>(onlyBefore) / (to - from + 1), after = static_cast<double>(onlyAfter) / (to - from + 1);
 		if (std::min(before, after) <= 0.25 && std::max(before, after) <= 0.6) {
-			for (int l = line; l <= end; ++l)
-				for (int k = from; k <= to; ++k)
-					if (at(l, k) == 2) {
-						at(l, k) = 1;
-						++removed;
-					}
-			// The line's own edge (a cell either side of it).
-			for (int l : {line - 1, end + 1})
+			// The line and its own edge (a cell either side of it).
+			for (int l = line - 1; l <= end + 1; ++l)
 				if (l >= 0 && l < n)
 					for (int k = from; k <= to; ++k)
-						if (at(l, k) == 2) {
+						if (at(l, k) == 2 && !crossing(k)) {
 							at(l, k) = 1;
 							++removed;
 						}
@@ -5469,7 +5474,10 @@ static const MaskExtent& ExtentFor(int slot)
 }
 
 // A view's screen axes in the model's frame, from its rotation (kViewCodes):
-// d[0] screen right, d[1] screen down, d[2] towards the camera.
+// d[0] screen right, d[1] screen down, d[2] towards the camera. (Build 151
+// turned the camera to the far side, reading the rows as right, down and
+// into the screen; the Left view then showed the tail for the hand. A
+// creature facing left in the Left image faces the Front camera this way.)
 static void ViewAxes(int slot, double d[3][3])
 {
 	int code = kViewCodes[slot];
@@ -5492,83 +5500,339 @@ static void ScreenAxis(const double d[3][3], int a, int& m, double& s)
 		if (fabs(d[a][t]) > 0.5) { m = t; s = d[a][t]; }
 }
 
-// The visible surface at the middle of C's viewport, by the silhouettes: a
-// point is the model's only if every other view with a silhouette sees model
-// there (the views' visual hull), and what C shows is the first such point
-// from its camera. g[3] is the point along each model axis, 0 to 1 across
-// the model's extent; g[] for C's two screen axes come in, the depth along
-// its camera axis goes out. Silhouette bounds stand for the same model extent
-// in every view (orthographic). ZBrush's own depth (PixolPick) is documented
-// as broken and is not used. False when no view sees across C's depth or the
-// ray misses the model; hullViews is how many views it was cast against.
-static bool HullDepth(int c, double g[3], int& hullViews)
+// The visible surface at a point of C's view, by the silhouettes: a point is
+// the model's only if every other view with a silhouette sees model there
+// (the views' visual hull), and what C shows is the first such point from its
+// camera. ZBrush's own depth (PixolPick) is documented as broken and is not
+// used.
+//
+// Points are in model units (G): along each model axis, the distance from the
+// model's pivot as the canvas shows it at ratio 1. Every view's image is
+// placed by its anchor (the pivot's image point) and scale, as Classic places
+// it (ViewLayout), so a view's image point is G = s * (img - anchor) * f per
+// screen axis, f = gAnchorScale / scale. Builds 137-154 measured points as a
+// share of each silhouette's bounds instead, taking a silhouette for the
+// whole model; the DeathClaw's were recorded zoomed in, cut off at the
+// canvas's edge (the leg, and the head and hands beyond it), so the views
+// disagreed about where things were and every ray met the leg's cut edge.
+struct ViewFrame {
+	const View* v = nullptr;
+	int m[2] = {0, 0};  // each screen axis as a model axis, and its sign
+	double s[2] = {0, 0};
+	double f = 1;
+	double anchor[2] = {0, 0};  // with the offset, for the showing view
+};
+
+static ViewFrame FrameFor(int slot, double offX, double offY)
 {
-	hullViews = 0;
-	double dc[3][3];
-	ViewAxes(c, dc);
-	int md;
-	double sd;
-	ScreenAxis(dc, 2, md, sd);
-	struct Hull { const View* v; const unsigned char* mask; int m[2]; double s[2]; double low[2], high[2]; };
+	ViewFrame fr;
+	const View& v = gViews[slot];
+	fr.v = &v;
+	double d[3][3];
+	ViewAxes(slot, d);
+	for (int a = 0; a < 2; ++a)
+		ScreenAxis(d, a, fr.m[a], fr.s[a]);
+	fr.f = gAnchorScale > 0 && v.scale > 0 ? gAnchorScale / v.scale : 1;
+	fr.anchor[0] = v.ax + offX;
+	fr.anchor[1] = v.ay + offY;
+	return fr;
+}
+
+// Image point along screen axis a to model units, and back.
+static double ToModel(const ViewFrame& fr, int a, double img)
+{
+	return fr.s[a] * (img - fr.anchor[a]) * fr.f;
+}
+
+static double ToImage(const ViewFrame& fr, int a, double g)
+{
+	return fr.anchor[a] + fr.s[a] * g / fr.f;
+}
+
+// A run of cells along screen axis a (lo to hi) in model units, low first.
+static void CellsToModel(const ViewFrame& fr, int a, int lo, int hi, double& g0, double& g1)
+{
+	const double origin = a == 0 ? fr.v->u0 : fr.v->v0;
+	const double x = ToModel(fr, a, origin + lo * fr.v->cell), y = ToModel(fr, a, origin + (hi + 1) * fr.v->cell);
+	g0 = std::min(x, y);
+	g1 = std::max(x, y);
+}
+
+static unsigned HashDouble(unsigned h, double x)
+{
+	unsigned long long b;
+	memcpy(&b, &x, sizeof b);
+	return h * 31 + static_cast<unsigned>(b ^ (b >> 32));
+}
+
+// The views C's rays are cast against, set up once per layout.
+struct HullSet {
+	struct Hull { ViewFrame fr; const unsigned char* mask; };
 	Hull hulls[kViewSlots];
 	int nh = 0;
+	int md = 0;  // C's camera axis as a model axis, and its sign
+	double sd = 0;
+	double dLo = 0, dHi = 0;  // the depths the hull views saw model at
+	unsigned sum = 0;  // the silhouettes and anchors it was made from
+};
+
+static void BuildHulls(int c, HullSet& hs)
+{
+	double dc[3][3];
+	ViewAxes(c, dc);
+	ScreenAxis(dc, 2, hs.md, hs.sd);
+	const int md = hs.md;
+	int nh = 0;
+	hs.sum = HashDouble(static_cast<unsigned>(c), gAnchorScale);
+	bool any = false;
 	for (int w = 0; w < kDefaultView; ++w) {
 		if (w == c || !gViews[w].used)
 			continue;
 		const MaskExtent& e = ExtentFor(w);
+		hs.sum = hs.sum * 31 + e.sum + static_cast<unsigned>(e.size) * 7 + w;
+		hs.sum = HashDouble(HashDouble(HashDouble(hs.sum, gViews[w].ax), gViews[w].ay), gViews[w].scale);
 		if (!e.ok)
 			continue;
-		double dw[3][3];
-		ViewAxes(w, dw);
-		Hull h;
-		h.v = &gViews[w];
+		HullSet::Hull h;
+		h.fr = FrameFor(w, 0, 0);
 		h.mask = e.clean.data();
-		bool sees = false;
-		for (int a = 0; a < 2; ++a) {
-			ScreenAxis(dw, a, h.m[a], h.s[a]);
-			sees |= h.m[a] == md;
-		}
-		if (!sees)
+		const int ad = h.fr.m[0] == md ? 0 : h.fr.m[1] == md ? 1 : -1;
+		if (ad < 0)
 			continue;
-		h.low[0] = h.v->u0 + e.i0 * h.v->cell;
-		h.high[0] = h.v->u0 + (e.i1 + 1) * h.v->cell;
-		h.low[1] = h.v->v0 + e.j0 * h.v->cell;
-		h.high[1] = h.v->v0 + (e.j1 + 1) * h.v->cell;
-		hulls[nh++] = h;
+		double g0, g1;
+		CellsToModel(h.fr, ad, ad == 0 ? e.i0 : e.j0, ad == 0 ? e.i1 : e.j1, g0, g1);
+		hs.dLo = any ? std::min(hs.dLo, g0) : g0;
+		hs.dHi = any ? std::max(hs.dHi, g1) : g1;
+		any = true;
+		hs.hulls[nh++] = h;
 	}
-	hullViews = nh;
-	if (!nh)
-		return false;
-	// From the camera's side inwards, in steps of half a percent.
-	for (int k = 0; k <= 200; ++k) {
-		g[md] = sd > 0 ? 1 - k / 200.0 : k / 200.0;
-		bool inside = true;
-		for (int t = 0; t < nh && inside; ++t) {
-			const Hull& h = hulls[t];
-			int cell[2];
-			for (int a = 0; a < 2; ++a) {
-				const double f = h.s[a] > 0 ? g[h.m[a]] : 1 - g[h.m[a]];
-				const double img = h.low[a] + f * (h.high[a] - h.low[a]);
-				cell[a] = static_cast<int>(floor((img - (a == 0 ? h.v->u0 : h.v->v0)) / h.v->cell));
-			}
-			inside = cell[0] >= 0 && cell[1] >= 0 && cell[0] < h.v->gw && cell[1] < h.v->gh &&
-				h.mask[static_cast<size_t>(cell[1]) * h.v->gw + cell[0]] == 2;
-		}
-		if (inside)
-			return true;
-	}
-	return false;
+	hs.nh = nh;
 }
 
+// The run of model through cell (i, j) of a silhouette along one image axis
+// (along 0 across, 1 down), and how far the model under that run reaches the
+// other way (lo to hi, in cells): from a leg, down to the foot; from the
+// hand, down to the claw tips.
+static void RunReach(const unsigned char* mask, int gw, int gh, int i, int j, int along, int& lo, int& hi)
+{
+	auto at = [&](int p, int q) {
+		const int x = along == 0 ? p : q, y = along == 0 ? q : p;
+		return x >= 0 && y >= 0 && x < gw && y < gh && mask[static_cast<size_t>(y) * gw + x] == 2;
+	};
+	const int n = along == 0 ? gw : gh, nq = along == 0 ? gh : gw;
+	const int p0 = along == 0 ? i : j, q0 = along == 0 ? j : i;
+	int a = p0, b = p0;
+	while (a > 0 && at(a - 1, q0))
+		--a;
+	while (b < n - 1 && at(b + 1, q0))
+		++b;
+	const int stride = std::max(1, (b - a) / 16);
+	auto any = [&](int q) {
+		for (int p = a; p <= b; p += stride)
+			if (at(p, q))
+				return true;
+		return at(b, q);
+	};
+	lo = hi = q0;
+	while (lo > 0 && any(lo - 1))
+		--lo;
+	while (hi < nq - 1 && any(hi + 1))
+		++hi;
+}
+
+// A hull view's screen axis that is not C's depth: the model axis it shares
+// with C's screen.
+static int SharedAxis(const HullSet& hs, const HullSet::Hull& h)
+{
+	return h.fr.m[0] == hs.md ? 1 : 0;
+}
+
+// The ray at g[] (model units; C's two screen axes come in, the depth along
+// its camera axis goes out, and back is where the ray leaves the model
+// again: the far side of the part it hit).
+// Two silhouettes make phantoms: looking at the crotch from the front, the
+// Left silhouette's row there holds the hand, in front of the legs, so the
+// ray down the leg is inside both silhouettes at the hand's depth (build
+// 152 showed the hand for the crotch). With want (per hull view, the reach
+// of the part C shows along the axis the two share, from RunReach in C), each
+// solid stretch of the ray is checked against the part it is in in the hull
+// view: the leg reaches the foot in both, the hand stops at the claws. A
+// later stretch is taken when it matches clearly better (by a tenth of the
+// depth seen). False when no view sees across C's depth or the ray misses.
+static bool CastHull(const HullSet& hs, double g[3], double& back, const double (*want)[2] = nullptr)
+{
+	const int md = hs.md, nh = hs.nh;
+	const double sd = hs.sd, range = hs.dHi - hs.dLo;
+	if (!nh || range <= 0)
+		return false;
+	auto at = [&](int k) { return sd > 0 ? hs.dHi - k * range / 200 : hs.dLo + k * range / 200; };
+	auto cellOf = [&](const HullSet::Hull& h, int cell[2]) {
+		for (int a = 0; a < 2; ++a) {
+			const double img = ToImage(h.fr, a, g[h.fr.m[a]]);
+			cell[a] = static_cast<int>(floor((img - (a == 0 ? h.fr.v->u0 : h.fr.v->v0)) / h.fr.v->cell));
+		}
+	};
+	// How far the stretch entered at k is from the part C shows.
+	auto mismatch = [&](int k) {
+		g[md] = at(k);
+		double off = 0;
+		for (int t = 0; t < nh; ++t) {
+			const HullSet::Hull& h = hs.hulls[t];
+			const int ao = SharedAxis(hs, h);
+			int cell[2], lo, hi;
+			cellOf(h, cell);
+			RunReach(h.mask, h.fr.v->gw, h.fr.v->gh, cell[0], cell[1], 1 - ao, lo, hi);
+			double gl, gh;
+			CellsToModel(h.fr, ao, lo, hi, gl, gh);
+			off += fabs(gl - want[t][0]) + fabs(gh - want[t][1]);
+		}
+		return off;
+	};
+	// From the camera's side inwards, in steps of half a percent.
+	int entered = -1, bestIn = -1, bestOut = -1;
+	double bestOff = 0;
+	for (int k = 0; k <= 200; ++k) {
+		g[md] = at(k);
+		bool inside = true;
+		for (int t = 0; t < nh && inside; ++t) {
+			const HullSet::Hull& h = hs.hulls[t];
+			int cell[2];
+			cellOf(h, cell);
+			inside = cell[0] >= 0 && cell[1] >= 0 && cell[0] < h.fr.v->gw && cell[1] < h.fr.v->gh &&
+				h.mask[static_cast<size_t>(cell[1]) * h.fr.v->gw + cell[0]] == 2;
+		}
+		if (inside && entered < 0)
+			entered = k;
+		if (entered >= 0 && (!inside || k == 200)) {
+			const int out = inside ? k : k - 1;
+			if (!want) {
+				bestIn = entered;
+				bestOut = out;
+				break;
+			}
+			const double off = mismatch(entered);
+			if (bestIn < 0 || off < bestOff - 0.1 * range) {
+				bestIn = entered;
+				bestOut = out;
+				bestOff = off;
+			}
+			entered = -1;
+		}
+	}
+	if (bestIn < 0)
+		return false;
+	back = at(bestOut);
+	g[md] = at(bestIn);
+	return true;
+}
+
+// The depth of the surface round the middle of C's viewport, in model units
+// along C's camera axis: the surface behind each silhouette cell within reach of
+// the middle, averaged with weights falling smoothly to nothing at the reach.
+// One ray at the middle (builds 137-148) flipped between the surface and the
+// band's middle whenever the middle crossed a gap between fingers or the
+// outline: half the model in the side view, several times a second panning
+// across the hand. The cells are fixed on the model (every step-th cell of
+// C's grid), so moving the camera only shifts their weights and the depth
+// moves smoothly. Each cell's depth is kept until a silhouette changes.
+// back is the far side of the parts hit, averaged the same way. False when
+// no surface is within reach; samples is how many were.
+static bool SurfaceDepth(int c, const ViewFrame& cf, const double centreC[2], double reach, double& depth, double& back, int& samples)
+{
+	samples = 0;
+	const View& cv = gViews[c];
+	const MaskExtent& ce = ExtentFor(c);
+	if (!ce.ok || reach <= 0 || cv.cell <= 0)
+		return false;
+	static HullSet hs;
+	BuildHulls(c, hs);
+	if (!hs.nh)
+		return false;
+	// Per cell of C's grid, the near and far side; NaN not cast yet, -1e30
+	// missed. Kept while the silhouettes and C's placement stay.
+	static std::vector<float> cache;
+	static unsigned cacheSum = 0;
+	const unsigned key = HashDouble(HashDouble(HashDouble(hs.sum, cf.anchor[0]), cf.anchor[1]), cf.f);
+	const size_t n = static_cast<size_t>(cv.gw) * cv.gh;
+	if (cacheSum != key || cache.size() != n * 2) {
+		cache.assign(n * 2, NAN);
+		cacheSum = key;
+	}
+	const int* m = cf.m;
+	// Reach in cells; about 25 cells across it whatever the zoom.
+	const double r = reach / cv.cell;
+	int step = 1;
+	while (r / step > 12)
+		step *= 2;
+	const double ci = (centreC[0] - cv.u0) / cv.cell - 0.5, cj = (centreC[1] - cv.v0) / cv.cell - 0.5;
+	const int i0 = std::max(0, static_cast<int>(ceil((ci - r) / step)) * step), i1 = std::min(cv.gw - 1, static_cast<int>(floor(ci + r)));
+	const int j0 = std::max(0, static_cast<int>(ceil((cj - r) / step)) * step), j1 = std::min(cv.gh - 1, static_cast<int>(floor(cj + r)));
+	double sum = 0, sumBack = 0, weights = 0;
+	for (int j = j0; j <= j1; j += step)
+		for (int i = i0; i <= i1; i += step) {
+			const double d2 = ((i - ci) * (i - ci) + (j - cj) * (j - cj)) / (r * r);
+			const size_t at = static_cast<size_t>(j) * cv.gw + i;
+			if (d2 >= 1 || ce.clean[at] != 2)
+				continue;
+			float& d = cache[at * 2];
+			float& rearAt = cache[at * 2 + 1];
+			if (std::isnan(d)) {
+				double g[3] = {0, 0, 0};
+				const double img[2] = {cv.u0 + (i + 0.5) * cv.cell, cv.v0 + (j + 0.5) * cv.cell};
+				for (int b = 0; b < 2; ++b)
+					g[m[b]] = ToModel(cf, b, img[b]);
+				// The reach of the part this cell is in, in C, along each
+				// hull view's shared axis (CastHull).
+				double want[kViewSlots][2];
+				for (int t = 0; t < hs.nh; ++t) {
+					const HullSet::Hull& h = hs.hulls[t];
+					const int ms = h.fr.m[SharedAxis(hs, h)];
+					const int bs = m[0] == ms ? 0 : 1;
+					int lo, hi;
+					RunReach(ce.clean.data(), cv.gw, cv.gh, i, j, 1 - bs, lo, hi);
+					CellsToModel(cf, bs, lo, hi, want[t][0], want[t][1]);
+				}
+				double b = 0;
+				const bool hit = CastHull(hs, g, b, want);
+				d = hit ? static_cast<float>(g[hs.md]) : -1e30f;
+				rearAt = hit ? static_cast<float>(b) : -1e30f;
+			}
+			if (d < -1e29f)
+				continue;
+			const double w = (1 - d2) * (1 - d2);
+			sum += w * d;
+			sumBack += w * rearAt;
+			weights += w;
+			++samples;
+		}
+	if (weights <= 0)
+		return false;
+	depth = sum / weights;
+	back = sumBack / weights;
+	return true;
+}
+
+// ZBrush's canvas depth (defined with the scan for it, DepthScan).
+static bool DepthFound(double& empty);
+static bool DepthAtDoc(double x, double y, double& v);
+static bool DepthSame(double a, double b);
+static bool CanvasDepth(double x, double y, double reach, double kp, double& z, double& width, int& samples);
+static bool MapDepth(int view, const double centre[2], double reach, double& front, double& thick, int& samples);
+static bool MapHas(int view);
+// Canvas readings since the last multiview log line: used, not covering the
+// screen's model, still being drawn.
+static int gCanvasUsed = 0, gCanvasUncovered = 0, gCanvasDrawing = 0;
+static bool PivotDepth(const OverlayState& st, double& z);
+
 // Multiview: a view other than the one being looked at (C, the showing
-// view) shows the same part of the model. Both views' silhouettes (recorded
-// when their images were lined up with the model) give the model's extent
-// in each image, so an axis the two views share (height, between Front and
-// Left) maps across: the same place along the model, zoomed alike. Along the
+// view) shows the same part of the model. Both views' anchors (ViewFrame)
+// place their images on the model, so an axis the two views share (height,
+// between Front and Left) maps across: the same model point, zoomed alike.
+// Along the
 // axis that is depth for C (across, in Left seen from Front), the part being
 // looked at is centred: the model's extent there within the band shown, so
 // zoomed into the face, the side view shows the head. Zoomed in closer than
-// the head's depth, it goes to the surface C shows (HullDepth: the nose, not
+// the head's depth, it goes to the surface C shows (SurfaceDepth: the nose, not
 // the middle of the skull). Without both silhouettes the view is placed by
 // the camera as Classic would show it.
 static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out, std::string& path)
@@ -5582,54 +5846,133 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 	std::string cpath;
 	if (!ViewLayout(c, st, cs, cpath) || cs.ratio <= 0)
 		return true;
-	const MaskExtent& ce = ExtentFor(c);
 	const MaskExtent& ve = ExtentFor(slot);
-	if (!ce.ok || !ve.ok)
-		return true;
-	const View& cv = gViews[c];
 	const View& vv = gViews[slot];
-	// C's window (the viewport) in its image space: centre and half size per
-	// screen axis.
+	const ViewFrame cf = FrameFor(c, cs.offX, cs.offY), vf = FrameFor(slot, 0, 0);
+	// C's window in its image space: centre and half size per screen axis.
+	// The window is the part of the viewport beside the panel, where the
+	// model is worked on and which the cell shows (DrawPanelCell). Builds
+	// 137-151 took the whole viewport, whose middle is under the panel: the
+	// surface was looked for right of what was being looked at, and the
+	// part found sat a quarter of the cell right of its middle (the hand off
+	// the cell's edge).
 	int vx0, vy0, vx1, vy1;
 	const double kp = st.pixelsPerDoc > 0 ? st.pixelsPerDoc : 1;
-	ViewportRect(static_cast<int>(st.docW * kp + 0.5), static_cast<int>(st.docH * kp + 0.5), vx0, vy0, vx1, vy1);
+	{
+		const int w = static_cast<int>(st.docW * kp + 0.5), h = static_cast<int>(st.docH * kp + 0.5);
+		ViewportRect(w, h, vx0, vy0, vx1, vy1);
+		int px, py, pw, ph;
+		PanelRect(w, h, px, py, pw, ph);
+		if (gPanelLeft)
+			vx0 = px + pw;
+		else
+			vx1 = px;
+	}
 	const double midX = (vx0 + vx1) * 0.5 / kp, midY = (vy0 + vy1) * 0.5 / kp;
 	const double centreC[2] = {(midX - cs.px) / cs.ratio + cs.ax + cs.offX, (midY - cs.py) / cs.ratio + cs.ay + cs.offY};
 	const double halfC[2] = {(vx1 - vx0) * 0.5 / kp / cs.ratio, (vy1 - vy0) * 0.5 / kp / cs.ratio};
-	// The model's bounds in image space, per screen axis.
-	const double lowC[2] = {cv.u0 + ce.i0 * cv.cell, cv.v0 + ce.j0 * cv.cell};
-	const double highC[2] = {cv.u0 + (ce.i1 + 1) * cv.cell, cv.v0 + (ce.j1 + 1) * cv.cell};
-	const double lowV[2] = {vv.u0 + ve.i0 * vv.cell, vv.v0 + ve.j0 * vv.cell};
-	const double highV[2] = {vv.u0 + (ve.i1 + 1) * vv.cell, vv.v0 + (ve.j1 + 1) * vv.cell};
-	double dc[3][3], dv[3][3];
+	double dc[3][3];
 	ViewAxes(c, dc);
-	ViewAxes(slot, dv);
 	double centreV[2] = {0, 0}, halfV[2] = {0, 0};
 	int depthAxis = -1;
-	double k = 0;
-	// The middle of C's viewport along each model axis (0 to 1 across the
-	// model), and its depth: the surface C shows there, when the middle is on
-	// C's silhouette and other views see across C's depth.
-	double g[3] = {0.5, 0.5, 0.5};
-	for (int b = 0; b < 2; ++b) {
-		int m;
-		double s;
-		ScreenAxis(dc, b, m, s);
-		const double f = (centreC[b] - lowC[b]) / (highC[b] - lowC[b]);
-		g[m] = s > 0 ? f : 1 - f;
-	}
-	int hullViews = 0;
-	bool focus = false;
+	// V's image units per C's: both are placed at the same model scale.
+	const double k = cf.f / vf.f;
+	// The middle of C's viewport in model units, and its depth: the surface
+	// C shows there, when other views see across C's depth.
+	double g[3] = {0, 0, 0};
+	for (int b = 0; b < 2; ++b)
+		g[cf.m[b]] = ToModel(cf, b, centreC[b]);
+	// The depth: the surface round the middle (SurfaceDepth), within a
+	// quarter of the viewport's smaller side. With none in reach (the middle
+	// off the model), the last depth found stays until C changes: the band's
+	// middle instead is a jump.
+	int samples = 0;
+	bool focus = false, held = false, fromCanvas = false;
+	double back = 0;  // the far side of the part, along C's camera axis
 	{
-		const int ci = static_cast<int>(floor((centreC[0] - cv.u0) / cv.cell)), cj = static_cast<int>(floor((centreC[1] - cv.v0) / cv.cell));
-		bool onModel = false;
-		for (int dj = -1; dj <= 1; ++dj)
-			for (int di = -1; di <= 1; ++di) {
-				const int i = ci + di, j = cj + dj;
-				if (i >= 0 && j >= 0 && i < cv.gw && j < cv.gh && ce.clean[static_cast<size_t>(j) * cv.gw + i] == 2)
-					onModel = true;
+		static double heldDepth = 0, heldBack = 0;
+		static int heldFrom = -1;
+		int md;
+		double sd;
+		ScreenAxis(dc, 2, md, sd);
+		double depth = 0, z = 0, width = 0;
+		// ZBrush's own depth first (CanvasDepth: document pixels, negative
+		// towards the camera, measured from the model's pivot, PivotDepth: so
+		// (pivot - z) / zoom in model units towards it), the part as thick as
+		// it is wide on screen; the silhouettes when the buffer or the pivot
+		// is not found.
+		const double reachDoc = 0.25 * std::min(vx1 - vx0, vy1 - vy0) / kp;
+		// From the depth map of ZBrush's finished frames (MapDepth), never the
+		// plane as it is: ZBrush draws it part by part nearly all the time
+		// the view moves, and builds 164-171 read it mid-draw (the body behind
+		// the face, a few pixels, an empty plane) however they checked it.
+		double front = 0, thick = 0;
+		if (gAuto3D && MapDepth(c, centreC, reachDoc / cs.ratio, front, thick, samples)) {
+			depth = sd * front;
+			back = sd * (front - thick);
+			g[md] = depth;
+			heldDepth = depth;
+			heldBack = back;
+			heldFrom = c;
+			focus = fromCanvas = true;
+		} else if (gAuto3D && heldFrom == c && MapHas(c)) {
+			// The map has too little round the middle (a part no finished
+			// frame has shown yet): the last reading stays. The silhouettes
+			// instead put the far side elsewhere (build 172: -120 for the
+			// map's 268, the cell 60 px off and back within 5 layouts).
+			g[md] = heldDepth;
+			back = heldBack;
+			focus = held = true;
+		} else if (gAuto3D && SurfaceDepth(c, cf, centreC, 0.5 * std::min(halfC[0], halfC[1]), depth, back, samples)) {
+			g[md] = depth;
+			heldDepth = depth;
+			heldBack = back;
+			heldFrom = c;
+			focus = true;
+		} else if (gAuto3D && heldFrom == c) {
+			g[md] = heldDepth;
+			back = heldBack;
+			focus = held = true;
+		}
+		// A jump in the depth (the middle moving onto a part nearer or
+		// farther: build 173, 140 to 297 in a frame, the cell 190 px) is eased
+		// over about 150 ms, 50 ms a step of 1/e, so the cell glides there;
+		// smaller changes, as the middle moves over one part, are followed as
+		// they are. The layout is asked for again until it has arrived.
+		if (focus) {
+			static double easedDepth = 0, easedBack = 0;
+			static LARGE_INTEGER easedAt = {};
+			static int easedFrom = -1;
+			static bool easing = false;
+			LARGE_INTEGER t, qf;
+			QueryPerformanceCounter(&t);
+			QueryPerformanceFrequency(&qf);
+			if (easedFrom != c) {
+				easing = false;
+			} else if (easing || fabs(g[md] - easedDepth) > 15 || fabs(back - easedBack) > 15) {
+				// At most a frame's time a step (the layout is not asked for
+				// while the camera is still: the first step after a pause
+				// would otherwise be the whole jump).
+				const double ms = std::min(33.0, 1000.0 * (t.QuadPart - easedAt.QuadPart) / qf.QuadPart);
+				const double a = 1 - exp(-ms / 50.0);
+				easedDepth += (g[md] - easedDepth) * a;
+				easedBack += (back - easedBack) * a;
+				easing = fabs(g[md] - easedDepth) > 0.5 || fabs(back - easedBack) > 0.5;
 			}
-		focus = gAuto3D && onModel && HullDepth(c, g, hullViews);
+			if (!easing) {
+				easedDepth = g[md];
+				easedBack = back;
+			}
+			easedFrom = c;
+			easedAt = t;
+			g[md] = easedDepth;
+			back = easedBack;
+			if (easing) {
+				EnterCriticalSection(&gOverlayLock);
+				gRedrawPending = true;
+				LeaveCriticalSection(&gOverlayLock);
+			}
+		}
 	}
 	{
 		// Each silhouette once a session in the log, as text (# model, .
@@ -5665,31 +6008,22 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 			}
 		}
 	}
+	// Each of V's screen axes: one C shares (the same model point), or C's
+	// depth. The cell shows a window the size of C's (DrawPanelCell fits the
+	// same screen area), so its half size per screen axis is C's, in V's
+	// units. (Builds 150-154 left it 0 along the depth: the window went to the
+	// front surface whatever the part's thickness.)
 	for (int a = 0; a < 2; ++a) {
-		int b = -1;
-		double sign = 0;
-		for (int t = 0; t < 3; ++t) {
-			const double dot = dv[a][0] * dc[t][0] + dv[a][1] * dc[t][1] + dv[a][2] * dc[t][2];
-			if (fabs(dot) > 0.5) { b = t; sign = dot; }
-		}
-		if (b == 2 || b < 0) {
+		halfV[a] = halfC[a] * k;
+		const int b = cf.m[0] == vf.m[a] ? 0 : cf.m[1] == vf.m[a] ? 1 : -1;
+		if (b < 0) {
 			depthAxis = a;
+			centreV[a] = vf.anchor[a];
 			continue;
 		}
-		double f = (centreC[b] - lowC[b]) / (highC[b] - lowC[b]);
-		if (sign < 0)
-			f = 1 - f;
-		centreV[a] = lowV[a] + f * (highV[a] - lowV[a]);
-		const double ka = (highV[a] - lowV[a]) / (highC[b] - lowC[b]);
-		if (k <= 0)
-			k = ka;
-		halfV[a] = halfC[b];
+		centreV[a] = ToImage(vf, a, g[vf.m[a]]);
 	}
-	if (k <= 0)
-		return true;
-	for (int a = 0; a < 2; ++a)
-		halfV[a] *= k;
-	if (depthAxis >= 0) {
+	if (depthAxis >= 0 && ve.ok) {
 		// The band shown along the shared axis, and the model's extent
 		// across it within the band.
 		const int o = 1 - depthAxis;
@@ -5706,42 +6040,79 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 				hi = std::max(hi, maxs[i]);
 			}
 		const double across = depthAxis == 0 ? vv.u0 : vv.v0;
-		centreV[depthAxis] = lo >= 0 ? across + (lo + hi + 1) * 0.5 * vv.cell
-			: (lowV[depthAxis] + highV[depthAxis]) * 0.5;
-		// With the surface's depth: the band still shows whole when it fits
-		// (with a tenth of the window to spare); when it does not (zoomed into
-		// the nose, the head is deeper than the window), the window goes to
-		// the surface, kept inside the band, rather than the middle of the
-		// head.
+		if (lo >= 0)
+			centreV[depthAxis] = across + (lo + hi + 1) * 0.5 * vv.cell;
+		// With the surface's depth: the band still shows whole when it fits;
+		// when it does not (zoomed into the hand, the arm behind it is deeper
+		// than the window), the window goes to the part C shows: the middle of
+		// its thickness, or, for a part deeper than half the window (the
+		// head, zoomed into the nose), the surface a quarter of the window in
+		// from the edge. Build 149 kept the window inside the band, which put
+		// the surface (the claw tips, at the band's end) at the window's edge,
+		// the hand hanging off it. Between the band fitting and not, the two
+		// blend, so zooming does not jump.
 		if (focus) {
-			int m;
-			double s;
-			ScreenAxis(dv, depthAxis, m, s);
-			const double f = s > 0 ? g[m] : 1 - g[m];
-			const double at = lowV[depthAxis] + f * (highV[depthAxis] - lowV[depthAxis]);
-			const double room = halfV[depthAxis] * 0.9;
+			const double half = halfV[depthAxis];
+			const double front = ToImage(vf, depthAxis, g[vf.m[depthAxis]]), rear = ToImage(vf, depthAxis, back);
+			const double thick = fabs(rear - front);
+			const double part = front + (rear >= front ? 1 : -1) * std::min(thick * 0.5, half * 0.5);
 			if (lo < 0) {
-				centreV[depthAxis] = at;
+				centreV[depthAxis] = part;
 			} else {
 				const double bandLo = across + lo * vv.cell, bandHi = across + (hi + 1) * vv.cell;
-				if (bandHi - bandLo > 2 * room)
-					centreV[depthAxis] = std::min(std::max(at, bandLo + room), bandHi - room);
+				const double t = std::min(1.0, std::max(0.0, ((bandHi - bandLo) / (2 * half) - 0.9) / 0.3));
+				centreV[depthAxis] += t * (part - centreV[depthAxis]);
 			}
 		}
 	}
 	{
 		// Logged when what it went by changes: the views, whether the surface
-		// was found, and where (in whole percent).
-		static int lastC = -1, lastSlot = -1, lastFocus = -1, lastG[3] = {-1, -1, -1};
-		const int gi[3] = {static_cast<int>(g[0] * 100), static_cast<int>(g[1] * 100), static_cast<int>(g[2] * 100)};
-		if (c != lastC || slot != lastSlot || focus != (lastFocus == 1) || abs(gi[0] - lastG[0]) > 4 || abs(gi[1] - lastG[1]) > 4 || abs(gi[2] - lastG[2]) > 4) {
+		// was found, and where (model units; moves of a 25th of the window).
+		static int lastC = -1, lastSlot = -1, lastFocus = -1;
+		static double lastG[3] = {0, 0, 0};
+		const double tol = std::max(halfC[0], halfC[1]) * cf.f * 2 / 25;
+		const int how = held ? 2 : focus ? 1 : 0;
+		if (c != lastC || slot != lastSlot || how != lastFocus || fabs(g[0] - lastG[0]) > tol || fabs(g[1] - lastG[1]) > tol || fabs(g[2] - lastG[2]) > tol) {
 			lastC = c;
 			lastSlot = slot;
-			lastFocus = focus ? 1 : 0;
-			memcpy(lastG, gi, sizeof lastG);
+			lastFocus = how;
+			memcpy(lastG, g, sizeof lastG);
+			// ZBrush's own depth (DepthAtDoc), for working out its units: at
+			// the middle (the median of the model's pixels within 10 document
+			// pixels) and over the model in the window.
+			char canvas[320] = "canvas depth not found";
+			double empty = 0;
+			if (DepthFound(empty)) {
+				std::vector<double> mid;
+				double lo = 1e300, hi = -1e300;
+				for (int dy = -10; dy <= 10; dy += 2)
+					for (int dx = -10; dx <= 10; dx += 2) {
+						double z;
+						if (DepthAtDoc(midX + dx, midY + dy, z) && !DepthSame(z, empty))
+							mid.push_back(z);
+					}
+				for (int y = vy0; y < vy1; y += 8)
+					for (int x = vx0; x < vx1; x += 8) {
+						double z;
+						if (DepthAtDoc(x / kp, y / kp, z) && !DepthSame(z, empty)) {
+							lo = std::min(lo, z);
+							hi = std::max(hi, z);
+						}
+					}
+				std::sort(mid.begin(), mid.end());
+				double pivot = 0;
+				const bool havePivot = PivotDepth(st, pivot);
+				snprintf(canvas, sizeof canvas, "canvas depth middle %.6g (%zu px), model %.6g to %.6g, empty %.6g, zoom %.5f, pivot %s%.6g; readings used %d, not covering %d, mid-draw %d",
+					mid.empty() ? 0.0 : mid[mid.size() / 2], mid.size(), lo, hi, empty, st.ratio, havePivot ? "" : "not found ", pivot,
+					gCanvasUsed, gCanvasUncovered, gCanvasDrawing);
+				gCanvasUsed = gCanvasUncovered = gCanvasDrawing = 0;
+			}
 			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
-				fprintf(f, "%lu multiview %d from %d: %s (%d views across), model point %d%% %d%% %d%%, scale %.3f, depth axis %d\n", GetTickCount(), slot, c,
-					focus ? "surface found" : "band only", hullViews, gi[0], gi[1], gi[2], k, depthAxis);
+				fprintf(f, "%lu   %s\n", GetTickCount(), canvas);
+				fprintf(f, "%lu multiview %d from %d: %s (%d cells), model point %.0f %.0f %.0f (far side %.0f), V centre %.0f %.0f half %.0f %.0f, scale %.3f, depth axis %d\n",
+					GetTickCount(), slot, c, held ? "surface held (none in reach)" : fromCanvas ? "surface from the canvas depth" : focus ? "surface from the silhouettes" : "band only",
+					samples, g[0], g[1], g[2], back,
+					centreV[0], centreV[1], halfV[0], halfV[1], k, depthAxis);
 				fclose(f);
 			}
 		}
@@ -5861,6 +6232,26 @@ static double MaskScore(const View& g, const std::vector<unsigned char>& cur, in
 	return either >= minEither ? static_cast<double>(both) / either : -1;
 }
 
+// The share of saved's model cells that cur sees (on the canvas, model or
+// not) with cur shifted by (ox, oy) cells: how much of the model a match
+// could be judged on.
+static double MaskCoverage(const View& g, const std::vector<unsigned char>& cur, int ox, int oy)
+{
+	int model = 0, seen = 0;
+	for (int j = 0; j < g.gh; ++j) {
+		const int cj = j - oy;
+		const unsigned char* a = &g.mask[static_cast<size_t>(j) * g.gw];
+		for (int i = 0; i < g.gw; ++i) {
+			if (a[i] != 2)
+				continue;
+			++model;
+			const int ci = i - ox;
+			seen += cj >= 0 && cj < g.gh && ci >= 0 && ci < g.gw && cur[static_cast<size_t>(cj) * g.gw + ci] != 0;
+		}
+	}
+	return model ? static_cast<double>(seen) / model : 0;
+}
+
 static void RunViewJob(const OverlayState& st)
 {
 	const int slot = gViewJobSlot, job = gViewJob;
@@ -5924,10 +6315,20 @@ static void RunViewJob(const OverlayState& st)
 	gViewScore = best;
 	gViewShiftX = fx * v.cell;
 	gViewShiftY = fy * v.cell;
+	// Zoomed in on a part, the canvas sees a little of the model, and sliding
+	// the saved outline until all-model cells cover that window scores near
+	// 1 anywhere (build 146: zoomed in on the hand, "matched ... score 0.969
+	// shift -405.13 271.44", and the PureRef panel jumped off the model). A
+	// match is judged only with most of the saved model in view.
+	const double coverage = best >= 0 ? MaskCoverage(v, cur, bx, by) : 0;
 	EnterCriticalSection(&gOverlayLock);
 	if (abs(bx) >= rx - 2 || abs(by) >= ry - 2) {
 		// At the end of the search: no real match.
 		ViewLog("match at the edge of the search, not moved", slot);
+	} else if (best >= 0.6 && coverage < 0.6) {
+		char what[96];
+		snprintf(what, sizeof(what), "match with %.0f%% of the model in view, not moved", 100 * coverage);
+		ViewLog(what, slot);
 	} else if (best >= 0.6) {
 		gOverlay.offX = gViewShiftX;
 		gOverlay.offY = gViewShiftY;
@@ -5976,6 +6377,1192 @@ static void ViewJobStep(const OverlayState& st)
 	if (now - gViewSettledAt < 300 || now - gViewJobAt < 400)
 		return;
 	FinishViewJob(st);
+}
+
+// Each overlay step: keeps the showing view's silhouette current. It was
+// recorded once, when the view was lined up, and the model grows after
+// that: the DeathClaw's Front and Left silhouettes held only the arm when
+// the legs were there (build 153 looked at the hand for the crotch, the
+// only part 3D Auto Track knew of). With the camera on the view and still,
+// no menu open and no job queued, every cell the canvas shows is written
+// into the saved silhouette, except round the cursor (the brush circle is
+// not the model). Only when the saved model lines up with the canvas as it
+// is (85% of its cells seen on the canvas are model there), so a view whose
+// image has slid off the model is left alone. At most every 2 s.
+static void ViewRefreshStep(const OverlayState& st)
+{
+	static DWORD lastAt = 0, settledAt = 0;
+	static double lastCount = -1;
+	const DWORD now = GetTickCount();
+	if (gGesture.active || fabs(gModelPixels - lastCount) > 0.002 * (gModelPixels + 100)) {
+		lastCount = gModelPixels;
+		settledAt = now;
+		return;
+	}
+	const int c = gActiveView;
+	if (now - settledAt < 500 || now - lastAt < 2000 || gViewJob || c < 0 || c >= kDefaultView || gKeyShare.empty() || st.ratio <= 0)
+		return;
+	View& v = gViews[c];
+	if (!v.used || v.gw <= 0 || v.mask.size() != static_cast<size_t>(v.gw) * v.gh || !gMenuBoxes.empty() || gFlyout.right > gFlyout.left ||
+		gMenuBakedCount)
+		return;
+	lastAt = now;
+	std::vector<unsigned char> cur;
+	SampleSilhouette(st, st.offX, st.offY, v, cur);
+	// The cursor's surroundings in image space, left out.
+	POINT cp;
+	double cu = 0, cv = 0, cr = -1;
+	if (GetCursorPos(&cp) && st.pixelsPerDoc > 0) {
+		const double k = st.pixelsPerDoc;
+		cu = ((cp.x - st.screenX) / k - st.px) / st.ratio + st.ax + st.offX;
+		cv = ((cp.y - st.screenY) / k - st.py) / st.ratio + st.ay + st.offY;
+		cr = 160 / k / st.ratio;
+	}
+	auto nearCursor = [&](int i, int j) {
+		const double du = v.u0 + (i + 0.5) * v.cell - cu, dv = v.v0 + (j + 0.5) * v.cell - cv;
+		return cr > 0 && du * du + dv * dv < cr * cr;
+	};
+	int model = 0, kept = 0;
+	for (int j = 0; j < v.gh; ++j)
+		for (int i = 0; i < v.gw; ++i) {
+			const size_t at = static_cast<size_t>(j) * v.gw + i;
+			if (v.mask[at] == 2 && cur[at] && !nearCursor(i, j)) {
+				++model;
+				kept += cur[at] == 2;
+			}
+		}
+	if (model < 200 || kept < model * 0.85)
+		return;
+	int changed = 0;
+	for (int j = 0; j < v.gh; ++j)
+		for (int i = 0; i < v.gw; ++i) {
+			const size_t at = static_cast<size_t>(j) * v.gw + i;
+			if (cur[at] && cur[at] != v.mask[at] && !nearCursor(i, j)) {
+				v.mask[at] = cur[at];
+				++changed;
+			}
+		}
+	if (changed < 20)
+		return;
+	gExtents[c].data = nullptr;  // worked out again
+	SaveMask(c);
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu silhouette of view %d refreshed from the canvas: %d cells changed (%.0f%% of the saved model still model)\n", now, c,
+			changed, 100.0 * kept / model);
+		fclose(f);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ZBrush's canvas depth, read from its memory. The canvas is 2.5D: every
+// document pixel (pixol) keeps the depth of the surface drawn there, updated
+// with every stroke, which is what 3D Auto Track needs at the middle of the
+// screen, from any view and with no other view's silhouette. ZScript's
+// PixolPick returns one value everywhere (0.366211 on the model and off it,
+// nav_log), so the buffer is found instead: one allocation the document's
+// size (width x height x bytes per pixel, the pixel maybe in a larger
+// record, the image maybe at twice the size for antialiasing), where the
+// empty canvas holds one value and the model, by the overlay's own mask,
+// holds others that change smoothly.
+// ---------------------------------------------------------------------------
+struct DepthBuffer {
+	bool ok = false;
+	uintptr_t base = 0;  // the value of buffer pixel (0, 0)
+	int scale = 1;       // buffer pixels per document pixel
+	size_t pitch = 0, stride = 0;  // bytes per row and per pixel
+	int type = 0;        // 0 float, 1 uint16, 2 int32, 3 double
+	int w = 0, h = 0;
+	double bg = 0;       // the empty canvas's value
+	double score = 0;    // pixels it agreed with the mask on
+	uintptr_t image = 0; // ZBrush's image object holding it, when found by it
+};
+static DepthBuffer gDepth;
+static std::vector<uintptr_t> gDepthDropped;  // buffers that stopped fitting
+// Every image object taken for depth, with its empty value. ZBrush keeps
+// more than one, and the one with the model in it changes (build 164: the
+// plane found with the model held only the empty value 18 s later, over the
+// whole window); DepthStep takes whichever agrees with the mask.
+static std::vector<std::pair<uintptr_t, double>> gDepthImages;
+
+static const int kDepthTypeSize[4] = {4, 2, 4, 8};
+
+static double DepthValue(const unsigned char* p, int type)
+{
+	switch (type) {
+	case 0: { float f; memcpy(&f, p, 4); return f; }
+	case 1: { uint16_t u; memcpy(&u, p, 2); return u; }
+	case 2: { int32_t i; memcpy(&i, p, 4); return i; }
+	default: { double d; memcpy(&d, p, 8); return d; }
+	}
+}
+
+static bool DepthSame(double a, double b)
+{
+	return fabs(a - b) <= 1e-6 * std::max(1.0, fabs(a));
+}
+
+static bool DepthFound(double& empty)
+{
+	empty = gDepth.bg;
+	return gDepth.ok;
+}
+
+// The buffer's value at a document point; false off the buffer or unreadable.
+static bool DepthAtDoc(double x, double y, double& v)
+{
+	if (!gDepth.ok)
+		return false;
+	const int bx = static_cast<int>(x * gDepth.scale), by = static_cast<int>(y * gDepth.scale);
+	if (bx < 0 || by < 0 || bx >= gDepth.w || by >= gDepth.h)
+		return false;
+	unsigned char raw[8];
+	SIZE_T got = 0;
+	const uintptr_t at = gDepth.base + by * gDepth.pitch + bx * gDepth.stride;
+	const int n = kDepthTypeSize[gDepth.type];
+	if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(at), raw, n, &got) || got != static_cast<SIZE_T>(n))
+		return false;
+	v = DepthValue(raw, gDepth.type);
+	return v == v;
+}
+
+// The surface round a document point from ZBrush's canvas depth, as
+// SurfaceDepth works it out from silhouettes: the model's pixels within
+// reach, averaged with weights falling smoothly to nothing at the reach. In
+// document pixels, like x and y: 0 at the plane through the tool's middle,
+// negative towards the camera (x64dbg, a model drawn in Front: -9 at its
+// outline to -167 at its middle, the empty canvas 35840). width is the
+// model's width across the rows round the point (their median), standing in
+// for the part's thickness, which the canvas does not hold.
+//
+// Only a plane that shows what the screen shows is read: ZBrush redraws the
+// plane in passes, and a layout that catches a pass before it reaches the
+// middle read a handful of pixels (2 to 53 of about 430, build 169) whose
+// average was another depth, frame after frame. So each point in reach is
+// read only where the overlay's capture (gKeyShare, the frame ZBrush shows)
+// is sure it is the model, and the plane must have the model at most of
+// them; the depth is the average over those it has. A plane mid-pass, empty
+// (ZBrush's copy plane is cleared while the view moves) or from another pose
+// fails, and the caller keeps the last reading. kp: overlay pixels per
+// document pixel.
+static uintptr_t ImagePixels(uintptr_t image, int dw, int dh);
+
+static bool CanvasDepthIn(double x, double y, double reach, double kp, double& z, double& width, int& samples)
+{
+	samples = 0;
+	width = 0;
+	auto model = [&](double px, double py, double& v) {
+		return DepthAtDoc(px, py, v) && !DepthSame(v, gDepth.bg) && fabs(v) < 1e6;
+	};
+	// The capture's verdict at a document point: 1 model, 0 canvas, -1 not sure.
+	auto screen = [&](double px, double py) {
+		const int sx = static_cast<int>(px * kp), sy = static_cast<int>(py * kp);
+		if (sx < 0 || sy < 0 || sx >= gKeyW || sy >= gKeyH || gKeyShare.size() < static_cast<size_t>(gKeyW) * gKeyH)
+			return -1;
+		const int k = gKeyShare[static_cast<size_t>(sy) * gKeyW + sx];
+		return k <= 15 ? 1 : k >= 240 ? 0 : -1;
+	};
+	const double step = std::max(1.0, reach / 12);
+	double sum = 0, weights = 0;
+	int shown = 0;
+	std::vector<double> seen;  // every point's value, for the second read
+	for (double dy = -reach; dy <= reach; dy += step)
+		for (double dx = -reach; dx <= reach; dx += step) {
+			const double d2 = (dx * dx + dy * dy) / (reach * reach);
+			if (d2 >= 1 || screen(x + dx, y + dy) != 1)
+				continue;
+			++shown;
+			double v;
+			const bool m = model(x + dx, y + dy, v);
+			seen.push_back(m ? v : 1e300);
+			if (!m)
+				continue;
+			const double w = (1 - d2) * (1 - d2);
+			sum += w * v;
+			weights += w;
+			++samples;
+		}
+	if (shown < 10 || samples < shown * 0.8 || weights <= 0) {
+		++gCanvasUncovered;
+		return false;
+	}
+	// Read only while ZBrush is not writing it. It draws a frame part by
+	// part (build 170: the reading went 250, 367, 251, 369 frame after
+	// frame with every point round the middle covered, the middle -1930 or
+	// -2420: the body behind the head, then the head drawn over it), so a
+	// plane that covers what the screen shows may still be unfinished. The
+	// points read again 3 ms on must all be the same.
+	LARGE_INTEGER qf, t0, t;
+	QueryPerformanceFrequency(&qf);
+	QueryPerformanceCounter(&t0);
+	do {
+		YieldProcessor();
+		QueryPerformanceCounter(&t);
+	} while (t.QuadPart - t0.QuadPart < qf.QuadPart * 3 / 1000);
+	size_t i = 0;
+	for (double dy = -reach; dy <= reach; dy += step)
+		for (double dx = -reach; dx <= reach; dx += step) {
+			const double d2 = (dx * dx + dy * dy) / (reach * reach);
+			if (d2 >= 1 || screen(x + dx, y + dy) != 1)
+				continue;
+			double v;
+			const bool m = model(x + dx, y + dy, v);
+			if (i >= seen.size() || (m ? v : 1e300) != seen[i]) {
+				++gCanvasDrawing;
+				return false;
+			}
+			++i;
+		}
+	++gCanvasUsed;
+	z = sum / weights;
+	// The model's run across each row within half the reach, through the
+	// model pixel nearest the point's column; the median of them.
+	std::vector<double> runs;
+	double v;
+	for (double dy = -reach / 2; dy <= reach / 2; dy += std::max(1.0, reach / 6))
+		for (int r = 0; r <= reach; ++r) {
+			bool found = false;
+			for (int side : {-1, 1}) {
+				const double at = x + side * r, row = y + dy;
+				if (!model(at, row, v))
+					continue;
+				double lo = at, hi = at;
+				while (hi - lo < 8 * reach && model(lo - 1, row, v))
+					lo -= 1;
+				while (hi - lo < 8 * reach && model(hi + 1, row, v))
+					hi += 1;
+				runs.push_back(hi - lo + 1);
+				found = true;
+				break;
+			}
+			if (found)
+				break;
+		}
+	if (!runs.empty()) {
+		std::sort(runs.begin(), runs.end());
+		width = runs[runs.size() / 2];
+	}
+	return true;
+}
+
+// ZBrush keeps two planes: one redrawn as the view moves, one a copy it
+// clears when a move starts and fills when it ends (watching from outside).
+// The one in use first, then the other; one that fits is kept.
+static bool CanvasDepth(double x, double y, double reach, double kp, double& z, double& width, int& samples)
+{
+	samples = 0;
+	width = 0;
+	if (!gDepth.ok || reach <= 0 || kp <= 0)
+		return false;
+	if (CanvasDepthIn(x, y, reach, kp, z, width, samples))
+		return true;
+	const DepthBuffer was = gDepth;
+	for (const auto& im : gDepthImages) {
+		if (im.first == was.image)
+			continue;
+		const uintptr_t first = ImagePixels(im.first, was.w, was.h);
+		if (!first)
+			continue;
+		gDepth.base = first;
+		gDepth.image = im.first;
+		gDepth.bg = im.second;
+		if (CanvasDepthIn(x, y, reach, kp, z, width, samples))
+			return true;
+	}
+	gDepth = was;
+	return false;
+}
+
+// Document points the overlay is sure about: off the model (background) and
+// on it, spread over the viewport.
+struct DepthSample { int x, y; bool model; };
+
+static std::vector<DepthSample> DepthSamples(const OverlayState& st, int want)
+{
+	std::vector<DepthSample> out;
+	if (gKeyShare.empty() || st.pixelsPerDoc <= 0)
+		return out;
+	int vx0, vy0, vx1, vy1;
+	ViewportRect(gKeyW, gKeyH, vx0, vy0, vx1, vy1);
+	const int gizmoX = vx1 - static_cast<int>(std::min(vx1 - vx0, vy1 - vy0) * 0.3);
+	const int step = std::max(2, static_cast<int>(sqrt(static_cast<double>(vx1 - vx0) * (vy1 - vy0) / std::max(1, want))));
+	for (int y = vy0 + step / 2; y < vy1; y += step)
+		for (int x = vx0 + step / 2; x < vx1; x += step) {
+			if (x >= gizmoX && y < gGizmoBottom)
+				continue;
+			// Sure: the pixel and its neighbours two away all alike.
+			bool sure = true;
+			const int k0 = gKeyShare[static_cast<size_t>(y) * gKeyW + x];
+			if (k0 > 15 && k0 < 240)
+				continue;
+			for (int d = -2; d <= 2 && sure; d += 4)
+				for (int e = 0; e < 2 && sure; ++e) {
+					const int xx = x + (e ? d : 0), yy = y + (e ? 0 : d);
+					if (xx < 0 || yy < 0 || xx >= gKeyW || yy >= gKeyH)
+						continue;
+					const int k = gKeyShare[static_cast<size_t>(yy) * gKeyW + xx];
+					sure = (k0 <= 15) == (k <= 15) && (k <= 15 || k >= 240);
+				}
+			if (sure)
+				out.push_back({static_cast<int>(x / st.pixelsPerDoc), static_cast<int>(y / st.pixelsPerDoc), k0 <= 15});
+		}
+	return out;
+}
+
+// How well a layout fits the samples: the share whose class (the empty
+// canvas's value or not) agrees with the mask, with the model's values
+// changing smoothly. Negative when it plainly does not fit.
+static double DepthFit(const unsigned char* mem, size_t size, size_t off, size_t pitch, size_t stride, int type, int scale,
+	const std::vector<DepthSample>& s, double& bg)
+{
+	const int n = kDepthTypeSize[type];
+	auto value = [&](int x, int y, double& v) {
+		const size_t at = off + static_cast<size_t>(y) * scale * pitch + static_cast<size_t>(x) * scale * stride;
+		if (at + n > size)
+			return false;
+		v = DepthValue(mem + at, type);
+		return v == v && fabs(v) < 1e30;
+	};
+	// The empty canvas: one value.
+	bool haveBg = false;
+	int bgSeen = 0, modelSeen = 0;
+	for (const DepthSample& p : s) {
+		double v;
+		if (p.model || !value(p.x, p.y, v))
+			continue;
+		if (!haveBg) {
+			bg = v;
+			haveBg = true;
+		} else if (!DepthSame(v, bg) && ++bgSeen > 3) {
+			return -1;
+		}
+	}
+	if (!haveBg)
+		return -1;
+	int agree = 0, total = 0;
+	double lo = 1e300, hi = -1e300;
+	for (const DepthSample& p : s) {
+		double v;
+		if (!value(p.x, p.y, v))
+			continue;
+		++total;
+		const bool model = !DepthSame(v, bg);
+		agree += model == p.model;
+		if (p.model && model) {
+			++modelSeen;
+			lo = std::min(lo, v);
+			hi = std::max(hi, v);
+		}
+	}
+	if (total < 50 || modelSeen < 20 || hi <= lo)
+		return -1;
+	// Depth's empty value is far beyond the model's (35840 for the empty
+	// canvas, the model -9 to -167, x64dbg). Build 161 took a mask plane,
+	// empty 1 and the model 0 to 0.998, and read depth 0 everywhere.
+	if (fabs(bg) < 4 * std::max(fabs(lo), fabs(hi)))
+		return -1;
+	// Neighbouring model pixels within a quarter of the model's range. (A
+	// twentieth, build 158, turned the real buffer down: the side of a model
+	// falls 10 document pixels a pixel in a range of 170, x64dbg.)
+	int smooth = 0, pairs = 0;
+	for (const DepthSample& p : s) {
+		double v, w;
+		if (!p.model || !value(p.x, p.y, v) || DepthSame(v, bg) || !value(p.x + 1, p.y, w) || DepthSame(w, bg))
+			continue;
+		++pairs;
+		smooth += fabs(w - v) <= (hi - lo) * 0.25;
+	}
+	if (pairs < 10 || smooth < pairs * 0.7)
+		return -1;
+	return static_cast<double>(agree) / total;
+}
+
+static void DepthLog(const char* what)
+{
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu canvas depth %s\n", GetTickCount(), what);
+		fclose(f);
+	}
+}
+
+// ZBrush 2023's own objects for the canvas (x64dbg, the DeathClaw in Edit
+// mode): an image object (vtable at ZBrush.exe + 0xCFD2DE8) with its width and
+// height as floats at +0x40 and +0x44, its pixels' object at +0x90, bits per
+// pixel at +0xA0 and bytes per row at +0xA4; the pixels' object (vtable at
+// + 0xCFFEF90) with its size at +0x38 and the first pixel's address at +0x40.
+// The document's own images are the ones its size, 32 bits a pixel; the
+// depth among them is the float plane whose empty value is far beyond the
+// model's. Found by the vtables, not by guessing at memory's contents
+// (builds 158-162: the depth missed in some sessions, a mask taken for it in
+// another).
+static const uintptr_t kImageVtable = 0xCFD2DE8, kPixelsVtable = 0xCFFEF90;
+
+static bool ReadOwn(uintptr_t at, void* out, size_t n)
+{
+	SIZE_T got = 0;
+	return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(at), out, n, &got) && got == n;
+}
+
+// The first pixel of an image object's plane, checked against both vtables
+// and the document's size; 0 if it is not one.
+static uintptr_t ImagePixels(uintptr_t image, int dw, int dh)
+{
+	const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+	unsigned char o[0xA8];
+	if (!ReadOwn(image, o, sizeof o))
+		return 0;
+	uintptr_t vt, pixels;
+	float w, h;
+	int bpp, pitch;
+	memcpy(&vt, o, 8);
+	memcpy(&w, o + 0x40, 4);
+	memcpy(&h, o + 0x44, 4);
+	memcpy(&pixels, o + 0x90, 8);
+	memcpy(&bpp, o + 0xA0, 4);
+	memcpy(&pitch, o + 0xA4, 4);
+	if (vt != exe + kImageVtable || w != dw || h != dh || bpp != 32 || pitch != dw * 4)
+		return 0;
+	unsigned char p[0x48];
+	if (!ReadOwn(pixels, p, sizeof p))
+		return 0;
+	uintptr_t pvt, first;
+	int64_t size;
+	memcpy(&pvt, p, 8);
+	memcpy(&size, p + 0x38, 8);
+	memcpy(&first, p + 0x40, 8);
+	return pvt == exe + kPixelsVtable && size == static_cast<int64_t>(dw) * dh * 4 ? first : 0;
+}
+
+// The document's images, found by the image vtable in private memory, each
+// tried as depth (DepthFit, and its empty value far beyond the model's).
+static bool DepthFromObjects(const OverlayState& st, const std::vector<DepthSample>& samples, int dw, int dh)
+{
+	const DWORD t0 = GetTickCount();
+	const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)), want = exe + kImageVtable;
+	std::vector<uintptr_t> images;
+	std::vector<unsigned char> buf(1 << 22);
+	MEMORY_BASIC_INFORMATION mbi;
+	size_t scanned = 0;
+	for (uintptr_t addr = 0; VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof mbi) == sizeof mbi;) {
+		const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress), next = base + mbi.RegionSize;
+		if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && (mbi.Protect & 0xff) == PAGE_READWRITE && !(mbi.Protect & PAGE_GUARD))
+			for (uintptr_t chunk = base; chunk < next; chunk += buf.size()) {
+				const size_t len = std::min<size_t>(buf.size(), next - chunk);
+				if (!ReadOwn(chunk, buf.data(), len))
+					continue;
+				scanned += len;
+				for (size_t i = 0; i + 8 <= len; i += 16) {
+					uintptr_t v;
+					memcpy(&v, &buf[i], 8);
+					if (v == want && ImagePixels(chunk + i, dw, dh))
+						images.push_back(chunk + i);
+				}
+			}
+		if (next <= addr)
+			break;
+		addr = next;
+	}
+	gDepthImages.clear();
+	char line[300];
+	snprintf(line, sizeof line, "by ZBrush's image objects: %zu of the document's size in %zu MB, %lu ms", images.size(), scanned >> 20, GetTickCount() - t0);
+	DepthLog(line);
+	DepthBuffer best;
+	for (uintptr_t image : images) {
+		const uintptr_t first = ImagePixels(image, dw, dh);
+		const size_t size = static_cast<size_t>(dw) * dh * 4;
+		std::vector<unsigned char> mem(size);
+		if (!first || !ReadOwn(first, mem.data(), size))
+			continue;
+		double bg = 0;
+		double fit = DepthFit(mem.data(), size, 0, static_cast<size_t>(dw) * 4, 4, 0, 1, samples, bg);
+		// By content alone, when the mask does not settle it: as floats, one
+		// value over a fifth of the plane, and every other value a quarter of
+		// it or less (depth: 35840 empty, the model in the hundreds).
+		const float* f = reinterpret_cast<const float*>(mem.data());
+		const size_t n = static_cast<size_t>(dw) * dh;
+		std::vector<float> s;
+		for (size_t i = 0; i < n; i += n / 4096 + 1)
+			s.push_back(f[i]);
+		std::vector<float> sorted = s;
+		std::sort(sorted.begin(), sorted.end());
+		float mode = sorted.empty() ? 0 : sorted[0];
+		size_t modeCount = 0;
+		for (size_t i = 0, run = 0; i < sorted.size(); ++i) {
+			run = i && sorted[i] == sorted[i - 1] ? run + 1 : 1;
+			if (run > modeCount) {
+				modeCount = run;
+				mode = sorted[i];
+			}
+		}
+		bool byContent = modeCount * 5 >= s.size() && fabs(mode) >= 100;
+		for (float v : s)
+			if (v != mode && !(fabs(v) * 4 <= fabs(mode)))
+				byContent = false;
+		if (fit < 0 && byContent) {
+			fit = 0.5;
+			bg = mode;
+		}
+		snprintf(line, sizeof line, "  image %p, pixels %p: %s, empty %.6g", reinterpret_cast<void*>(image), reinterpret_cast<void*>(first),
+			fit < 0 ? "not depth" : fit == 0.5 ? "depth by its values" : "depth", bg);
+		DepthLog(line);
+		if (fit >= 0)
+			gDepthImages.push_back({image, bg});
+		if (fit > best.score) {
+			best.ok = true;
+			best.base = first;
+			best.scale = 1;
+			best.pitch = static_cast<size_t>(dw) * 4;
+			best.stride = 4;
+			best.type = 0;
+			best.w = dw;
+			best.h = dh;
+			best.bg = bg;
+			best.score = fit;
+			best.image = image;
+		}
+	}
+	if (!best.ok)
+		return false;
+	gDepth = best;
+	return true;
+}
+
+// Looks for the buffer: by ZBrush's image objects, else every private
+// allocation the document's size, every layout. Logs the best few.
+static void DepthScan(const OverlayState& st)
+{
+	const DWORD t0 = GetTickCount();
+	const std::vector<DepthSample> samples = DepthSamples(st, 3000);
+	const int dw = static_cast<int>(st.docW + 0.5), dh = static_cast<int>(st.docH + 0.5);
+	if (samples.size() < 200 || dw < 16 || dh < 16)
+		return;
+	if (DepthFromObjects(st, samples, dw, dh))
+		return;
+	// Allocations: base and committed size (regions of one allocation summed);
+	// and every committed region on its own, for the wider search.
+	std::vector<std::pair<uintptr_t, size_t>> allocs, regions;
+	MEMORY_BASIC_INFORMATION mbi;
+	uintptr_t addr = 0;
+	while (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == sizeof(mbi)) {
+		const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress), next = base + mbi.RegionSize;
+		const DWORD prot = mbi.Protect & 0xff;
+		if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && (prot == PAGE_READWRITE) && !(mbi.Protect & PAGE_GUARD)) {
+			const uintptr_t ab = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+			regions.push_back({base, mbi.RegionSize});
+			if (!allocs.empty() && allocs.back().first == ab && allocs.back().first + allocs.back().second == base)
+				allocs.back().second += mbi.RegionSize;
+			else if (ab == base)
+				allocs.push_back({base, mbi.RegionSize});
+		}
+		if (next <= addr)
+			break;
+		addr = next;
+	}
+	std::vector<DepthBuffer> found;
+	std::vector<unsigned char> mem;
+	size_t tried = 0, copied = 0;
+	static const int kStrides[] = {2, 4, 8, 12, 16, 20, 24, 32};
+	for (const auto& al : allocs) {
+		bool loaded = false;
+		for (int scale = 1; scale <= 2; ++scale) {
+			const size_t w = static_cast<size_t>(dw) * scale, h = static_cast<size_t>(dh) * scale;
+			for (int stride : kStrides) {
+				size_t lastPitch = 0;
+				for (size_t align : {1, 16, 32, 64}) {
+					const size_t pw = (w + align - 1) / align * align, pitch = pw * stride;
+					if (pitch == lastPitch)
+						continue;
+					lastPitch = pitch;
+					const size_t need = pitch * h;
+					if (al.second < need || al.second > need + need / 50 + (1 << 16))
+						continue;
+					if (!loaded) {
+						if (al.second > (size_t(512) << 20))
+							break;
+						mem.resize(al.second);
+						SIZE_T got = 0;
+						if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(al.first), mem.data(), mem.size(), &got) || got != mem.size())
+							break;
+						loaded = true;
+						copied += got;
+					}
+					for (size_t head = 0; head + need <= al.second && head <= 4096; head += 16)
+						for (int type = 0; type < 4; ++type)
+							for (int field = 0; field + kDepthTypeSize[type] <= stride; field += kDepthTypeSize[type]) {
+								++tried;
+								double bg = 0;
+								const double fit = DepthFit(mem.data(), mem.size(), head + field, pitch, stride, type, scale, samples, bg);
+								if (fit < 0.9)
+									continue;
+								DepthBuffer b;
+								b.ok = true;
+								b.base = al.first + head + field;
+								b.scale = scale;
+								b.pitch = pitch;
+								b.stride = stride;
+								b.type = type;
+								b.w = static_cast<int>(w);
+								b.h = static_cast<int>(h);
+								b.bg = bg;
+								b.score = fit;
+								found.push_back(b);
+							}
+				}
+			}
+		}
+	}
+	// Not a block of its own (build 160 found no allocation the right size,
+	// where 159 found the buffer 0x70 into one): the start of a long run of
+	// one value (the empty canvas along the top rows) in any committed region
+	// big enough, taken as the image's first pixel, a float plane of the
+	// document's width.
+	if (found.empty()) {
+		const size_t need = static_cast<size_t>(dw) * dh * 4;
+		for (const auto& al : regions) {
+			if (al.second < need || al.second > (size_t(512) << 20))
+				continue;
+			mem.resize(al.second);
+			SIZE_T got = 0;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(al.first), mem.data(), mem.size(), &got) || got < need)
+				continue;
+			copied += got;
+			const uint32_t* d = reinterpret_cast<const uint32_t*>(mem.data());
+			const size_t n = got / 4;
+			for (size_t i = 0; i + 512 < n; i += 256) {
+				const uint32_t v = d[i];
+				if (!v || d[i + 64] != v || d[i + 255] != v || d[i + 511] != v)
+					continue;
+				float fv;
+				memcpy(&fv, &v, 4);
+				size_t s = i, e = i;
+				while (s > 0 && d[s - 1] == v)
+					--s;
+				while (e < n && d[e] == v)
+					++e;
+				if (fabs(fv) > 1e-3 && fabs(fv) < 1e7)
+					for (int scale = 1; scale <= 2; ++scale) {
+						const size_t pitch = static_cast<size_t>(dw) * scale * 4;
+						if (s * 4 + pitch * dh * scale > got)
+							continue;
+						++tried;
+						double bg = 0;
+						const double fit = DepthFit(mem.data(), got, s * 4, pitch, 4, 0, scale, samples, bg);
+						if (fit < 0.9)
+							continue;
+						DepthBuffer b;
+						b.ok = true;
+						b.base = al.first + s * 4;
+						b.scale = scale;
+						b.pitch = pitch;
+						b.stride = 4;
+						b.type = 0;
+						b.w = dw * scale;
+						b.h = dh * scale;
+						b.bg = bg;
+						b.score = fit;
+						found.push_back(b);
+					}
+				i = e / 256 * 256;  // past the run
+			}
+		}
+	}
+	// Best first; a float before the other readings of the same bytes; a
+	// buffer dropped before (ZBrush keeps two planes alike, and one may be a
+	// copy left behind) after the rest.
+	auto dropped = [](const DepthBuffer& b) {
+		return std::find(gDepthDropped.begin(), gDepthDropped.end(), b.base) != gDepthDropped.end();
+	};
+	std::stable_sort(found.begin(), found.end(), [&](const DepthBuffer& a, const DepthBuffer& b) {
+		if (dropped(a) != dropped(b))
+			return !dropped(a);
+		if (fabs(a.score - b.score) > 0.002)
+			return a.score > b.score;
+		return (a.type == 0) > (b.type == 0);
+	});
+	char line[400];
+	snprintf(line, sizeof line, "scan: %zu allocations, %zu MB copied, %zu layouts tried in %lu ms, %zu fit (document %d x %d, %zu samples)",
+		allocs.size(), copied >> 20, tried, GetTickCount() - t0, found.size(), dw, dh, samples.size());
+	DepthLog(line);
+	static const char* kTypes[4] = {"float", "uint16", "int32", "double"};
+	for (size_t i = 0; i < found.size() && i < 8; ++i) {
+		const DepthBuffer& b = found[i];
+		snprintf(line, sizeof line, "  candidate %zu: at %p, %s every %zu bytes, rows %zu bytes, %d x %d (x%d), empty canvas %.6g, agrees %.1f%%", i,
+			reinterpret_cast<void*>(b.base), kTypes[b.type], b.stride, b.pitch, b.w, b.h, b.scale, b.bg, 100 * b.score);
+		DepthLog(line);
+	}
+	if (!found.empty())
+		gDepth = found[0];
+}
+
+// ZBrush's tool position along the depth (TransformGet's z), in the canvas
+// depth's units: the model's pivot, which the canvas depth is measured from
+// once taken off. ZBrush keeps the position as floats, x, y, z, with the scale
+// in document pixels before them (x64dbg: 632.874 [439.086 1215.1 -650.225],
+// at zoom 3.29563; the face's depth -1895 is 575 model units in front of the
+// pivot from 0, 378 from -650, the model's front by the silhouettes 407).
+// Read from the triplet the overlay follows x and y in (MemFollow).
+
+static bool PivotDepth(const OverlayState& st, double& z)
+{
+	// The triplet MemFollow reads x and y from every frame: z is the value
+	// after y. (Build 166's search took copies of the start's position with
+	// 0 after them, which never moved again.) Only once the triplet has
+	// followed a pan or zoom drag: before that it may be one of those copies
+	// (build 172 took the first finished frame with depth 0 from one, where
+	// the camera's own read -530 at the next).
+	if (gTripletInUse >= 0 && gTripletInUse < static_cast<int>(gTriplets.size()) && gTriplets[gTripletInUse].posFrames > 0) {
+		// x, y, z in a row (the scale may be elsewhere within 1 KB: build 167
+		// required it just before x and never read a depth).
+		const MemTriplet& t = gTriplets[gTripletInUse];
+		double xyz[3] = {0, 0, 0};
+		bool read;
+		if (t.x.isDouble) {
+			read = ReadOwn(t.x.addr, xyz, sizeof xyz);
+		} else {
+			float f[3];
+			read = ReadOwn(t.x.addr, f, sizeof f);
+			for (int i = 0; i < 3; ++i)
+				xyz[i] = f[i];
+		}
+		static uintptr_t logged = 0;
+		if (logged != t.x.addr) {
+			logged = t.x.addr;
+			char line[240];
+			snprintf(line, sizeof line, "model pivot depth from the camera's triplet: x at %p (%s), scale at %+lld bytes; x %.3f y %.3f depth %.3f (overlay x %.3f y %.3f)",
+				reinterpret_cast<void*>(t.x.addr), t.x.isDouble ? "doubles" : "floats", static_cast<long long>(t.s.addr) - static_cast<long long>(t.x.addr),
+				xyz[0], xyz[1], xyz[2], st.px, st.py);
+			DepthLog(line);
+		}
+		if (read && fabs(xyz[0] - st.px) < 0.5 && fabs(xyz[1] - st.py) < 0.5 && fabs(xyz[2]) < 1e6 && xyz[2] == xyz[2]) {
+			z = xyz[2];
+			return true;
+		}
+	}
+	return false;
+}
+
+// ---------------------------------------------------------------------------
+// The model's depth as the active view sees it, from ZBrush's finished frames
+// only, kept in that view's image space (where MultiviewLayout's centreC
+// is), so panning and zooming only change which part of it is looked up.
+// ZBrush keeps two depth planes: it draws into one, part by part, almost all
+// the time the view moves, and copies a finished frame into the other, which
+// it clears as soon as it draws again (watching both from outside, 100 ms
+// apart). The two alike, with the model in them, is a finished frame: it is
+// taken into the map whole, every pixel, so the map holds the front surface
+// of all the model a finished frame has shown, and is refreshed by every
+// finished frame after (an edit included). Values: the model's front in
+// model units towards the camera, (pivot - depth) / zoom; kMapEmpty where a
+// finished frame showed no model; NaN never seen.
+// ---------------------------------------------------------------------------
+static const float kMapEmpty = -1e30f;
+struct DepthMap {
+	int view = -1;
+	double x0 = 0, y0 = 0, cell = 2;  // image point of cell (0, 0); image units a cell
+	int w = 0, h = 0;
+	std::vector<float> front;
+	std::vector<int> stamp;  // the frame that last wrote each cell
+	int frames = 0;
+};
+static DepthMap gDepthMap;
+
+// A finished frame of this view is in the map.
+static bool MapHas(int view)
+{
+	return gDepthMap.view == view && gDepthMap.frames > 0;
+}
+
+// The pivot depth, kept from its last read (the camera triplet runs a frame
+// ahead of the overlay's state during moves).
+static bool PivotKept(const OverlayState& st, double& pivot)
+{
+	static double kept = 0;
+	static bool have = false;
+	double p;
+	if (PivotDepth(st, p)) {
+		kept = p;
+		have = true;
+	}
+	pivot = kept;
+	return have;
+}
+
+// Each overlay step: a finished frame, when there is a new one, into the map.
+static void DepthMapStep(const OverlayState& st)
+{
+	const int c = gActiveView;
+	if (!gDepth.image || gDepthImages.size() < 2 || c < 0 || c >= kDefaultView || !gViews[c].used || st.ratio <= 0)
+		return;
+	const int w = gDepth.w, h = gDepth.h;
+	const uintptr_t a = ImagePixels(gDepthImages[0].first, w, h), b = ImagePixels(gDepthImages[1].first, w, h);
+	if (!a || !b)
+		return;
+	// First 16 rows of each: alike, and the model in them (or a full look
+	// at most every quarter second, for a model the rows miss).
+	static std::vector<float> rowA, rowB, planeA, planeB;
+	static DWORD lastFull = 0;
+	rowA.resize(w);
+	rowB.resize(w);
+	bool model = false;
+	for (int i = 0; i < 16; ++i) {
+		const size_t at = static_cast<size_t>((2 * i + 1) * h / 32) * w * 4;
+		if (!ReadOwn(a + at, rowA.data(), w * 4) || !ReadOwn(b + at, rowB.data(), w * 4) || memcmp(rowA.data(), rowB.data(), w * 4))
+			return;
+		for (int x = 0; x < w && !model; x += 4)
+			model = rowA[x] != rowA[0] && fabs(rowA[x]) < 1e6;
+	}
+	const DWORD now = GetTickCount();
+	if (!model && now - lastFull < 250)
+		return;
+	lastFull = now;
+	const size_t n = static_cast<size_t>(w) * h;
+	planeA.resize(n);
+	planeB.resize(n);
+	if (!ReadOwn(a, planeA.data(), n * 4) || !ReadOwn(b, planeB.data(), n * 4) || memcmp(planeA.data(), planeB.data(), n * 4))
+		return;
+	// The empty value: the most common of a sparse sample (ZBrush changes it,
+	// 24000 then 35840).
+	std::vector<float> s;
+	for (size_t i = 0; i < n; i += n / 2048 + 1)
+		s.push_back(planeA[i]);
+	std::sort(s.begin(), s.end());
+	float bg = s[0];
+	size_t most = 0;
+	for (size_t i = 0, run = 0; i < s.size(); ++i) {
+		run = i && s[i] == s[i - 1] ? run + 1 : 1;
+		if (run > most) {
+			most = run;
+			bg = s[i];
+		}
+	}
+	OverlayState cs;
+	std::string path;
+	double pivot;
+	if (!PivotKept(st, pivot) || !ViewLayout(c, st, cs, path) || cs.ratio <= 0)
+		return;
+	// The same frame as last time, seen again: nothing new.
+	uint64_t key = 1469598103934665603ull;
+	auto mix = [&](const void* p, size_t len) {
+		for (size_t i = 0; i < len; ++i)
+			key = (key ^ static_cast<const unsigned char*>(p)[i]) * 1099511628211ull;
+	};
+	for (size_t i = 0; i < n; i += 61)
+		mix(&planeA[i], 4);
+	const double cam[6] = {cs.px, cs.py, cs.ratio, cs.offX, cs.offY, pivot};
+	mix(cam, sizeof cam);
+	mix(&c, sizeof c);
+	static uint64_t lastKey = 0;
+	if (key == lastKey)
+		return;
+	lastKey = key;
+	DepthMap& m = gDepthMap;
+	if (m.view != c || m.front.empty()) {
+		m.view = c;
+		m.cell = 2;
+		m.w = static_cast<int>(3 * st.docW / m.cell);
+		m.h = static_cast<int>(3 * st.docH / m.cell);
+		m.x0 = cs.ax - 1.5 * st.docW;
+		m.y0 = cs.ay - 1.5 * st.docH;
+		m.front.assign(static_cast<size_t>(m.w) * m.h, std::numeric_limits<float>::quiet_NaN());
+		m.stamp.assign(static_cast<size_t>(m.w) * m.h, 0);
+		m.frames = 0;
+	}
+	++m.frames;
+	// Every document pixel, or every few when a cell spans several.
+	const int step = std::max(1, static_cast<int>(m.cell * cs.ratio / 2));
+	size_t modelPx = 0;
+	for (int y = 0; y < h; y += step)
+		for (int x = 0; x < w; x += step) {
+			const double u = (x - cs.px) / cs.ratio + cs.ax + cs.offX, v = (y - cs.py) / cs.ratio + cs.ay + cs.offY;
+			const int i = static_cast<int>(floor((u - m.x0) / m.cell)), j = static_cast<int>(floor((v - m.y0) / m.cell));
+			if (i < 0 || j < 0 || i >= m.w || j >= m.h)
+				continue;
+			const size_t k = static_cast<size_t>(j) * m.w + i;
+			const float d = planeA[static_cast<size_t>(y) * w + x];
+			const bool fresh = m.stamp[k] != m.frames;
+			if (d != bg && fabs(d) < 1e6) {
+				const float f = static_cast<float>((pivot - d) / st.ratio);
+				if (fresh || !(m.front[k] >= f))  // the nearest in the cell
+					m.front[k] = f;
+				++modelPx;
+			} else if (fresh) {
+				m.front[k] = kMapEmpty;
+			}
+			m.stamp[k] = m.frames;
+		}
+	static DWORD lastLog = 0;
+	if (now - lastLog > 5000) {
+		lastLog = now;
+		char line[200];
+		snprintf(line, sizeof line, "finished frame %d into view %d's map: %zu model pixels, empty %g, pivot %.3f, zoom %.5f", m.frames, c, modelPx * step * step, bg, pivot, st.ratio);
+		DepthLog(line);
+	}
+	// The cell is laid out again with it.
+	EnterCriticalSection(&gOverlayLock);
+	gRedrawPending = true;
+	LeaveCriticalSection(&gOverlayLock);
+}
+
+// The surface round an image point of a view, from its map, as CanvasDepth
+// read it from the plane: the model's front within reach, averaged with
+// weights falling smoothly to nothing at the reach; thick, the median width
+// of the model's runs across the rows within half the reach, standing in for
+// the part's thickness. In image (model) units. False with fewer than 10
+// cells of the model in reach.
+static bool MapDepth(int view, const double centre[2], double reach, double& front, double& thick, int& samples)
+{
+	samples = 0;
+	thick = 0;
+	const DepthMap& m = gDepthMap;
+	if (m.view != view || m.front.empty() || reach <= 0)
+		return false;
+	auto at = [&](double u, double v, float& f) {
+		const int i = static_cast<int>(floor((u - m.x0) / m.cell)), j = static_cast<int>(floor((v - m.y0) / m.cell));
+		if (i < 0 || j < 0 || i >= m.w || j >= m.h)
+			return false;
+		f = m.front[static_cast<size_t>(j) * m.w + i];
+		return f == f && f != kMapEmpty;
+	};
+	const double step = std::max(m.cell, reach / 12);
+	double sum = 0, weights = 0;
+	for (double dy = -reach; dy <= reach; dy += step)
+		for (double dx = -reach; dx <= reach; dx += step) {
+			const double d2 = (dx * dx + dy * dy) / (reach * reach);
+			float f;
+			if (d2 >= 1 || !at(centre[0] + dx, centre[1] + dy, f))
+				continue;
+			const double wgt = (1 - d2) * (1 - d2);
+			sum += wgt * f;
+			weights += wgt;
+			++samples;
+		}
+	if (samples < 10 || weights <= 0)
+		return false;
+	front = sum / weights;
+	// Every row within reach, a cell apart, each with the same weight as the
+	// depth's, falling to nothing at the reach: a row whose run changes part
+	// (an arm crossing it) moves the width by its small share, where the
+	// median of 7 rows let one row move it whole (build 172: the far side
+	// 207, then 90, the cell 50 px for 20 px of panning).
+	float f;
+	double runSum = 0, runWeights = 0;
+	for (double dy = -reach; dy <= reach; dy += m.cell) {
+		const double wgt = (1 - dy * dy / (reach * reach)) * (1 - dy * dy / (reach * reach));
+		if (wgt <= 0)
+			continue;
+		for (double r = 0; r <= reach; r += m.cell) {
+			bool found = false;
+			for (int side : {-1, 1}) {
+				const double u = centre[0] + side * r, v = centre[1] + dy;
+				if (!at(u, v, f))
+					continue;
+				double lo = u, hi = u;
+				while (hi - lo < 8 * reach && at(lo - m.cell, v, f))
+					lo -= m.cell;
+				while (hi - lo < 8 * reach && at(hi + m.cell, v, f))
+					hi += m.cell;
+				runSum += wgt * (hi - lo + m.cell);
+				runWeights += wgt;
+				found = true;
+				break;
+			}
+			if (found)
+				break;
+		}
+	}
+	if (runWeights > 0)
+		thick = runSum / runWeights;
+	return true;
+}
+
+// Each overlay step: finds the buffer and checks every 2 s that it still
+// fits (a new document moves it), both only with the canvas steady for half
+// a second: the capture lags ZBrush's redraw, and a check during a camera
+// move dropped the real buffer 3 s after it was found (build 159: "lost:
+// agrees with 120 of 360 pixels"), and the next scan waited 15 s. Two
+// failed checks in a row drop it; a scan follows at once, then every 5 s.
+static void DepthStep(const OverlayState& st)
+{
+	static DWORD lastScan = 0, lastCheck = 0, settledAt = 0;
+	static double lastCount = -1;
+	static int failed = 0;
+	const DWORD now = GetTickCount();
+	if (gGesture.active || gKeyShare.empty() || fabs(gModelPixels - lastCount) > 0.002 * (gModelPixels + 100)) {
+		lastCount = gModelPixels;
+		settledAt = now;
+		return;
+	}
+	if (now - settledAt < 500)
+		return;
+	if (gDepth.image && !gDepthImages.empty()) {
+		// Found by ZBrush's objects: every 2 s, each followed again (it may
+		// have moved the pixels) and the one that agrees with the mask taken,
+		// on the model and off it apart (a plane holding only the empty value
+		// agrees with nine samples in ten where the model fills a tenth).
+		if (now - lastCheck < 2000)
+			return;
+		lastCheck = now;
+		const std::vector<DepthSample> s = DepthSamples(st, 400);
+		const DepthBuffer was = gDepth;
+		double bestScore = -1;
+		DepthBuffer best = gDepth;
+		int bestModel = 0, bestModelTotal = 0;
+		static DWORD lastDiag = 0;
+		const bool diag = now - lastDiag > 6000;
+		if (diag)
+			lastDiag = now;
+		for (auto& im : gDepthImages) {
+			const uintptr_t first = ImagePixels(im.first, gDepth.w, gDepth.h);
+			if (!first)
+				continue;
+			gDepth.ok = true;
+			gDepth.base = first;
+			gDepth.image = im.first;
+			// The empty value, again from the canvas's samples: ZBrush changes
+			// it (24000, then 35840 a minute later, watching from outside).
+			{
+				std::vector<double> empties;
+				for (const DepthSample& p : s) {
+					double v;
+					if (!p.model && DepthAtDoc(p.x, p.y, v))
+						empties.push_back(v);
+				}
+				std::sort(empties.begin(), empties.end());
+				size_t run = 0, most = 0;
+				double mode = im.second;
+				for (size_t i = 0; i < empties.size(); ++i) {
+					run = i && empties[i] == empties[i - 1] ? run + 1 : 1;
+					if (run > most) {
+						most = run;
+						mode = empties[i];
+					}
+				}
+				if (most * 2 > empties.size() && fabs(mode) >= 100)
+					im.second = mode;
+			}
+			gDepth.bg = im.second;
+			int on = 0, onTotal = 0, off = 0, offTotal = 0;
+			for (const DepthSample& p : s) {
+				double v;
+				if (!DepthAtDoc(p.x, p.y, v))
+					continue;
+				const bool model = !DepthSame(v, gDepth.bg);
+				(p.model ? onTotal : offTotal)++;
+				(p.model ? on : off) += model == p.model;
+			}
+			if (onTotal < 10 || offTotal < 10)
+				continue;
+			const double score = std::min(static_cast<double>(on) / onTotal, static_cast<double>(off) / offTotal);
+			// Where the plane's model is against the mask's, to tell a stale
+			// plane (the model where it was) from an empty one or one off by a
+			// scale or shift (build 165: the model at 4 of the mask's 65).
+			if (score < 0.85 && diag) {
+				std::vector<float> plane(static_cast<size_t>(gDepth.w) * gDepth.h);
+				if (ReadOwn(first, plane.data(), plane.size() * 4)) {
+					size_t count = 0;
+					int px0 = gDepth.w, py0 = gDepth.h, px1 = -1, py1 = -1;
+					for (int y = 0; y < gDepth.h; ++y)
+						for (int x = 0; x < gDepth.w; ++x) {
+							const double v = plane[static_cast<size_t>(y) * gDepth.w + x];
+							if (DepthSame(v, gDepth.bg) || !(fabs(v) < 1e6))
+								continue;
+							++count;
+							px0 = std::min(px0, x);
+							py0 = std::min(py0, y);
+							px1 = std::max(px1, x);
+							py1 = std::max(py1, y);
+						}
+					int mx0 = 1 << 30, my0 = 1 << 30, mx1 = -1, my1 = -1;
+					for (const DepthSample& p : s)
+						if (p.model) {
+							mx0 = std::min(mx0, p.x);
+							my0 = std::min(my0, p.y);
+							mx1 = std::max(mx1, p.x);
+							my1 = std::max(my1, p.y);
+						}
+					char line[300];
+					snprintf(line, sizeof line, "  image %p: model %d/%d, canvas %d/%d; plane's model %zu px in %d %d to %d %d, the mask's in %d %d to %d %d", reinterpret_cast<void*>(im.first),
+						on, onTotal, off, offTotal, count, px0, py0, px1, py1, mx0, my0, mx1, my1);
+					DepthLog(line);
+				}
+			}
+			// The plane in use stays while it fits (CanvasDepth moves to the
+			// plane ZBrush redraws as the view moves; both fit while it is still).
+			if (score > bestScore + (im.first == was.image ? -0.05 : best.image == was.image && bestScore >= 0.85 ? 0.05 : 0)) {
+				bestScore = score;
+				best = gDepth;
+				bestModel = on;
+				bestModelTotal = onTotal;
+			}
+		}
+		if (bestScore < 0 && ImagePixels(was.image, was.w, was.h)) {
+			// Too little model or canvas in view to judge: as it was.
+			gDepth = was;
+			gDepth.base = ImagePixels(was.image, was.w, was.h);
+			return;
+		}
+		gDepth = best;
+		gDepth.ok = bestScore >= 0.85;
+		if (gDepth.ok != was.ok || gDepth.image != was.image) {
+			char line[200];
+			snprintf(line, sizeof line, "%s image %p: the model at %d of the mask's %d model pixels", gDepth.ok ? "using" : "no plane fits, best",
+				reinterpret_cast<void*>(gDepth.image), bestModel, bestModelTotal);
+			DepthLog(line);
+		}
+		if (bestScore < 0 && !ImagePixels(gDepth.image, gDepth.w, gDepth.h)) {
+			DepthLog("image objects gone, looking again");
+			gDepth = DepthBuffer();
+			gDepthImages.clear();
+			lastScan = 0;
+		}
+		return;
+	}
+	if (!gDepth.ok) {
+		// A scan copies a few hundred MB (0.9 s, build 161): at most every
+		// 30 s, at once after a drop.
+		if (now - lastScan < 30000 && lastScan)
+			return;
+		lastScan = now;
+		DepthScan(st);
+		failed = 0;
+		return;
+	}
+	if (now - lastCheck < 2000)
+		return;
+	lastCheck = now;
+	if (gDepth.image) {
+		// Found by ZBrush's objects: followed again (it may have moved the
+		// pixels), not judged by the mask.
+		const uintptr_t first = ImagePixels(gDepth.image, gDepth.w, gDepth.h);
+		if (!first) {
+			DepthLog("image object gone, looking again");
+			gDepth.ok = false;
+			lastScan = 0;
+		} else {
+			gDepth.base = first;
+		}
+		return;
+	}
+	const std::vector<DepthSample> s = DepthSamples(st, 400);
+	int agree = 0, total = 0;
+	for (const DepthSample& p : s) {
+		double v;
+		if (!DepthAtDoc(p.x, p.y, v))
+			continue;
+		++total;
+		agree += !DepthSame(v, gDepth.bg) == p.model;
+	}
+	if (total >= 50 && agree < total * 0.85) {
+		char line[160];
+		snprintf(line, sizeof line, "check failed: agrees with %d of %d pixels%s", agree, total, failed ? ", dropped" : "");
+		DepthLog(line);
+		if (++failed >= 2) {
+			gDepth.ok = false;
+			gDepthDropped.push_back(gDepth.base);
+			lastScan = 0;
+		}
+	} else {
+		failed = 0;
+	}
 }
 
 // Waits (up to 2 s) for a queued recording to be done.
@@ -6591,6 +8178,9 @@ static bool OverlayStep(HWND wnd)
 		}
 	}
 	ViewJobStep(st);
+	ViewRefreshStep(st);
+	DepthStep(st);
+	DepthMapStep(st);
 	return true;
 }
 
