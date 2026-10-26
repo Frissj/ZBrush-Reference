@@ -23,9 +23,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 205"]
+[VarDef, zrsBuild, "build 215"]
 [VarDef, zrsDll, "JRef_Data\JRef64.dll"]
-[VarDef, zrsDllBuild, 205]
+[VarDef, zrsDllBuild, 215]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -401,6 +401,7 @@
 		[IShow, "ZPlugin:JRef:|"]
 		[IShow, "ZPlugin:JRef:PureRef Mode"]
 		[IShow, "ZPlugin:JRef:Reset"]
+		[IShow, "ZPlugin:JRef:Auto Persp"]
 		[IShow, "ZPlugin:JRef:Views"]
 		[IShow, "ZPlugin:JRef:Image"]
 		,
@@ -409,6 +410,7 @@
 		[IHide, "ZPlugin:JRef:|"]
 		[IHide, "ZPlugin:JRef:PureRef Mode"]
 		[IHide, "ZPlugin:JRef:Reset"]
+		[IHide, "ZPlugin:JRef:Auto Persp"]
 		[IHide, "ZPlugin:JRef:Views"]
 		[IHide, "ZPlugin:JRef:Image"]
 	]
@@ -434,6 +436,7 @@
 	[ISet, "ZPlugin:JRef:Overlay Off", [FileExecute, zrsDll, "RSIsOn", "overlayoff"]]
 	[ISet, "ZPlugin:JRef:Classic Mode", [FileExecute, zrsDll, "RSIsOn", "classic"]]
 	[ISet, "ZPlugin:JRef:PureRef Mode", [FileExecute, zrsDll, "RSIsOn", "pureref"]]
+	[ISet, "ZPlugin:JRef:Auto Persp", [FileExecute, zrsDll, "RSIsOn", "autopersp"]]
 	[ISet, "ZPlugin:JRef:Multiview:Multiview", [FileExecute, zrsDll, "RSIsOn", "multi"]]
 	[ISet, "ZPlugin:JRef:Multiview:3D Auto Track", [FileExecute, zrsDll, "RSIsOn", "auto3d"]]
 	[ISet, "ZPlugin:JRef:Upper Image:Front", [FileExecute, zrsDll, "RSIsOn", "a 0"]]
@@ -608,6 +611,17 @@
 	[If, zrsTick < 256, [FileExecute, zrsDll, "RSDisplay", [StrMerge, "back ", zrsTick]]]
 	[FileExecute, zrsDll, "RSDisplay", "mode 1"]
 ]
+// Auto Persp on: ZBrush's Persp on in PureRef Mode, off in Classic (where the
+// image lies on one plane and perspective draws the model off it). Only when
+// the mode or the overlay changes, so Persp set by hand in between stays.
+[RoutineDef, ZRSAutoPersp,
+	[If, [FileExecute, zrsDll, "RSIsOn", "autopersp"] && [FileExecute, zrsDll, "RSIsOn", "overlay"],
+		[If, [IExists, "Draw:Persp"],
+			[ISet, "Draw:Persp", [FileExecute, zrsDll, "RSIsOn", "pureref"]]
+			[FileExecute, zrsDll, "RSLog", [StrMerge, "auto persp: Persp set to ", [FileExecute, zrsDll, "RSIsOn", "pureref"]]]
+		]
+	]
+]
 // Turns Adjust Image off when it is on, else on.
 [RoutineDef, ZRSPressAdjust,
 	[If, [FileExecute, zrsDll, "RSIsOn", "adjust"],
@@ -627,8 +641,8 @@
 // Overlay and Overlay Off: the lit one says whether the overlay is on.
 [ISwitch, "ZPlugin:JRef:Overlay", [FileExecute, zrsDll, "RSIsOn", "overlay"],
 	"Show the reference in a click-through window over the canvas, behind the model (lit while on). Press again to find the canvas again.",
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressOverlay] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressOverlay] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressOverlay] [RoutineCall, ZRSAutoPersp] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressOverlay] [RoutineCall, ZRSAutoPersp] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
 	, 0, 0.5
 ]
 
@@ -643,15 +657,15 @@
 // bar between them is only a divider (it does nothing).
 [ISwitch, "ZPlugin:JRef:Classic Mode", [FileExecute, zrsDll, "RSIsOn", "classic"],
 	"Classic Mode: the reference shows behind the model.",
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "mode 0"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "mode 0"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "mode 0"] [RoutineCall, ZRSAutoPersp] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "mode 0"] [RoutineCall, ZRSAutoPersp] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
 	, 0, 0.45
 ]
 [IButton, "ZPlugin:JRef:|", "Classic Mode or PureRef Mode.", , 1, 0.1]
 [ISwitch, "ZPlugin:JRef:PureRef Mode", [FileExecute, zrsDll, "RSIsOn", "pureref"],
 	"PureRef Mode: the reference shows in a panel at the side, zoomed and panned with the camera.",
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressPureRef] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressPureRef] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressPureRef] [RoutineCall, ZRSAutoPersp] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressPureRef] [RoutineCall, ZRSAutoPersp] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
 	, 0, 0.45
 ]
 // Each press moves the panel to the other side ("left -1" toggles it): a
@@ -659,6 +673,14 @@
 [IButton, "ZPlugin:JRef:Swap Side",
 	"PureRef: move the panel to the other side of the canvas.",
 	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "left -1"] [VarSet, zrsBusy, 0]]
+	, 0, 0.5
+]
+// Auto Persp: a setting (lit while on), applied when the mode changes
+// (ZRSAutoPersp).
+[ISwitch, "ZPlugin:JRef:Auto Persp", [FileExecute, zrsDll, "RSIsOn", "autopersp"],
+	"Turn ZBrush's Persp on in PureRef Mode and off in Classic Mode, each time the mode changes. Persp set by hand stays until the next change.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "autopersp -1"] [RoutineCall, ZRSAutoPersp] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "autopersp -1"] [RoutineCall, ZRSAutoPersp] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
 	, 0, 0.5
 ]
 

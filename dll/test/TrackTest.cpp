@@ -101,17 +101,21 @@ struct Camera {
 	double r, px, py;
 };
 
+static const double kDocW = 1019, kDocH = 776;
+
 // The nearest surface (largest depth towards the camera) per pixel of a grid
-// whose pixel (i, j) is at document point (ox + i * ps, oy + j * ps).
-static void Rasterize(const Mesh& m, const Camera& c, int w, int h, double ox, double oy, double ps, std::vector<double>& depth)
+// whose pixel (i, j) is at document point (ox + i * ps, oy + j * ps). invD:
+// Persp as ZBrush draws it about the document's middle, 0 flat.
+static void Rasterize(const Mesh& m, const Camera& c, int w, int h, double ox, double oy, double ps, std::vector<double>& depth, double invD = 0)
 {
 	depth.assign(static_cast<size_t>(w) * h, -1e300);
 	const size_t nt = m.tri.size() / 3;
 	std::vector<double> sx(m.v.size()), sy(m.v.size()), sz(m.v.size());
 	for (size_t i = 0; i < m.v.size(); ++i) {
-		sx[i] = (c.px + c.r * Dot(m.v[i], c.d[0]) - ox) / ps;
-		sy[i] = (c.py + c.r * Dot(m.v[i], c.d[1]) - oy) / ps;
 		sz[i] = Dot(m.v[i], c.d[2]);
+		const double q = std::max(0.05, 1 - sz[i] * invD);
+		sx[i] = (kDocW * 0.5 + (c.px + c.r * Dot(m.v[i], c.d[0]) - kDocW * 0.5) / q - ox) / ps;
+		sy[i] = (kDocH * 0.5 + (c.py + c.r * Dot(m.v[i], c.d[1]) - kDocH * 0.5) / q - oy) / ps;
 	}
 	for (size_t t = 0; t < nt; ++t) {
 		const uint32_t a = m.tri[3 * t], b = m.tri[3 * t + 1], e = m.tri[3 * t + 2];
@@ -185,7 +189,6 @@ static Camera Orbit(double yawDeg, double pitchDeg, double zoom)
 	return c;
 }
 
-static const double kDocW = 1019, kDocH = 776;
 static const double kAnchorScale = 40.834045, kAnchorX = 536.340820, kAnchorY = 784.979126;
 
 // A view slot set up as JRef records it, its silhouette rendered from the
@@ -234,6 +237,9 @@ struct Result {
 	double cloudErr;
 	int cloudSamples;
 	bool edge;  // the middle on an outline: the rays round it meet surfaces apart
+	// Persp cases: the cell's zoom over the model's as drawn there, less 1.
+	int kind = 0;  // 0 flat, 1 Persp after the flat frames, 2 Persp from no points
+	double scaleErr = 0;
 };
 
 // The window's middle (document pixels) and half size (model units), as
@@ -374,6 +380,73 @@ static bool SilhouetteTests()
 	return pass;
 }
 
+// Whether the view counts as turning (Turning, after RotFollow reads the
+// rotation's copies, as each overlay frame does), with nine copies of
+// ZBrush's rotation in this process's memory, snapped to Right:
+// - an Alt pan in which one copy reads Front for a frame (build 205's log):
+//   not turning, and that copy is dropped;
+// - a turn drag in which three of the copies move (as ZBrush's do): turning.
+static bool RotationTests()
+{
+	static double mats[9][9];
+	const double right[9] = {0, 0, 1, 0, 1, 0, -1, 0, 0}, front[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+	const double a = 0.2, turned[9] = {cos(a), 0, sin(a), 0, 1, 0, -sin(a), 0, cos(a)};
+	auto setUp = [&]() {
+		gRotCands.clear();
+		for (int k = 0; k < 9; ++k) {
+			memcpy(mats[k], right, sizeof(right));
+			RotCand c = {};
+			c.addr = reinterpret_cast<uintptr_t>(mats[k]);
+			c.isDouble = true;
+			c.stride = 3;
+			c.unit = true;
+			c.rel = 0;
+			memcpy(c.m, right, sizeof(right));
+			memcpy(c.settled, right, sizeof(right));
+			gRotCands.push_back(c);
+		}
+		gRotLocked = true;
+		gRotSettled = true;
+		gGesture = Gesture();
+		gGesture.active = true;
+		gButtonsDown = 1;
+		gLastButtonAt = GetTickCount();
+	};
+	// The pan.
+	setUp();
+	gGesture.mode = kDragMove;
+	RotFollow();
+	memcpy(mats[1], front, sizeof(front));
+	RotFollow();
+	const bool panFlicker = Turning();
+	memcpy(mats[1], right, sizeof(right));
+	RotFollow();
+	const bool panAfter = Turning();
+	const size_t panLeft = gRotCands.size();
+	// The turn.
+	setUp();
+	gGesture.mode = kDragNone;
+	RotFollow();
+	for (int k = 0; k < 3; ++k)
+		memcpy(mats[k], turned, sizeof(turned));
+	RotFollow();
+	const bool turnSeen = Turning();
+	const size_t turnLeft = gRotCands.size();
+
+	gRotCands.clear();
+	gRotLocked = false;
+	gRotSettled = true;
+	gTurnKnown = gTurning = false;
+	gGesture = Gesture();
+	gButtonsDown = 0;
+	const bool panOk = !panFlicker && !panAfter && panLeft == 8, turnOk = turnSeen && turnLeft == 9;
+	printf("turning, read from nine copies of ZBrush's rotation:\n");
+	printf("  Alt pan, one copy flickers to Front    turning %d then %d, %zu copies kept: %s\n", panFlicker, panAfter, panLeft,
+		panOk ? "pass" : "FAIL");
+	printf("  turn drag, three copies move           turning %d, %zu copies kept: %s\n", turnSeen, turnLeft, turnOk ? "pass" : "FAIL");
+	return panOk && turnOk;
+}
+
 static int Run(int argc, char** argv)
 {
 	const char* objPath = argc > 1 ? argv[1] : "C:\\Users\\Friss\\Downloads\\dafoe_final_v001.obj";
@@ -397,6 +470,7 @@ static int Run(int argc, char** argv)
 	gTesting = true;
 	gDataFolder = std::wstring(outDir.begin(), outDir.end());
 	_wremove((gDataFolder + L"nav_log.txt").c_str());
+	const bool rotOk = RotationTests();
 	gViewsLoaded = true;
 	gAnchorScale = kAnchorScale;
 	gMode = 1;
@@ -568,6 +642,144 @@ static int Run(int argc, char** argv)
 				}
 			}
 
+	// Persp (Draw > Persp, 50 mm on 1019 x 776: the eye at 1415.28 document
+	// pixels up to zoom 1.38, 0.7256 x the zoom x that past it, as ZBrush's
+	// record has it), its frames as ZBrush draws them: a point Z = zoom * depth
+	// in front of the pivot's plane at E / (E - Z) times its flat place, its
+	// value pivot - 2E - Z * E / (E - Z). Twice: after the flat frames above,
+	// and from no points (Persp on from the start, as Auto Persp has it in
+	// PureRef), each case's frame taken before its layout. The camera panned so
+	// the target is drawn at the window's middle; the truth: what the ray
+	// through the middle meets, towards the eye. Each cell, the snapped view's
+	// too, should centre on it and be zoomed as the model is drawn there.
+	const double kEye = 1415.28;
+	gTestProjD0 = kEye;
+	int perspCases = 0, perspTaken[3] = {}, perspTried[3] = {};
+	for (int kind : {1, 2}) {
+		if (kind == 2) {
+			gCloud.clear();
+			gCloudAt.clear();
+			gFrames.clear();
+		}
+		for (const Angle& an : angles)
+			for (double zoom : {1.0, 2.5})
+				for (const Target& tg : targets) {
+					Camera cam = Orbit(an.yaw, an.pitch, zoom);
+					const double eye = std::max(kEye, 0.72562 * zoom * kEye), invD = zoom / eye, cx = kDocW * 0.5, cy = kDocH * 0.5;
+					double midX, midY, half[2];
+					Window(zoom, midX, midY, half);
+					const double q = 1 - Dot(tg.p, cam.d[2]) * invD;
+					cam.px = cx + (midX - cx) * q - zoom * Dot(tg.p, cam.d[0]);
+					cam.py = cy + (midY - cy) * q - zoom * Dot(tg.p, cam.d[1]);
+					const Vec base = cam.d[0] * ((midX - cam.px) / zoom) + cam.d[1] * ((midY - cam.py) / zoom);
+					const Vec dir = cam.d[2] - (cam.d[0] * (midX - cx) + cam.d[1] * (midY - cy)) * (invD / zoom);
+					double facing = 0;
+					const std::vector<double> ts = Crossings(mesh, base, dir, &facing);
+					// Past the model, into it, or the model reaching the eye.
+					if (ts.size() < 2 || facing != outside || ts[0] * invD > 0.9) {
+						++skipped;
+						continue;
+					}
+					gActiveView = an.snapped;
+					gViewAway = an.snapped < 0;
+					const double pivot = an.snapped >= 0 ? 0 : 400 * sin(an.yaw * kPi / 180 + 0.3) * zoom + 90 * an.pitch / 25;
+					for (int a = 0; a < 3; ++a) {
+						gTestCam.d[a][0] = cam.d[a].x;
+						gTestCam.d[a][1] = cam.d[a].y;
+						gTestCam.d[a][2] = cam.d[a].z;
+					}
+					gTestCam.pivot = pivot;
+					OverlayState st;
+					st.docW = kDocW;
+					st.docH = kDocH;
+					st.pixelsPerDoc = 1;
+					st.ratio = zoom;
+					st.px = cam.px;
+					st.py = cam.py;
+					st.visible = true;
+					Rasterize(mesh, cam, static_cast<int>(kDocW), static_cast<int>(kDocH), 0, 0, 1, depth, invD);
+					for (size_t i = 0; i < plane.size(); ++i)
+						plane[i] = depth[i] > -1e299 ? static_cast<float>(pivot - 2 * eye - zoom * depth[i] / (1 - depth[i] * invD)) : 32608.0f;
+					const int version = gCloudVersion;
+					TakeFrame(st, gTestCam.d, plane, static_cast<int>(kDocW), static_cast<int>(kDocH), tick += 500);
+					perspTaken[kind] += gCloudVersion != version;
+					++perspTried[kind];
+					++perspCases;
+					// How much larger than on the pivot's plane the model is drawn at
+					// the surface looked at.
+					const double grow = 1 / (1 - ts[0] * invD);
+					std::vector<Vec> truths = {base + dir * ts[0]};
+					std::vector<double> truthT = {ts[0]};
+					bool edge = false;
+					for (int k = 0; k < 4; ++k) {
+						const double step = std::max(0.02 * half[0], 2.5 * kCloudCell);
+						const Vec off = cam.d[k / 2] * (k % 2 ? step : -step);
+						const std::vector<double> near = Crossings(mesh, base + off, dir);
+						if (near.empty())
+							continue;
+						truths.push_back(base + off + dir * near[0]);
+						truthT.push_back(near[0]);
+						edge = edge || fabs(near[0] - ts[0]) > 0.1 * half[0];
+					}
+					for (int slot : {0, 2}) {
+						OverlayState out;
+						std::string path;
+						if (!MultiviewLayout(slot, st, out, path))
+							continue;
+						const ViewFrame vf = FrameFor(slot, 0, 0);
+						const double centre[2] = {(midX - out.px) / out.ratio + out.ax, (midY - out.py) / out.ratio + out.ay};
+						// The window the cell shows, in model units at the surface.
+						const double halfS[2] = {half[0] / grow, half[1] / grow};
+						Result res;
+						char label[160];
+						snprintf(label, sizeof label, "%s yaw %+4.0f pitch %+3.0f zoom %.1f %-11s", kind == 1 ? "persp " : "persp0", an.yaw, an.pitch, zoom, tg.name);
+						res.label = label;
+						res.slot = slot;
+						double err[2] = {0, 0}, best = -1;
+						for (const Vec& tp : truths) {
+							double e[2];
+							for (int a = 0; a < 2; ++a)
+								e[a] = (centre[a] - ToImage(vf, a, Axis(tp, vf.m[a]))) * vf.f;
+							const double worst = std::max(fabs(e[0]) / halfS[0], fabs(e[1]) / halfS[1]);
+							if (best < 0 || worst < best) {
+								best = worst;
+								err[0] = e[0];
+								err[1] = e[1];
+							}
+						}
+						res.edge = edge;
+						res.errU = err[0];
+						res.errV = err[1];
+						res.halfU = halfS[0];
+						res.halfV = halfS[1];
+						res.shareU = fabs(err[0]) / halfS[0];
+						res.shareV = fabs(err[1]) / halfS[1];
+						res.kind = kind;
+						// On an outline, as drawn at whichever surface beside the middle is nearest.
+						res.scaleErr = out.ratio / (zoom * vf.f * grow) - 1;
+						for (double t : truthT) {
+							const double e = out.ratio * (1 - t * invD) / (zoom * vf.f) - 1;
+							if (fabs(e) < fabs(res.scaleErr))
+								res.scaleErr = e;
+						}
+						res.pass = res.shareU <= 0.10 && res.shareV <= 0.10 && fabs(res.scaleErr) <= 0.05;
+						res.cloudErr = 0;
+						res.cloudSamples = 0;
+						if (!only.empty()) {
+							if (res.label.find(only) == std::string::npos)
+								continue;
+							printf("%s %s cell: error %+.1f %+.1f, zoom %+.1f%%; surface at %.1f, drawn x%.3f\n", label, slot == 0 ? "Front" : "Right", err[0], err[1], 100 * res.scaleErr, ts[0], grow);
+						}
+						results.push_back(res);
+					}
+				}
+	}
+	gTestProjD0 = 0;
+	// Every Persp frame taken: its depth from the eye, none put elsewhere by
+	// the points (PerspCheck).
+	const bool perspFramesOk = perspTaken[1] == perspTried[1] && perspTaken[2] == perspTried[2];
+	printf("Persp frames taken: %d of %d after the flat frames, %d of %d from no points: %s\n", perspTaken[1], perspTried[1], perspTaken[2], perspTried[2], perspFramesOk ? "pass" : "FAIL");
+
 	// Report: every failure, a summary per view and per zoom, results.csv.
 	int pass = 0;
 	for (const Result& r : results)
@@ -581,23 +793,32 @@ static int Run(int argc, char** argv)
 	printf("\nfailures (error as a share of the window's half size, across / down the cell):\n");
 	for (const Result& r : results)
 		if (!r.pass)
-			printf("  %s  %s cell  %+7.1f %+7.1f units  (%3.0f%% %3.0f%%)  points' depth %+6.1f off (%d bins)%s\n", r.label.c_str(), r.slot == 0 ? "Front" : "Right", r.errU, r.errV, 100 * r.shareU, 100 * r.shareV, r.cloudErr, r.cloudSamples, r.edge ? "  on an edge" : "");
-	for (int slot : {0, 2}) {
-		int n = 0, ok = 0;
-		std::vector<double> shares;
-		for (const Result& r : results)
-			if (r.slot == slot) {
-				++n;
-				ok += r.pass;
-				shares.push_back(std::max(r.shareU, r.shareV));
-			}
-		std::sort(shares.begin(), shares.end());
-		if (n)
-			printf("%s cell: %d of %d pass; worst-axis error median %.0f%%, 90th %.0f%%, max %.0f%% of the half window\n", slot == 0 ? "Front" : "Right", ok, n,
-				100 * shares[shares.size() / 2], 100 * shares[shares.size() * 9 / 10], 100 * shares.back());
-	}
-	printf("%d cases (%d looking past or into the model skipped), %zu cells: %d pass, %zu fail (%lu ms)\n", cases, skipped, results.size(), pass, results.size() - pass, GetTickCount() - t0);
-	return pass == static_cast<int>(results.size()) && scaleOk ? 0 : 1;
+			if (r.kind)
+				printf("  %s  %s cell  %+7.1f %+7.1f units  (%3.0f%% %3.0f%%)  zoom %+.1f%% off%s\n", r.label.c_str(), r.slot == 0 ? "Front" : "Right", r.errU, r.errV, 100 * r.shareU, 100 * r.shareV, 100 * r.scaleErr, r.edge ? "  on an edge" : "");
+			else
+				printf("  %s  %s cell  %+7.1f %+7.1f units  (%3.0f%% %3.0f%%)  points' depth %+6.1f off (%d bins)%s\n", r.label.c_str(), r.slot == 0 ? "Front" : "Right", r.errU, r.errV, 100 * r.shareU, 100 * r.shareV, r.cloudErr, r.cloudSamples, r.edge ? "  on an edge" : "");
+	const char* kindName[3] = {"", "Persp ", "Persp from no points, "};
+	for (int kind : {0, 1, 2})
+		for (int slot : {0, 2}) {
+			int n = 0, ok = 0;
+			std::vector<double> shares, zooms;
+			for (const Result& r : results)
+				if (r.slot == slot && r.kind == kind) {
+					++n;
+					ok += r.pass;
+					shares.push_back(std::max(r.shareU, r.shareV));
+					zooms.push_back(fabs(r.scaleErr));
+				}
+			std::sort(shares.begin(), shares.end());
+			std::sort(zooms.begin(), zooms.end());
+			if (n)
+				printf("%s%s cell: %d of %d pass; worst-axis error median %.0f%%, 90th %.0f%%, max %.0f%% of the half window%s", kindName[kind], slot == 0 ? "Front" : "Right", ok, n,
+					100 * shares[shares.size() / 2], 100 * shares[shares.size() * 9 / 10], 100 * shares.back(), kind ? "" : "\n");
+			if (n && kind)
+				printf("; zoom off median %.1f%%, max %.1f%%\n", 100 * zooms[zooms.size() / 2], 100 * zooms.back());
+		}
+	printf("%d cases, %d in Persp (%d looking past or into the model skipped), %zu cells: %d pass, %zu fail (%lu ms)\n", cases + perspCases, perspCases, skipped, results.size(), pass, results.size() - pass, GetTickCount() - t0);
+	return pass == static_cast<int>(results.size()) && scaleOk && rotOk && perspFramesOk ? 0 : 1;
 }
 
 }  // namespace track_test

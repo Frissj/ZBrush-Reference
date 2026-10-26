@@ -260,7 +260,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 205;
+static const int kDllBuild = 215;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1552,6 +1552,9 @@ static int gMode = 0, gPanelLeft = 0, gMulti = 0, gMultiA = 0, gMultiB = 3, gBac
 // 3D Auto Track: Multiview goes to the surface being looked at (SurfaceDepth),
 // not only the band; off unless switched on.
 static int gAuto3D = 0;
+// Auto Persp: the script turns ZBrush's Persp on with PureRef Mode and off
+// with Classic when this is on (only then: Persp set by hand stays).
+static int gAutoPersp = 0;
 // Multiview's four cells (top left, top right, bottom right, bottom left):
 // a view slot each, or -1 for none.
 static int gCells[4] = {0, 3, 4, 1};
@@ -4104,7 +4107,7 @@ cbuffer C : register(b0) {
 	int4 panel;
 	int4 flyout;
 	int gizmoX; int gizmoBottom; float blendM; int boxCount;
-	int uiCount; float rot; int2 pad;
+	int uiCount; float rot; float back; int pad;
 	int4 boxes[16];
 	int4 ui[16];
 };
@@ -4152,12 +4155,17 @@ float4 compose(VO i) : SV_Target {
 	bool inFly = In(flyout, p);
 	bool inView = In(viewport, p);
 	bool gizmo = p.y < gizmoBottom && p.x >= gizmoX;
-	if (mode == 0 && blendM > 0 && !bg && inView && rf.a > 0 && !gizmo && !menuPix && !inFly)
+	bool inBox = inFly;
+	for (int k = 0; k < boxCount; ++k)
+		inBox = inBox || In(boxes[k], p);
+	if (mode == 0 && blendM > 0 && !bg && inView && rf.a > 0 && !gizmo && !menuPix && !inBox)
 		o = float4(cap.rgb + (rf.rgb - cap.rgb * rf.a) * blendM, 1);
+	// Classic: a menu's whole box is ZBrush's, the canvas behind it plain
+	// grey (build 206 showed the reference through the ZPlugin palette's
+	// see-through backdrop, only PureRef's panel kept out of the boxes).
+	if (mode == 0 && (inBox || menuPix))
+		o = bg ? float4(back, back, back, 1) : cap;
 	if (mode == 1 && In(panel, p)) {
-		bool inBox = inFly;
-		for (int k = 0; k < boxCount; ++k)
-			inBox = inBox || In(boxes[k], p);
 		if (inBox || menuPix)
 			o = 0;
 		else if (hover == 0)
@@ -4190,7 +4198,8 @@ struct GpuConsts {
 	int boxCount;
 	int uiCount;
 	float rot;  // radians, for a turned image
-	int pad[2];
+	float back;  // gBackGrey, 0-1
+	int pad;
 	int boxes[16][4];
 	int ui[16][4];
 };
@@ -4724,6 +4733,7 @@ struct GpuOverlay {
 		c.gizmoX = vx1 - static_cast<int>(std::min(vx1 - vx0, vy1 - vy0) * 0.3);
 		c.gizmoBottom = gGizmoBottom;
 		c.blendM = gModelOpacity < 100 ? (100 - gModelOpacity) / 100.0f : 0;
+		c.back = (gBackGrey & 255) / 255.0f;
 		for (const RECT& r : gMenuBoxes) {
 			if (c.boxCount == 16)
 				break;
@@ -5432,6 +5442,17 @@ static void HoldScale(ScaleHold& h, bool hold, double rOld, double r, double& fi
 	fix = fabs(r / h.r0 - 1) < 0.05 ? std::max(0.01, std::min(100.0, h.fix0 * h.r0 / r)) : h.fix0;
 }
 
+// Turning: the rotation read from memory is changing, or without it, a drag
+// that is neither a pan nor a zoom. Never in a pan or a zoom: ZBrush does not
+// turn then, whatever a copy of the rotation reads, and a pan taken for a
+// turn goes into the offset (the image stops following the model).
+static bool Turning()
+{
+	if (gGesture.active && (gGesture.mode == kDragMove || gGesture.mode == kDragScale))
+		return false;
+	return gTurnKnown ? gTurning : gGesture.active && gGesture.mode == kDragNone;
+}
+
 static void MemFollow()
 {
 	if (!gMemLocked || gAnchorScale <= 0)
@@ -5445,9 +5466,7 @@ static void MemFollow()
 		if (gMemScale.cands.size() + gMemX.cands.size() + gMemY.cands.size() != before)
 			BuildTriplets();
 	}
-	// Turning: the rotation read from memory is changing, or without it, a
-	// drag that is neither a pan nor a zoom.
-	const bool rotating = gTurnKnown ? gTurning : gGesture.active && gGesture.mode == kDragNone;
+	const bool rotating = Turning();
 	const bool panning = gGesture.active && gGesture.mode == kDragMove;
 	OverlayState& st = gOverlay;
 	double sx = st.ratio * gAnchorScale, px = st.px, py = st.py;
@@ -6320,7 +6339,7 @@ static bool CanvasDepth(double x, double y, double reach, double kp, double& z, 
 // perspective is taken about.
 // A point's depth Z towards the camera is (pivot - value) / zoom model units
 // (DepthZ), pivot the model's pivot depth ZBrush holds (PivotDepth); across,
-// a document point is the pivot's offset / zoom scaled by 1 - Z * gInvD
+// a document point is the pivot's offset / zoom scaled by 1 - Z * invD
 // (perspective: one over the eye's distance from the pivot; 0, flat, as
 // ZBrush draws with Persp off).
 // Checked against both silhouettes (the visual hull's front along each row
@@ -6332,15 +6351,220 @@ static bool CanvasDepth(double x, double y, double reach, double kp, double& z, 
 // perspective to the frames and silhouettes instead (to make up for a pivot
 // held through snaps), and what they fitted (x1.114 -38, eye at 1800) put
 // 40-63% of points impossible: the front cell on the hair, from the side.
+// invD: perspective (ProjInvD), 0 flat.
 struct Cam {
 	double d[3][3];
 	double px, py, r, pivot, cx, cy;
+	double invD = 0;
 };
-static const double gInvD = 0;
 
+// ZBrush's projection (Draw > Persp), from its own record in ZBrush.exe's
+// data (x64dbg, ZBrush 2023, build 207): floats docW/2 and docH/2 (the
+// perspective's centre), 0, the eye's distance in document pixels, an int of
+// switches (bit 0 Persp; 0x559 with it on, 0x558 off, in Horizontal: bit 6 is
+// not Vertical), the field of view in degrees and the crop factor. The
+// distance holds the field of view, focal length and crop: half the
+// document's width / tan(half the angle) * crop, 1415.28 for 50 mm on 1019 x
+// 776 up to zoom 1.38, then 1026.9 x the zoom (0.7256 of it: 1.568 to 3.088,
+// build 213's log); it moves during drags (to 1524) and settles back. Two
+// copies; only one followed the Draw palette, so the one that changed last
+// is read. ZBrush draws about the document's middle with the eye at that
+// distance (E, document pixels): a point Z = zoom * depth in front of the
+// pivot's plane at E / (E - Z) times its flat place, and its depth value
+// pivot - 2E - Z * E / (E - Z) (DepthZ: ZBrush's depth dumped at zooms 0.91,
+// 1 and 2.33, within 0.08-0.18 of 650). Builds 207-213 took the eye as 1415.28
+// x the square root of the zoom, fitted to those dumps' outlines, which near
+// zoom 1 tell the two apart by under a pixel; at 2.33 their depth fit it 8
+// off, so 208-213 fitted the depth's constant to the points per frame. The
+// zoom is the overlay's ratio (ZBrush's scale over the anchor's, 40.83 in
+// that project).
+static bool ReadOwn(uintptr_t at, void* out, size_t n);
+struct ProjRec { uintptr_t at; unsigned char last[0x1c]; DWORD changedAt; };
+static std::vector<ProjRec> gProj;
+static double gProjDocW = 0, gProjDocH = 0;
+static DWORD gProjFoundAt = 0;
+static double gTestProjD0 = 0;  // tests: Persp with this eye distance (0 flat)
+
+// ZBrush.exe is packed: its code and data are one section of 433 MB, its
+// pages execute-read-write (build 207 looked only in read-write and
+// write-copy pages, and found none). The two places the records were found
+// (ZBrush 2023) are looked at first; the whole image only when they are not
+// records, at most every 30 s, in 1 MB pieces. counts: candidates dropped by
+// each check, for the log.
+static const uintptr_t kProjKnown[2] = {0xEC476C8, 0xEC482C8};
+
+static std::string gProjNotes;  // each record with sane values, for the log
+
+static bool ProjIs(const unsigned char* b, double docW, double docH, int counts[4])
+{
+	float c[2], d0, fov, crop;
+	uint32_t zero, flags;
+	memcpy(c, b, 8);
+	if (c[0] != static_cast<float>(docW * 0.5) || c[1] != static_cast<float>(docH * 0.5))
+		return false;
+	++counts[0];
+	memcpy(&zero, b + 8, 4);
+	memcpy(&d0, b + 12, 4);
+	memcpy(&flags, b + 16, 4);
+	memcpy(&fov, b + 20, 4);
+	memcpy(&crop, b + 24, 4);
+	if (zero || !(d0 > 10 && d0 < 1e7) || flags > 0xffff || !(fov > 0.5 && fov < 179.5) || !(crop > 0.01 && crop < 100))
+		return false;
+	++counts[1];
+	// The eye from the field of view across the width or the height, with
+	// the crop or without, or farther: past zoom 1.38 ZBrush keeps it at
+	// 0.7256 x the zoom x that (build 214 asked for it exactly, and a session
+	// started at zoom 2.35, eye 2555, found no record: Persp unknown, its
+	// frames read as flat).
+	const double t = tan(fov * kPi / 360);
+	const double wants[4] = {docW * 0.5 / t * crop, docH * 0.5 / t * crop, docW * 0.5 / t, docH * 0.5 / t};
+	bool fits = false;
+	for (double want : wants)
+		fits = fits || (d0 / want >= 0.99 && d0 / want <= 1000);
+	if (gProjNotes.size() < 600) {
+		char note[160];
+		snprintf(note, sizeof note, " [eye %.3f, switches %x, field of view %.4f, crop %.4f; width gives %.3f, height %.3f%s]", d0, flags, fov, crop, wants[0], wants[1], fits ? "" : ": not taken");
+		gProjNotes += note;
+	}
+	if (!fits)
+		return false;
+	++counts[2];
+	return true;
+}
+
+static void ProjFind(double docW, double docH)
+{
+	gProj.clear();
+	gProjDocW = docW;
+	gProjDocH = docH;
+	gProjFoundAt = GetTickCount();
+	const uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+	MODULEINFO mi = {};
+	GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(nullptr), &mi, sizeof mi);
+	int counts[4] = {};
+	gProjNotes.clear();
+	auto take = [&](uintptr_t at, const unsigned char* b) {
+		ProjRec r = {at, {}, 0};
+		memcpy(r.last, b, sizeof r.last);
+		gProj.push_back(r);
+	};
+	for (uintptr_t off : kProjKnown) {
+		unsigned char b[0x1c];
+		if (off + sizeof b <= mi.SizeOfImage && ReadOwn(exe + off, b, sizeof b) && ProjIs(b, docW, docH, counts))
+			take(exe + off, b);
+	}
+	const bool known = !gProj.empty();
+	size_t scanned = 0;
+	if (!known) {
+		memset(counts, 0, sizeof counts);
+		const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+		std::vector<unsigned char> buf;
+		for (uintptr_t a = exe; a < exe + mi.SizeOfImage;) {
+			MEMORY_BASIC_INFORMATION m;
+			if (VirtualQuery(reinterpret_cast<LPCVOID>(a), &m, sizeof m) != sizeof m)
+				break;
+			const uintptr_t end = std::min<uintptr_t>(reinterpret_cast<uintptr_t>(m.BaseAddress) + m.RegionSize, exe + mi.SizeOfImage);
+			if (m.State == MEM_COMMIT && (m.Protect & writable) && !(m.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+				for (uintptr_t at = a; at < end; at += 1 << 20) {
+					// Each piece read 0x1c past its end, for a record across two.
+					const size_t n = static_cast<size_t>(std::min<uintptr_t>(end - at, (1 << 20) + 0x1c));
+					buf.resize(n);
+					if (!ReadOwn(at, buf.data(), n))
+						continue;
+					scanned += n;
+					for (size_t o = 0; o + 0x1c <= n && o < (1u << 20); o += 4)
+						if (ProjIs(&buf[o], docW, docH, counts))
+							take(at + o, &buf[o]);
+				}
+			a = end;
+		}
+	}
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu projection records for %.0f x %.0f: %zu%s", GetTickCount(), docW, docH, gProj.size(), known ? " where found before" : "");
+		for (const ProjRec& r : gProj)
+			fprintf(f, " [+%llx]", static_cast<unsigned long long>(r.at - exe));
+		if (!known)
+			fprintf(f, " (%.0f MB of %.0f looked at; %d with the document's middle, %d of them with sane values, %d with the eye where the field of view puts it)",
+				scanned / 1048576.0, mi.SizeOfImage / 1048576.0, counts[0], counts[1], counts[2]);
+		fprintf(f, "%s", gProjNotes.c_str());
+		fprintf(f, "\n");
+		fclose(f);
+	}
+}
+
+// Persp on and the eye's distance (document pixels, at the reference zoom),
+// from the record that changed last. False if no record is found.
+static bool ProjRead(double docW, double docH, bool& persp, double& d0)
+{
+	if (docW != gProjDocW || docH != gProjDocH || (gProj.empty() && GetTickCount() - gProjFoundAt > 30000))
+		ProjFind(docW, docH);
+	const ProjRec* use = nullptr;
+	for (ProjRec& r : gProj) {
+		unsigned char now[sizeof r.last];
+		if (!ReadOwn(r.at, now, sizeof now))
+			continue;
+		if (memcmp(now, r.last, sizeof now)) {
+			memcpy(r.last, now, sizeof now);
+			r.changedAt = GetTickCount();
+		}
+		if (!use || static_cast<int>(r.changedAt - use->changedAt) > 0)
+			use = &r;
+	}
+	if (!use)
+		return false;
+	float f;
+	uint32_t flags;
+	memcpy(&f, use->last + 12, 4);
+	memcpy(&flags, use->last + 16, 4);
+	persp = (flags & 1) != 0;
+	d0 = f;
+	// Logged at each switch of Persp, and for the eye once it has held a
+	// second: it moves through drags and settles back (build 211: 1415 to 1524
+	// and back, 30 lines a second).
+	static int lastPersp = -1;
+	static double lastD0 = 0, heldD0 = 0;
+	static DWORD heldSince = 0;
+	if (d0 != heldD0) {
+		heldD0 = d0;
+		heldSince = GetTickCount();
+	}
+	if (persp != (lastPersp == 1) || lastPersp < 0 || (fabs(d0 - lastD0) > 0.01 && GetTickCount() - heldSince >= 1000)) {
+		lastPersp = persp;
+		lastD0 = d0;
+		if (FILE* fl = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			float fov, crop;
+			memcpy(&fov, use->last + 20, 4);
+			memcpy(&crop, use->last + 24, 4);
+			fprintf(fl, "%lu projection: Persp %s, eye at %.2f (field of view %.4f, crop %.4f, switches %x)\n", GetTickCount(), persp ? "on" : "off", d0, fov, crop, flags);
+			fclose(fl);
+		}
+	}
+	return true;
+}
+
+// The camera's perspective at zoom r: one over the eye's distance from the
+// pivot's plane in model units (Cam::invD), 0 with Persp off: the zoom over
+// ZBrush's eye in document pixels. The tests give the eye below zoom 1.38 and
+// follow ZBrush's record above it.
+static double ProjInvD(double docW, double docH, double r)
+{
+	if (r <= 0)
+		return 0;
+	if (gTesting)
+		return gTestProjD0 > 0 ? r / std::max(gTestProjD0, 0.72562 * r * gTestProjD0) : 0;
+	bool persp;
+	double eye;
+	return ProjRead(docW, docH, persp, eye) && persp && eye > 0 ? r / eye : 0;
+}
+
+// A depth plane's value as depth towards the camera, model units. pivot: the
+// value at depth 0. With Persp on, ZBrush's value is that less zoom * z / (1
+// - z * invD), and that is ZBrush's pivot less twice the eye's distance
+// (TakeFrame).
 static double DepthZ(const Cam& c, double value)
 {
-	return (c.pivot - value) / c.r;
+	const double w = (c.pivot - value) / c.r;
+	return c.invD > 0 ? w / (1 + w * c.invD) : w;
 }
 
 static void CamUnproject(const Cam& c, double x, double y, double z, double invD, double g[3])
@@ -6396,7 +6620,11 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 	// 137-174 tracked only snapped to a view with an image), a snapped view's
 	// when the rotation copies are not found.
 	const int c = gActiveView >= 0 && gActiveView < kDefaultView && !gViewAway ? gActiveView : -1;
-	if (c == slot || st.ratio <= 0)
+	// The view snapped to shows its image as Classic does, on the pivot's
+	// plane; in perspective the part looked at is nearer or farther and drawn
+	// larger or smaller, so that view is laid out like the others then.
+	const bool persp = ProjInvD(st.docW, st.docH, st.ratio) > 0;
+	if ((c == slot && !persp) || st.ratio <= 0)
 		return true;
 	const bool haveC = c >= 0 && gViews[c].used;
 	double dc[3][3];
@@ -6599,10 +6827,16 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 	// sat on the middle of the head for the side of the nose or an eye, and
 	// the test suite (dll\test) found every cell a quarter to a third of the
 	// window off the point looked at, at every angle and zoom.
+	// In perspective the surface looked at is drawn larger by 1 / (1 - depth *
+	// invD) than on the pivot's plane (CamProject): the cell shows its image
+	// that much larger, and so a window that much smaller, to match it.
+	double grow = 1;
+	if (focus && cam.invD > 0)
+		grow = 1 / std::max(0.05, 1 - front * cam.invD);
 	double along = 0;
 	int da = 0;
 	for (int a = 0; a < 2; ++a) {
-		halfV[a] = halfM[a] / vf.f;
+		halfV[a] = halfM[a] / vf.f / grow;
 		if (fabs(dc[2][vf.m[a]]) > along) {
 			along = fabs(dc[2][vf.m[a]]);
 			da = a;
@@ -6667,7 +6901,7 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 	}
 	// Document pixels per V image pixel: the camera's per model unit, by V's
 	// model units per image pixel.
-	out.ratio = st.ratio * vf.f;
+	out.ratio = st.ratio * vf.f * grow;
 	out.offX = out.offY = 0;
 	// ZBrush's camera can jump in a frame (a zoom step: build 175, 595 to 382,
 	// the cell 217 px; the model framed): a jump of the cell's middle by over
@@ -6722,8 +6956,8 @@ static std::wstring DisplayPath()
 static void SaveDisplay()
 {
 	if (FILE* f = _wfopen(DisplayPath().c_str(), L"wb")) {
-		fprintf(f, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", gMode, gPanelLeft, gMulti, gMultiA, gMultiB, gBackGrey,
-			gCells[0], gCells[1], gCells[2], gCells[3], gAuto3D, gGamma, gSat, gModelOpacity);
+		fprintf(f, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", gMode, gPanelLeft, gMulti, gMultiA, gMultiB, gBackGrey,
+			gCells[0], gCells[1], gCells[2], gCells[3], gAuto3D, gGamma, gSat, gModelOpacity, gAutoPersp);
 		fclose(f);
 	}
 }
@@ -6736,10 +6970,11 @@ static void LoadDisplay()
 		return;
 	gDisplayLoaded = true;
 	if (FILE* f = _wfopen(DisplayPath().c_str(), L"rb")) {
-		int v[14] = {0, 0, 0, 0, 3, 48, 0, 3, 4, 1, 0, 100, 100, 75};
-		const int n = fscanf(f, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9],
-			&v[10], &v[11], &v[12], &v[13]);
+		int v[15] = {0, 0, 0, 0, 3, 48, 0, 3, 4, 1, 0, 100, 100, 75, 0};
+		const int n = fscanf(f, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9],
+			&v[10], &v[11], &v[12], &v[13], &v[14]);
 		gAuto3D = n >= 11 && v[10] != 0;
+		gAutoPersp = n >= 15 && v[14] != 0;  // build 207
 		// Gamma, Saturation and Model Opacity (build 142; older files keep the defaults).
 		if (n >= 14) {
 			gGamma = std::max(20, std::min(v[11], 300));
@@ -7971,6 +8206,7 @@ static bool LiveCam(const OverlayState& st, const double d[3][3], Cam& c)
 	c.r = st.ratio;
 	c.cx = st.docW * 0.5;
 	c.cy = st.docH * 0.5;
+	c.invD = ProjInvD(st.docW, st.docH, st.ratio);
 	static double kept = 0;
 	static bool have = false;
 	double p;
@@ -7984,7 +8220,7 @@ static bool LiveCam(const OverlayState& st, const double d[3][3], Cam& c)
 
 static void CamPoint(const Cam& c, double x, double y, double z, double g[3])
 {
-	CamUnproject(c, x, y, z, gInvD, g);
+	CamUnproject(c, x, y, z, c.invD, g);
 }
 
 // A finished frame kept for measuring and rebuilding: its camera and its
@@ -8021,7 +8257,7 @@ static bool CloudIngest(const FrameRec& f, size_t& added, size_t& gone, size_t& 
 	const Cam& c = f.cam;
 	auto goneAt = [&](uint32_t i, bool& seen) {
 		double x, y, z;
-		seen = CamProject(c, gCloud[i].p, gInvD, x, y, z) && f.Inside(x, y);
+		seen = CamProject(c, gCloud[i].p, c.invD, x, y, z) && f.Inside(x, y);
 		if (!seen)
 			return false;
 		float v;
@@ -8056,7 +8292,7 @@ static bool CloudIngest(const FrameRec& f, size_t& added, size_t& gone, size_t& 
 				continue;
 			++modelPx;
 			double p[3];
-			CamUnproject(c, 2 * x + 1, 2 * y + 1, DepthZ(c, v), gInvD, p);
+			CamUnproject(c, 2 * x + 1, 2 * y + 1, DepthZ(c, v), c.invD, p);
 			const uint64_t k = CloudKey(p);
 			const auto it = gCloudAt.find(k);
 			CloudPoint* cp;
@@ -8075,6 +8311,75 @@ static bool CloudIngest(const FrameRec& f, size_t& added, size_t& gone, size_t& 
 	return true;
 }
 
+// A frame with Persp on, its depth from ZBrush's eye (TakeFrame), checked
+// against the points it shows: each half-size pixel's nearest point, value +
+// zoom * z / (1 - z * invD) there, and the band two points' cells wide that
+// holds most of them (where the points have a gap or spill past an outline a
+// pixel pairs one surface's value with another's point). False when over 30%
+// agree on a value over two cells from the eye's: ZBrush's depth then follows
+// something else (a pivot not 0 is not yet seen in Persp), and the frame is
+// not taken. Logged at most every 2 s, and whenever it is not taken.
+static bool PerspCheck(const FrameRec& f, double pivotRead)
+{
+	const Cam& c = f.cam;
+	const double invD = c.invD;
+	// Each point over the half-size pixels its cell covers drawn at its depth:
+	// zoomed in, the points sit pixels apart, and a pixel between them would
+	// get a point from the far side.
+	std::vector<float> nearest(f.plane.size(), -1e30f);
+	for (const CloudPoint& p : gCloud) {
+		double x, y, z;
+		if (!CamProject(c, p.p, invD, x, y, z) || !f.Inside(x, y))
+			continue;
+		const int r = static_cast<int>(kCloudCell * c.r / (1 - z * invD) / 4);
+		const int i = static_cast<int>(x / 2), j = static_cast<int>(y / 2);
+		for (int jj = std::max(0, j - r); jj <= std::min(f.h - 1, j + r); ++jj)
+			for (int ii = std::max(0, i - r); ii <= std::min(f.w - 1, i + r); ++ii) {
+				float& n = nearest[static_cast<size_t>(jj) * f.w + ii];
+				n = std::max(n, static_cast<float>(z));
+			}
+	}
+	std::vector<double> c0;
+	for (int y = 0; y < f.h; ++y)
+		for (int x = 0; x < f.w; ++x) {
+			const double z = nearest[static_cast<size_t>(y) * f.w + x];
+			float v;
+			if (z > -1e29 && f.Model(x, y, v))
+				c0.push_back(v + c.r * z / (1 - z * invD));
+		}
+	double C = 0, share = 0;
+	size_t in = 0;
+	if (c0.size() >= 500) {
+		std::sort(c0.begin(), c0.end());
+		const double band = 2 * kCloudCell * c.r;
+		size_t from = 0;
+		for (size_t i = 0, j = 0; j < c0.size(); ++j) {
+			while (c0[j] - c0[i] > band)
+				++i;
+			if (j - i + 1 > in) {
+				in = j - i + 1;
+				from = i;
+			}
+		}
+		C = c0[from + in / 2];
+		share = static_cast<double>(in) / c0.size();
+	}
+	const bool against = in >= 500 && share >= 0.3 && fabs(C - c.pivot) > 2 * kCloudCell * c.r;
+	static DWORD loggedAt = 0;
+	if (against || GetTickCount() - loggedAt > 2000) {
+		loggedAt = GetTickCount();
+		char line[300];
+		if (in >= 500)
+			snprintf(line, sizeof line, "Persp frame %s: value at depth 0 %.2f from the eye (%.2f, pivot %.3f), the points' %.2f (%.0f%% of %zu pixels within 2 cells), zoom %.5f",
+				against ? "not taken, the points put its depth elsewhere" : "taken", c.pivot, c.r / invD, pivotRead, C, 100 * share, c0.size(), c.r);
+		else
+			snprintf(line, sizeof line, "Persp frame taken: value at depth 0 %.2f from the eye (%.2f, pivot %.3f), too few points to check it (%zu pixels), zoom %.5f",
+				c.pivot, c.r / invD, pivotRead, c0.size(), c.r);
+		DepthLog(line);
+	}
+	return !against;
+}
+
 // Each overlay step: a finished frame, when there is a new one, into the
 // points; and the cells laid out again when the camera turns (the layout is
 // otherwise asked for only when the pan or zoom changes).
@@ -8082,6 +8387,11 @@ static void TakeFrame(const OverlayState& st, const double d[3][3], const std::v
 
 static void DepthMapStep(const OverlayState& st)
 {
+	// ZBrush's projection each step, whatever else happens: its records found
+	// and each Persp switch logged as it is made (build 209 read it only for a
+	// frame or a PureRef layout, and a session in Classic with no pan, so no
+	// pivot and no frame, never looked).
+	ProjInvD(st.docW, st.docH, st.ratio);
 	double d[3][3];
 	if (!CameraAxes(d)) {
 		const int c = gActiveView;
@@ -8172,6 +8482,19 @@ static void TakeFrame(const OverlayState& st, const double d[3][3], const std::v
 	double pivot;
 	if (!PivotDepth(st, pivot))
 		return;
+	const double invD = ProjInvD(st.docW, st.docH, st.ratio);
+	// Not without ZBrush's projection record: whether Persp is on is then
+	// unknown, and a Persp frame read as flat puts its points wrong (build
+	// 214, its record turned down at zoom 2.35: frame after frame refused as
+	// out of step, the points started again twice).
+	if (!gTesting && gProj.empty()) {
+		static DWORD loggedAt = 0;
+		if (GetTickCount() - loggedAt > 10000) {
+			loggedAt = GetTickCount();
+			DepthLog("frame not taken: ZBrush's projection record is not found, so whether Persp is on is not known");
+		}
+		return;
+	}
 	// The same frame as last time, seen again: nothing new.
 	uint64_t key = 1469598103934665603ull;
 	auto mix = [&](const void* p, size_t len) {
@@ -8211,6 +8534,14 @@ static void TakeFrame(const OverlayState& st, const double d[3][3], const std::v
 		modelHalf += v != bg && fabs(v) < 1e6;
 	if (modelHalf < 200)
 		return;
+	// Persp: ZBrush's value at depth 0 is its pivot less twice the eye's
+	// distance, E = zoom / invD (dumps at zooms 0.91, 1 and 2.33).
+	if (invD > 0) {
+		f.cam.invD = invD;
+		f.cam.pivot = pivot - 2 * st.ratio / invD;
+		if (!PerspCheck(f, pivot))
+			return;
+	}
 	size_t added = 0, gone = 0, modelPx = 0;
 	static int rejected = 0;
 	if (!CloudIngest(f, added, gone, modelPx)) {
@@ -8248,6 +8579,8 @@ static void TakeFrame(const OverlayState& st, const double d[3][3], const std::v
 		if (FILE* t = _wfopen((dir + L"frame" + std::to_wstring(n) + L".txt").c_str(), L"wb")) {
 			fprintf(t, "tick %lu\nsize %d %d\nempty %.9g\npivot %.9g\nzoom %.9g\npos %.9g %.9g\ncentre %.9g %.9g\ndoc %.9g %.9g\noff %.9g %.9g\nanchorscale %.9g\n",
 				now, f.w, f.h, f.bg, pivot, st.ratio, st.px, st.py, f.cam.cx, f.cam.cy, st.docW, st.docH, st.offX, st.offY, gAnchorScale);
+			if (invD > 0)
+				fprintf(t, "persp invD %.9g eye %.9g value at depth 0 %.9g\n", invD, st.ratio / invD, f.cam.pivot);
 			fprintf(t, "axes %.9g %.9g %.9g  %.9g %.9g %.9g  %.9g %.9g %.9g\n", d[0][0], d[0][1], d[0][2], d[1][0], d[1][1], d[1][2], d[2][0], d[2][1], d[2][2]);
 			if (gTripletInUse >= 0 && gTripletInUse < static_cast<int>(gTriplets.size())) {
 				const MemTriplet& tr = gTriplets[gTripletInUse];
@@ -8287,7 +8620,7 @@ static void TakeFrame(const OverlayState& st, const double d[3][3], const std::v
 // The surface round the camera's ray through a document point (x, y), from
 // the points: each point seen from the camera (Cam, with the measured depth
 // scale and perspective), the nearest in each bin of a grid round the point
-// (bins in model units at the pivot's depth), then the bins within reach
+// (bins in model units at each point's depth), then the bins within reach
 // averaged with weights falling smoothly to nothing at the reach; thick, the
 // width of the model's runs across the rows within reach, weighted the same
 // way (a row whose run changes part, an arm crossing it, moves it by its
@@ -8305,7 +8638,7 @@ static bool CloudDepth(const Cam& c, double qx, double qy, double reach, double&
 	static int lastVersion = -1, lastSamples = 0;
 	static double lastFront = 0, lastThick = 0;
 	static bool lastOk = false;
-	const double q[18] = {qx, qy, reach, c.px, c.py, c.r, c.cx, c.cy, gInvD, c.d[0][0], c.d[0][1], c.d[0][2], c.d[1][0], c.d[1][1], c.d[1][2], c.d[2][0], c.d[2][1], c.d[2][2]};
+	const double q[18] = {qx, qy, reach, c.px, c.py, c.r, c.cx, c.cy, c.invD, c.d[0][0], c.d[0][1], c.d[0][2], c.d[1][0], c.d[1][1], c.d[1][2], c.d[2][0], c.d[2][1], c.d[2][2]};
 	if (lastVersion == gCloudVersion && !memcmp(q, lastQ, sizeof q)) {
 		front = lastFront;
 		thick = lastThick;
@@ -8341,9 +8674,15 @@ static bool CloudDepth(const Cam& c, double qx, double qy, double reach, double&
 		bg.assign(cells, Bin{-1e30f, 0, 0});
 		for (int k = n * band / bands, end = n * (band + 1) / bands; k < end; ++k) {
 			double x, y, z;
-			if (!CamProject(c, gCloud[k].p, gInvD, x, y, z))
+			if (!CamProject(c, gCloud[k].p, c.invD, x, y, z))
 				continue;
-			const double su = (x - qx) / c.r, sv = (y - qy) / c.r;
+			// Off the ray in model units at the point's own depth: in
+			// perspective a part near the eye is drawn larger, and at the
+			// pivot's depth its points would sit further apart than a bin (the
+			// brow over the eye at x2.9, the eye found through the gaps:
+			// dll\test).
+			const double q = 1 - z * c.invD;
+			const double su = (x - qx) * q / c.r, sv = (y - qy) * q / c.r;
 			if (fabs(su) > 3 * reach || fabs(sv) > reach)
 				continue;
 			const long i = lround(su / b) + nu, j = lround(sv / b) + nv;
@@ -9148,8 +9487,13 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 	bool any = false;
 	// The camera turns only while a mouse button is held or in the snap
 	// animation just after: a copy that changes with the buttons up and idle
-	// follows something else (the brush under the cursor) and is dropped.
-	const bool idle = gButtonsDown == 0 && !gGesture.active && GetTickCount() - gLastButtonAt > 2000;
+	// follows something else (the brush under the cursor) and is dropped. So
+	// is one that changes in a pan or a zoom, which never turn the camera
+	// (build 205: one copy of nine read Front for a frame of an Alt pan in
+	// Right; the view counted as turning for the rest of the drag, and the
+	// pan went into the image's offset, leaving it behind).
+	const bool idle = (gButtonsDown == 0 && !gGesture.active && GetTickCount() - gLastButtonAt > 2000) ||
+		(gGesture.active && (gGesture.mode == kDragMove || gGesture.mode == kDragScale));
 	for (size_t ci = 0; ci < gRotCands.size(); ++ci) {
 		RotCand& c = gRotCands[ci];
 		double m[9];
@@ -9166,8 +9510,8 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 		}
 		if (step && idle) {
 			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
-				fprintf(f, "%lu rotation copy %zu changed with the mouse buttons up: not the camera, dropped (%zu left)\n",
-					GetTickCount(), ci, gRotCands.size() - 1);
+				fprintf(f, "%lu rotation copy %zu changed %s: not the camera, dropped (%zu left)\n", GetTickCount(), ci,
+					gGesture.active ? "in a pan or zoom" : "with the mouse buttons up", gRotCands.size() - 1);
 				fclose(f);
 			}
 			gRotCands.erase(gRotCands.begin() + ci);
@@ -10394,7 +10738,7 @@ ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 	}
 	int* field = strcmp(name, "mode") == 0 ? &gMode : strcmp(name, "left") == 0 ? &gPanelLeft :
 		strcmp(name, "multi") == 0 ? &gMulti : strcmp(name, "a") == 0 ? &gMultiA : strcmp(name, "b") == 0 ? &gMultiB :
-		strcmp(name, "auto3d") == 0 ? &gAuto3D : strcmp(name, "back") == 0 ? &gBackGrey : strcmp(name, "gamma") == 0 ? &gGamma : strcmp(name, "sat") == 0 ? &gSat : strcmp(name, "modelop") == 0 ? &gModelOpacity : nullptr;
+		strcmp(name, "auto3d") == 0 ? &gAuto3D : strcmp(name, "autopersp") == 0 ? &gAutoPersp : strcmp(name, "back") == 0 ? &gBackGrey : strcmp(name, "gamma") == 0 ? &gGamma : strcmp(name, "sat") == 0 ? &gSat : strcmp(name, "modelop") == 0 ? &gModelOpacity : nullptr;
 	float result = -1;
 	if (field) {
 		const bool view = field == &gMultiA || field == &gMultiB;
@@ -11869,6 +12213,7 @@ ZFUNC RSIsOn(char* text, double, char*, int, char*, int, char**)
 	else if (strcmp(name, "left") == 0) on = gPanelLeft != 0;
 	else if (strcmp(name, "multi") == 0) on = gMulti != 0;
 	else if (strcmp(name, "auto3d") == 0) on = gAuto3D != 0;
+	else if (strcmp(name, "autopersp") == 0) on = gAutoPersp != 0;
 	else if (strcmp(name, "adjust") == 0) on = gAdjust;
 	else if (strcmp(name, "a") == 0) on = gMultiA == n;
 	else if (strcmp(name, "b") == 0) on = gMultiB == n;
