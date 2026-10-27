@@ -53,13 +53,14 @@ All controls are under **ZPlugin > JRef**.
 | Overlay | Turns the overlay on. Press it again if JRef loses the canvas. |
 | Overlay Off | Hides the overlay. |
 | Classic / PureRef | The display mode: the image behind the model, or in a panel at the side. |
-| Swap Side | Moves the PureRef panel to the other side of the canvas. |
-| Reset | Snaps to the Front view lined up with its image. Also resets Gamma, Saturation and every image's Adjust Image size and position. |
+| Auto Persp | Each time you change mode, puts ZBrush's **Persp** back as you last had it in that mode. At first it's on in PureRef and off in Classic. |
+| Reset | Snaps to the Front view lined up with its image. Also resets Gamma, Saturation and every image's Adjust Image size and position. Asks first, since it can't be undone. |
+| Swap Side | Moves the PureRef panel to the other side of the canvas. Only shown in PureRef. |
 | Adjust Image | Moves and scales the current image to line it up with the model. |
 | Anchor | Records the current zoom and position as the 1:1 match with the image. |
 | Views | **Load** and **Remove** each view's image. |
 | Image | **Gamma** and **Saturation** of the images; **Model Opacity** lets the reference show through the model in Classic. |
-| Multiview | **Multiview** shows two views in the PureRef panel. **3D Auto Track** keeps the other view on the part you're looking at. |
+| Multiview | **Multiview** shows two views in the PureRef panel. **Zoom Out** shows the panel's images that many times smaller than the model (default 2). **3D Auto Track** keeps the other view on the part you're looking at, with or without **Persp**. |
 | Upper Image / Lower Image | Which views Multiview shows, top and bottom. |
 | Project | **Open Project** opens a saved JRef project. **Snapshot** saves what the overlay captured and drew, for reporting a problem. **About** shows the running build. |
 
