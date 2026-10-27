@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <array>
 #include <vector>
 #include <unordered_map>
 #include <map>
@@ -260,7 +261,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 215;
+static const int kDllBuild = 231;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1564,6 +1565,13 @@ static int gGamma = 100, gSat = 100;
 // Model Opacity, in percent: under 100, Classic shows the reference through
 // the model as Image Plane does (from the plugin's slider, saved likewise).
 static int gModelOpacity = 75;
+// Zoom Out, in percent: the panel's cells show the images this many times
+// smaller than the canvas shows the model (Multiview slider, saved likewise).
+static int gCellZoomOut = 200;
+// Auto Persp: the Persp each mode last had (Classic, PureRef), restored when
+// the mode changes. Build 229 set it on in PureRef and off in Classic each
+// time, undoing Persp turned off by hand in PureRef.
+static bool gPerspFor[2] = {false, true};
 static const double kPanelShare = 0.35;  // of the canvas width
 
 // The part of the document ZBrush shows (overlay pixels, x1 and y1 past the
@@ -1606,6 +1614,14 @@ static void PanelRect(int w, int h, int& x0, int& y0, int& pw, int& ph)
 static bool ViewLayout(int slot, const OverlayState& st, OverlayState& out, std::string& path);
 static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out, std::string& path);
 static int ActiveViewSlot();
+// While held, CameraAxes gives every caller its first reading.
+static bool gAxesHold = false, gAxesHeldSet = false;
+static double gAxesHeld[3][3];
+// A Persp turn's pan, zoom and eye from ZBrush's orbit (OrbitPan); the
+// surface point the cells last showed, where the orbit is first looked for.
+static void OrbitPan(OverlayState& st);
+static bool gOrbitOn = false, gFocusOk = false;
+static double gOrbitEye = 0, gFocusG[3] = {};
 
 template <typename Fn>
 static void ParallelRows(int y0, int y1, const Fn& fn);
@@ -1839,11 +1855,13 @@ static PanelCell PlanPanelCell(const OverlayState& st, int slot)
 }
 
 // The panel's cells show the images at Classic's scale (build 191: fitted
-// into the cell they showed smaller). Build 193 zoomed them out past 2.5
-// image pixels a screen pixel, which lost the zoom: wrong, taken out.
+// into the cell they showed smaller), less Zoom Out (build 222: a fixed
+// share of the canvas's zoom, so they still follow it). Build 193 zoomed them
+// out past 2.5 image pixels a screen pixel, which lost the zoom: wrong,
+// taken out.
 static double PanelScale(const PanelCell*, int)
 {
-	return 1;
+	return 100.0 / gCellZoomOut;
 }
 
 // Draws a planned view into a cell at scale s about the middle of the part
@@ -1892,13 +1910,28 @@ static bool BuildRefLayer(const OverlayState& st)
 			// The upper image's view above the lower's (ZPlugin > JRef >
 			// Upper Image and Lower Image).
 			const int hh = ph / 2;
-			const PanelCell cells[2] = {PlanPanelCell(st, gMultiA), PlanPanelCell(st, gMultiB)};
+			// Both cells from one reading of the rotation: each read its own,
+			// and a turn's step between them put the two at different angles
+			// (build 217; one reading from build 218).
+			// Through a Persp turn ZBrush's pan and zoom from that rotation too
+			// (OrbitPan).
+			gAxesHold = true;
+			gAxesHeldSet = false;
+			OverlayState so = st;
+			OrbitPan(so);
+			const PanelCell cells[2] = {PlanPanelCell(so, gMultiA), PlanPanelCell(so, gMultiB)};
+			gAxesHold = gOrbitOn = false;
 			const double s = PanelScale(cells, 2);
 			DrawPanelCell(cells[0], s, w, h, px, py, pw, hh, ops);
 			DrawPanelCell(cells[1], s, w, h, px, py + hh, pw, ph - hh, ops);
 			FillOp(ops, px, py + hh - 1, px + pw, py + hh + 1, 0xFF505050u);
 		} else {
-			const PanelCell cell = PlanPanelCell(st, ActiveViewSlot());
+			gAxesHold = true;
+			gAxesHeldSet = false;
+			OverlayState so = st;
+			OrbitPan(so);
+			const PanelCell cell = PlanPanelCell(so, ActiveViewSlot());
+			gAxesHold = gOrbitOn = false;
 			DrawPanelCell(cell, PanelScale(&cell, 1), w, h, px, py, pw, ph, ops);
 		}
 	} else {
@@ -5247,6 +5280,8 @@ static void BuildTriplets()
 		}
 }
 
+static bool Turning();
+
 // Reads the live triplet: of the copies that stay put while rotating, the
 // one that has changed in the most frames of pan and zoom drags (copies that
 // only update now and then never win), the most recently changed one until a
@@ -5334,10 +5369,13 @@ static bool TripletValues(double& sx, double& px, double& py, int mode)
 	// navigation head. A big jump is only taken once the next read carries
 	// on from it (close to it, not equal: a fast zoom or pan keeps changing,
 	// and waiting for equal reads held the image still until the drag
-	// stopped).
+	// stopped). Not while turning: with Persp on ZBrush's pan and zoom move
+	// 300-600 pixels a frame as it turns, and holding them back paired the
+	// turned rotation with the pan and zoom from before (build 219: the
+	// cells flicked half a window off and back every 150-400 ms of a turn).
 	static int pending = 0;
 	static double pendS = 0, pendX = 0, pendY = 0;
-	if (jump) {
+	if (jump && !Turning()) {
 		const bool follows = pending > 0 && fabs(t.s.last / pendS - 1) < 0.3 && fabs(t.x.last - pendX) < 200 && fabs(t.y.last - pendY) < 200;
 		pending = follows ? pending + 1 : 1;
 		pendS = t.s.last;
@@ -6528,6 +6566,10 @@ static bool ProjRead(double docW, double docH, bool& persp, double& d0)
 		heldD0 = d0;
 		heldSince = GetTickCount();
 	}
+	// Persp switched (by hand or by Auto Persp): what the mode showing wants
+	// from now on (RSIsOn "perspwanted").
+	if (lastPersp >= 0 && persp != (lastPersp == 1))
+		gPerspFor[gMode == 1] = persp;
 	if (persp != (lastPersp == 1) || lastPersp < 0 || (fabs(d0 - lastD0) > 0.01 && GetTickCount() - heldSince >= 1000)) {
 		lastPersp = persp;
 		lastD0 = d0;
@@ -6552,6 +6594,8 @@ static double ProjInvD(double docW, double docH, double r)
 		return 0;
 	if (gTesting)
 		return gTestProjD0 > 0 ? r / std::max(gTestProjD0, 0.72562 * r * gTestProjD0) : 0;
+	if (gOrbitOn)
+		return r / gOrbitEye;
 	bool persp;
 	double eye;
 	return ProjRead(docW, docH, persp, eye) && persp && eye > 0 ? r / eye : 0;
@@ -6632,6 +6676,16 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 		if (c < 0)
 			return true;
 		ViewAxes(c, dc);
+	}
+	// Whether the camera has turned since this slot's last layout: neither
+	// easing below applies then (see the depth's).
+	bool turning = false;
+	if (slot >= 0 && slot < kViewSlots) {
+		static double lastDc[kViewSlots][3][3] = {};
+		for (int i = 0; i < 3; ++i)
+			for (int k = 0; k < 3; ++k)
+				turning = turning || fabs(dc[i][k] - lastDc[slot][i][k]) > 1e-4;
+		memcpy(lastDc[slot], dc, sizeof lastDc[slot]);
 	}
 	const MaskExtent& ve = ExtentFor(slot);
 	const View& vv = gViews[slot];
@@ -6747,6 +6801,10 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 		// over about 150 ms, 50 ms a step of 1/e, so the cell glides there;
 		// smaller changes, as the middle moves over one part, are followed as
 		// they are. The layout is asked for again until it has arrived.
+		// Not while the camera turns: the depth is along the camera's axis, so
+		// the eased depth from before put on the turned ray is off the surface
+		// (builds up to 216: a turn put the point 430 units behind the face,
+		// the cell far off until 150 ms after letting go).
 		if (focus) {
 			static double easedFront = 0, easedThick = 0;
 			static LARGE_INTEGER easedAt = {};
@@ -6754,7 +6812,7 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 			LARGE_INTEGER t, qf;
 			QueryPerformanceCounter(&t);
 			QueryPerformanceFrequency(&qf);
-			if (started && !gTesting && (easing || fabs(front - easedFront) > 15 || fabs(thick - easedThick) > 15)) {
+			if (started && !gTesting && !turning && (easing || fabs(front - easedFront) > 15 || fabs(thick - easedThick) > 15)) {
 				// At most a frame's time a step (the layout is not asked for
 				// while the camera is still: the first step after a pause
 				// would otherwise be the whole jump).
@@ -6782,6 +6840,10 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 			// The point on the ray through the window's middle at that depth
 			// (in perspective the ray is not along the camera's axis).
 			CamPoint(cam, midX, midY, front, g);
+			if (!Turning()) {
+				memcpy(gFocusG, g, sizeof gFocusG);
+				gFocusOk = true;
+			}
 		}
 	}
 	{
@@ -6907,7 +6969,8 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 	// the cell 217 px; the model framed): a jump of the cell's middle by over
 	// half its window, or of its zoom by over 15%, is eased over about 150 ms
 	// like the depth's; moves smaller than that, as the view is panned, are
-	// followed as they are.
+	// followed as they are. Not while the camera turns: the cell then
+	// follows the turn as it is, not behind it.
 	if (slot >= 0 && slot < kViewSlots) {
 		struct Eased { double x, y, logR; LARGE_INTEGER at; bool started, easing; };
 		static Eased eased[kViewSlots] = {};
@@ -6917,7 +6980,7 @@ static bool MultiviewLayout(int slot, const OverlayState& st, OverlayState& out,
 		QueryPerformanceFrequency(&qf);
 		const double logR = log(out.ratio);
 		const bool jump = fabs(centreV[0] - e.x) > halfV[0] * 0.5 || fabs(centreV[1] - e.y) > halfV[1] * 0.5 || fabs(logR - e.logR) > log(1.15);
-		if (e.started && !gTesting && (e.easing || jump)) {
+		if (e.started && !gTesting && !turning && (e.easing || jump)) {
 			const double ms = std::min(33.0, 1000.0 * (t.QuadPart - e.at.QuadPart) / qf.QuadPart);
 			const double a = 1 - exp(-ms / 50.0);
 			e.x += (centreV[0] - e.x) * a;
@@ -6956,8 +7019,8 @@ static std::wstring DisplayPath()
 static void SaveDisplay()
 {
 	if (FILE* f = _wfopen(DisplayPath().c_str(), L"wb")) {
-		fprintf(f, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", gMode, gPanelLeft, gMulti, gMultiA, gMultiB, gBackGrey,
-			gCells[0], gCells[1], gCells[2], gCells[3], gAuto3D, gGamma, gSat, gModelOpacity, gAutoPersp);
+		fprintf(f, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", gMode, gPanelLeft, gMulti, gMultiA, gMultiB, gBackGrey,
+			gCells[0], gCells[1], gCells[2], gCells[3], gAuto3D, gGamma, gSat, gModelOpacity, gAutoPersp, gCellZoomOut);
 		fclose(f);
 	}
 }
@@ -6970,11 +7033,12 @@ static void LoadDisplay()
 		return;
 	gDisplayLoaded = true;
 	if (FILE* f = _wfopen(DisplayPath().c_str(), L"rb")) {
-		int v[15] = {0, 0, 0, 0, 3, 48, 0, 3, 4, 1, 0, 100, 100, 75, 0};
-		const int n = fscanf(f, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9],
-			&v[10], &v[11], &v[12], &v[13], &v[14]);
+		int v[16] = {0, 0, 0, 0, 3, 48, 0, 3, 4, 1, 0, 100, 100, 75, 0, 200};
+		const int n = fscanf(f, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9],
+			&v[10], &v[11], &v[12], &v[13], &v[14], &v[15]);
 		gAuto3D = n >= 11 && v[10] != 0;
 		gAutoPersp = n >= 15 && v[14] != 0;  // build 207
+		gCellZoomOut = n >= 16 ? std::max(100, std::min(v[15], 1000)) : 200;  // build 222
 		// Gamma, Saturation and Model Opacity (build 142; older files keep the defaults).
 		if (n >= 14) {
 			gGamma = std::max(20, std::min(v[11], 300));
@@ -8698,6 +8762,21 @@ static bool CloudDepth(const Cam& c, double qx, double qy, double reach, double&
 			if (bg[k].z > grid[k].z)
 				grid[k] = bg[k];
 	auto at = [&](int i, int j) { return i >= 0 && j >= 0 && i < gw && j < gh && grid[static_cast<size_t>(j) * gw + i].z > -1e29f; };
+	// The surface found last time, where the camera now sees it: while it is
+	// still at the ray, the ray stays on it (see the seed below).
+	static double prevG[3] = {};
+	static bool havePrev = false;
+	bool usePrev = false;
+	double prevZ = 0;
+	if (havePrev && !gTesting) {
+		const float pg[3] = {static_cast<float>(prevG[0]), static_cast<float>(prevG[1]), static_cast<float>(prevG[2])};
+		double px, py, pz;
+		if (CamProject(c, pg, c.invD, px, py, pz)) {
+			const double q = 1 - pz * c.invD;
+			usePrev = hypot((px - qx) * q / c.r, (py - qy) * q / c.r) < 6 * b;
+			prevZ = pz;
+		}
+	}
 	// The surface where the ray meets it: a plane (depth = a + b du + c dv)
 	// fitted to the bins round the ray, weighted falling smoothly to nothing
 	// at the radius, the bins off it by over three cells (another part,
@@ -8715,11 +8794,22 @@ static bool CloudDepth(const Cam& c, double qx, double qy, double reach, double&
 		// it or behind by more than 6 bins, and 3 units a unit away (steeper
 		// than 72 degrees), are another part (the nose's edge over the eye
 		// beyond it, seen at 60 degrees: 60-80 units off, dll\test).
+		// Where the ray grazes a part's edge (the nose's, the cheek beyond
+		// it), the bin nearest the ray is on one or the other as the camera
+		// moves a pixel: build 218 found the nose and the cheek 60 units apart
+		// in turn, frame by frame through a turn, and both cells jumped by a
+		// fifth of their window. Of the bins within a bin and a half of the
+		// ray, the one nearest the surface found last time is the seed.
 		std::vector<char> out(cells, 0);
 		const Bin* seed = nullptr;
-		for (size_t k = 0; k < cells; ++k)
-			if (grid[k].z > -1e29f && (!seed || grid[k].u * grid[k].u + grid[k].v * grid[k].v < seed->u * seed->u + seed->v * seed->v))
-				seed = &grid[k];
+		if (usePrev)
+			for (size_t k = 0; k < cells; ++k)
+				if (grid[k].z > -1e29f && grid[k].u * grid[k].u + grid[k].v * grid[k].v <= 2.25 * b * b && (!seed || fabs(grid[k].z - prevZ) < fabs(seed->z - prevZ)))
+					seed = &grid[k];
+		if (!seed)
+			for (size_t k = 0; k < cells; ++k)
+				if (grid[k].z > -1e29f && (!seed || grid[k].u * grid[k].u + grid[k].v * grid[k].v < seed->u * seed->u + seed->v * seed->v))
+					seed = &grid[k];
 		if (!seed)
 			return 0;
 		for (size_t k = 0; k < cells; ++k)
@@ -8815,6 +8905,8 @@ static bool CloudDepth(const Cam& c, double qx, double qy, double reach, double&
 			depth = std::min<double>(zHi, std::max<double>(zLo, depth));
 	}
 	front = depth;
+	CamPoint(c, qx, qy, front, prevG);
+	havePrev = true;
 	double runSum = 0, runWeights = 0;
 	for (int j = 0; j < gh; ++j) {
 		const double dv = (j - nv) * b, wgt = (1 - dv * dv / (reach * reach)) * (1 - dv * dv / (reach * reach));
@@ -9380,8 +9472,13 @@ static void RotDump(FILE* f)
 // snapped view's (d[0] screen right, d[1] screen down, d[2] towards the
 // camera), from the rotation copies: each put in the reference layout (the
 // one kViewCodes was read from) and its rows made unit length (some copies
-// carry the zoom); the one most others agree with. False until the copies
-// are found.
+// carry the zoom); of the copies two or more agree on, those that changed
+// last (RotCodes), the most of them on a tie. Through a turn only three of
+// ZBrush's nine follow it, the rest catching up when the button is let go:
+// builds to 215 took the one most agreed with, the rotation from before the
+// turn, all through it, and with Persp on (ZBrush's pan and zoom move as it
+// turns) the cells ran half a window off and snapped back on release.
+// False until the copies are found.
 static bool CameraAxes(double d[3][3])
 {
 	if (gTesting) {
@@ -9390,13 +9487,23 @@ static bool CameraAxes(double d[3][3])
 	}
 	if (!gRotLocked)
 		return false;
+	if (gAxesHold && gAxesHeldSet) {
+		memcpy(d, gAxesHeld, sizeof gAxesHeld);
+		return true;
+	}
 	std::vector<std::vector<double>> got;
+	std::vector<DWORD> changed;
+	const DWORD now = GetTickCount();
 	for (const RotCand& c : gRotCands) {
 		if (c.rel < 0)
 			continue;
 		double m[9], canon[9];
 		if (!RotRead(c, m))
 			continue;
+		// Changed since RotCodes last read it: changed now.
+		bool fresh = false;
+		for (int k = 0; k < 9; ++k)
+			fresh = fresh || fabs(m[k] - c.m[k]) > 5e-4;
 		RotApply(c.rel, m, canon);
 		bool ok = true;
 		for (int r = 0; r < 3 && ok; ++r) {
@@ -9405,23 +9512,55 @@ static bool CameraAxes(double d[3][3])
 			for (int k = 0; k < 3 && ok; ++k)
 				canon[r * 3 + k] /= len;
 		}
-		if (ok)
+		if (ok) {
 			got.push_back(std::vector<double>(canon, canon + 9));
+			changed.push_back(fresh ? now : c.changedAt);
+		}
 	}
 	if (got.empty())
 		return false;
+	// Turning, or turned under a second ago: ZBrush copies the turned rotation
+	// into the six copies that wait for the button some 80 ms after it is let
+	// go, and a read between its writes took the six from before the turn for
+	// a frame (build 221, the cells off and back on release).
+	static DWORD turnedAt = 0;
+	if (Turning())
+		turnedAt = now;
+	const bool turning = now - turnedAt < 1000;
 	size_t best = 0;
 	int bestAgree = -1;
+	DWORD bestAt = 0;
 	for (size_t i = 0; i < got.size(); ++i) {
 		int agree = 0;
+		DWORD at = changed[i];
 		for (size_t j = 0; j < got.size(); ++j) {
 			double diff = 0;
 			for (int k = 0; k < 9; ++k)
 				diff = std::max(diff, fabs(got[i][k] - got[j][k]));
-			agree += diff < 1e-3;
+			if (diff < 1e-3) {
+				++agree;
+				if (static_cast<int>(changed[j] - at) > 0)
+					at = changed[j];
+			}
 		}
-		if (agree > bestAgree) {
+		// A group of two or more over a lone copy (not while turning); then
+		// the one that changed last; then the larger. While turning a lone copy
+		// is a live one caught mid-step: ZBrush writes its three live copies
+		// one after another, a read between the writes finds all three apart,
+		// and build 216 then took the six from before the turn for that frame
+		// (the cells flicked back and forth through the turn).
+		bool better;
+		if (bestAgree < 0)
+			better = true;
+		else if (!turning && (agree >= 2) != (bestAgree >= 2))
+			better = agree >= 2;
+		else if (at != bestAt)
+			better = static_cast<int>(at - bestAt) > 0;
+		else
+			better = agree > bestAgree;
+		if (better) {
 			bestAgree = agree;
+			bestAt = at;
 			best = i;
 		}
 	}
@@ -9432,7 +9571,323 @@ static bool CameraAxes(double d[3][3])
 		d[1][c] = -m[3 + c];
 		d[2][c] = m[6 + c];
 	}
+	if (gAxesHold) {
+		memcpy(gAxesHeld, d, sizeof gAxesHeld);
+		gAxesHeldSet = true;
+	}
 	return true;
+}
+
+// ZBrush's camera through a turn with Persp on. ZBrush turns about a point
+// of the model (Q, a point of the surface, its own for each turn) that stays
+// where it is on screen at the same size: three still states either side of
+// two turns (frames, build 220) put one point at the same place and size to
+// 0.00 px, and every pan and zoom ZBrush wrote through an 8 s turn kept that
+// point at its distance from the origin to 0.5 units, at zooms 1.9 to 5.1.
+// ZBrush's pan and zoom (the origin's place and size) swing 300-600 px a
+// frame then, and read a frame apart from the rotation they put the cells
+// anywhere (builds 216-220); with Q, the rotation alone gives them, as it
+// gives them to ZBrush. Q is solved from the pan and zoom ZBrush writes in
+// the turn, each a point at Q's distance from the origin whatever rotation it
+// went with, so the reads need not be paired with the rotation at all. The
+// eye is ZBrush's record as read with each (it moves through a drag). Builds
+// 221-226 took it as max(E0, 0.7257 zoom E0), as in build 220's frames
+// (zooms 2.3-5.1); still at zoom 1.51 the record read 1415, not 1551, and no
+// turn's Q fitted (build 226: none in a session).
+struct Orbit {
+	bool restOk = false;  // the state the turn started from, held still
+	double restR = 0, restX = 0, restY = 0, restEye = 0, restD[3][3] = {}, cx = 0, cy = 0;
+	bool turning = false, solved = false, logged = false, haveQ = false;
+	double q[3] = {}, sx = 0, sy = 0, m = 0, rms = 0;
+	std::vector<std::array<double, 4>> samples;  // ZBrush's (zoom, x, y, eye) this turn
+};
+static Orbit gOrbit;
+
+// Q's place and size on screen in the still state.
+static bool OrbitAnchor(Orbit& o, const double q[3], double& sx, double& sy, double& m)
+{
+	double s[3];
+	for (int a = 0; a < 3; ++a)
+		s[a] = q[0] * o.restD[a][0] + q[1] * o.restD[a][1] + q[2] * o.restD[a][2];
+	const double f = 1 - s[2] * o.restR / o.restEye;
+	if (f <= 0.05)
+		return false;
+	sx = o.cx + (s[0] * o.restR + o.restX - o.cx) / f;
+	sy = o.cy + (s[1] * o.restR + o.restY - o.cy) / f;
+	m = o.restR / f;
+	return true;
+}
+
+// Each written pan and zoom's distance of Q from the origin, less Q's own.
+static bool OrbitResiduals(Orbit& o, const double q[3], std::vector<double>& res)
+{
+	double sx, sy, m;
+	if (!OrbitAnchor(o, q, sx, sy, m))
+		return false;
+	const double len = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]);
+	res.clear();
+	for (const auto& p : o.samples) {
+		const double r = p[0], f = r / m, e = p[3];
+		const double z = (1 - f) * e / r, a = (o.cx + (sx - o.cx) * f - p[1]) / r, b = (o.cy + (sy - o.cy) * f - p[2]) / r;
+		res.push_back(sqrt(a * a + b * b + z * z) - len);
+	}
+	return true;
+}
+
+// Gauss-Newton from a starting point; false if it fails. rms in model units.
+static bool OrbitFit(Orbit& o, double q[3], double& rms)
+{
+	std::vector<double> res, step;
+	for (int it = 0; it < 30; ++it) {
+		if (!OrbitResiduals(o, q, res))
+			return false;
+		const size_t n = res.size();
+		std::vector<std::array<double, 3>> jac(n);
+		for (int t = 0; t < 3; ++t) {
+			double qq[3] = {q[0], q[1], q[2]};
+			qq[t] += 0.5;
+			if (!OrbitResiduals(o, qq, step))
+				return false;
+			for (size_t i = 0; i < n; ++i)
+				jac[i][t] = (step[i] - res[i]) / 0.5;
+		}
+		double m[3][4] = {};
+		for (size_t i = 0; i < n; ++i)
+			for (int r = 0; r < 3; ++r) {
+				for (int c = 0; c < 3; ++c)
+					m[r][c] += jac[i][r] * jac[i][c];
+				m[r][3] -= jac[i][r] * res[i];
+			}
+		const double scale = m[0][0] + m[1][1] + m[2][2];
+		for (int col = 0; col < 3; ++col) {
+			int piv = col;
+			for (int r = col + 1; r < 3; ++r)
+				if (fabs(m[r][col]) > fabs(m[piv][col]))
+					piv = r;
+			for (int c = 0; c < 4; ++c)
+				std::swap(m[col][c], m[piv][c]);
+			// Samples too alike to fix all three of Q's coordinates.
+			if (fabs(m[col][col]) < 1e-6 * scale)
+				return false;
+			for (int r = 0; r < 3; ++r)
+				if (r != col) {
+					const double f = m[r][col] / m[col][col];
+					for (int c = col; c < 4; ++c)
+						m[r][c] -= f * m[col][c];
+				}
+		}
+		double moved = 0;
+		for (int t = 0; t < 3; ++t) {
+			const double dq = std::max(-200.0, std::min(200.0, m[t][3] / m[t][t]));
+			q[t] += dq;
+			moved = std::max(moved, fabs(dq));
+		}
+		if (moved < 0.01)
+			break;
+	}
+	if (!OrbitResiduals(o, q, res) || res.empty())
+		return false;
+	double sum = 0;
+	for (double v : res)
+		sum += v * v;
+	rms = sqrt(sum / res.size());
+	return true;
+}
+
+static void OrbitLog(const char* line)
+{
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu persp turn: %s\n", GetTickCount(), line);
+		fclose(f);
+	}
+}
+
+// ZBrush's pan and zoom for rotation d from the orbit, with the eye at eye.
+static bool OrbitCam(const Orbit& o, const double d[3][3], double eye, double& r, double& x, double& y)
+{
+	double s[3];
+	for (int a = 0; a < 3; ++a)
+		s[a] = o.q[0] * d[a][0] + o.q[1] * d[a][1] + o.q[2] * d[a][2];
+	// Q's size m is zoom / (1 - z zoom / eye).
+	r = o.m / (1 + o.m * s[2] / eye);
+	const double f = r / o.m;
+	if (!(r > 0) || f <= 0.05)
+		return false;
+	x = o.cx + (o.sx - o.cx) * f - s[0] * r;
+	y = o.cy + (o.sy - o.cy) * f - s[1] * r;
+	return true;
+}
+
+// st's pan and zoom for the cells: from the orbit at the rotation the cells
+// are laid out with while ZBrush turns in Persp, as read otherwise. Keeps
+// the still state, gathers ZBrush's pan and zoom through a turn and solves Q.
+// gOrbitOn while the cells are to use it (ProjInvD then takes the eye the
+// orbit went by: the record as read here).
+static void OrbitPan(OverlayState& st)
+{
+	Orbit& o = gOrbit;
+	gOrbitOn = false;
+	double d[3][3];
+	bool persp = false;
+	double eye = 0;
+	if (gTesting || !CameraAxes(d) || !ProjRead(st.docW, st.docH, persp, eye) || !persp || eye <= 0 || st.ratio <= 0) {
+		o.restOk = o.turning = false;
+		return;
+	}
+	// Each drag turns about its own point: a new button press starts a new
+	// turn, from the orbit's state where the last one stopped (ZBrush's pan
+	// and zoom may not have come to rest in between: build 221 kept the first
+	// drag's point for the second, 260 px off at its end).
+	static POINT down = {-1, -1};
+	const bool newDrag = gGesture.active && (gGesture.down.x != down.x || gGesture.down.y != down.y);
+	if (gGesture.active)
+		down = gGesture.down;
+	if (newDrag && o.turning && o.solved) {
+		double r, x, y;
+		if (OrbitCam(o, d, eye, r, x, y)) {
+			o.restR = r;
+			o.restX = x;
+			o.restY = y;
+			o.restEye = eye;
+			memcpy(o.restD, d, sizeof d);
+			o.restOk = true;
+		}
+		o.turning = false;
+	}
+	if (!Turning()) {
+		static DWORD endedAt = 0;
+		if (o.turning && o.solved) {
+			// After the button is let go ZBrush's pan and zoom come to rest a
+			// frame or more after its rotation; the orbit is used until they
+			// meet it, so the cells do not move on release (build 221 went back
+			// to ZBrush's pan and zoom at once, a frame of the old ones). A
+			// second at most.
+			double r, x, y;
+			const bool ok = OrbitCam(o, d, eye, r, x, y);
+			if (endedAt == 0)
+				endedAt = GetTickCount();
+			const bool met = ok && fabs(x - st.px) < 1.5 && fabs(y - st.py) < 1.5 && fabs(r / st.ratio - 1) < 0.003;
+			if (ok && !met && GetTickCount() - endedAt < 1000) {
+				st.ratio = r;
+				st.px = x;
+				st.py = y;
+				gOrbitEye = eye;
+				gOrbitOn = true;
+				return;
+			}
+			if (ok) {
+				char line[300];
+				snprintf(line, sizeof line, "ended %lu ms after the button: the orbit puts the origin at %.2f %.2f zoom %.4f, ZBrush %.2f %.2f zoom %.4f%s",
+					GetTickCount() - endedAt, x, y, r, st.px, st.py, st.ratio, met ? "" : " (NOT MET: the cells move to ZBrush's)");
+				OrbitLog(line);
+			}
+		}
+		endedAt = 0;
+		o.turning = false;
+		// Still, no button down: the state the next turn starts from. Build
+		// 224 waited for a read to repeat it, but the cells are not laid out
+		// again while nothing moves, so after the first turn every turn
+		// started from the state before the last and found no orbit (the
+		// cells on ZBrush's pan and zoom, snapping on release).
+		if (!gGesture.active) {
+			o.restOk = true;
+			o.restR = st.ratio;
+			o.restX = st.px;
+			o.restY = st.py;
+			o.restEye = eye;
+			memcpy(o.restD, d, sizeof d);
+			o.cx = st.docW * 0.5;
+			o.cy = st.docH * 0.5;
+		}
+		return;
+	}
+	if (!o.turning) {
+		o.turning = true;
+		o.solved = o.logged = false;
+		o.samples.clear();
+	}
+	if (!o.restOk)
+		return;
+	// A pan and zoom ZBrush has written this turn (up to 60 of them). Q is
+	// solved again with each: from 6, the ones off the fit by over 3 units
+	// left out (a read can take x, y and zoom from two of ZBrush's writes) and
+	// it fitted again. Build 221 took 4, one more than Q's three unknowns,
+	// which any read fits, and kept them: 50 px off at the turn's end.
+	const bool fresh = (st.ratio != o.restR || st.px != o.restX || st.py != o.restY) &&
+		(o.samples.empty() || st.ratio != o.samples.back()[0] || st.px != o.samples.back()[1] || st.py != o.samples.back()[2]);
+	if (fresh && o.samples.size() < 60) {
+		o.samples.push_back({st.ratio, st.px, st.py, eye});
+		if (o.samples.size() >= 6) {
+			// From where it was last solved, then from the surface the cells
+			// showed at the turn's start (Q is a point near it: the nose, 30
+			// units from it).
+			double best[3] = {}, bestRms = 1e30;
+			const double* starts[2] = {o.q, gFocusG};
+			for (int s = 0; s < 2; ++s) {
+				if (s == 0 && !o.haveQ)
+					continue;
+				if (s == 1 && !gFocusOk)
+					continue;
+				double q[3] = {starts[s][0], starts[s][1], starts[s][2]}, rms;
+				if (OrbitFit(o, q, rms) && rms < bestRms) {
+					bestRms = rms;
+					memcpy(best, q, sizeof best);
+				}
+			}
+			// Without the reads off the fit, then fitted again on the rest.
+			size_t kept = o.samples.size();
+			std::vector<double> res;
+			if (bestRms < 1e29 && OrbitResiduals(o, best, res)) {
+				std::vector<std::array<double, 4>> all = o.samples, in;
+				for (size_t i = 0; i < all.size(); ++i)
+					if (fabs(res[i]) <= 3)
+						in.push_back(all[i]);
+				kept = in.size();
+				if (kept >= 6 && kept < all.size()) {
+					o.samples = in;
+					double rms;
+					if (OrbitFit(o, best, rms))
+						bestRms = rms;
+					o.samples = all;
+				}
+			}
+			// The samples must spread over more than a turn's first step,
+			// and fit to under a unit, with 6 or more left.
+			double spread = 0;
+			for (const auto& p : o.samples)
+				spread = std::max(spread, hypot(p[1] - o.samples[0][1], p[2] - o.samples[0][2]));
+			o.rms = bestRms;
+			if (bestRms < 1 && kept >= 6 && spread > 30) {
+				memcpy(o.q, best, sizeof o.q);
+				o.haveQ = true;
+				o.solved = OrbitAnchor(o, o.q, o.sx, o.sy, o.m);
+				if (o.solved && !o.logged) {
+					o.logged = true;
+					char line[300];
+					snprintf(line, sizeof line, "about %.1f %.1f %.1f, held at %.2f %.2f size %.4f, from %zu of %zu of ZBrush's pans to %.2f units (eye %.1f at the start, %.1f now)",
+						o.q[0], o.q[1], o.q[2], o.sx, o.sy, o.m, kept, o.samples.size(), o.rms, o.restEye, eye);
+					OrbitLog(line);
+				}
+			}
+		}
+	}
+	double r, x, y;
+	if (o.solved && OrbitCam(o, d, eye, r, x, y)) {
+		st.ratio = r;
+		st.px = x;
+		st.py = y;
+		gOrbitEye = eye;
+		gOrbitOn = true;
+	} else if (o.samples.size() >= 6 && !o.solved) {
+		// Why not, once a turn (the fit's state).
+		static DWORD said = 0;
+		if (GetTickCount() - said > 2000) {
+			said = GetTickCount();
+			char line[200];
+			snprintf(line, sizeof line, "no orbit yet from %zu of ZBrush's pans (best fit %.2f units)", o.samples.size(), o.rms);
+			OrbitLog(line);
+		}
+	}
 }
 
 // Every copy is put in the reference copy's layout before its view is
@@ -9519,6 +9974,8 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 			continue;
 		}
 		any = any || step;
+		if (step)
+			c.changedAt = GetTickCount();
 		memcpy(c.m, m, sizeof(m));
 		if (sinceSettled && !moved)
 			continue;
@@ -9526,9 +9983,12 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 			continue;
 		double canon[9];
 		RotApply(c.rel, m, canon);
-		const int code = RotCode(canon);
-		if (code < 0)
-			continue;
+		// A copy turned to no view counts too, as -1: build 230 left them
+		// out, and a stray copy that moved onto Front while the eight that
+		// follow the camera turned away from it was the only one counted, so the
+		// view never counted as left, nor snapping back to it as a snap (the
+		// turns' pans stayed in Classic's offset, the image off the model).
+		const int code = std::max(-1, RotCode(canon));
 		const size_t at = std::find(codes.begin(), codes.end(), code) - codes.begin();
 		if (at == codes.size()) {
 			codes.push_back(code);
@@ -9541,8 +10001,12 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 	const int most = counts.empty() ? 0 : *std::max_element(counts.begin(), counts.end());
 	std::vector<int> top;
 	for (size_t i = 0; i < codes.size(); ++i)
-		if (counts[i] == most)
+		if (counts[i] == most) {
+			// Most copies on no view: turned away, whatever the rest say.
+			if (codes[i] < 0)
+				return {};
 			top.push_back(codes[i]);
+		}
 	return top;
 }
 
@@ -10706,7 +11170,8 @@ ZFUNC RSOverlayResetOffset(char*, double, char*, int, char*, int, char**)
 // views in the panel), "auto3d" (3D Auto Track), "a" and "b" (the two views,
 // slots 0-5), "back" (the
 // grey shown around the panel), "gamma" and "sat" (the reference's gamma
-// and saturation in percent), "modelop" (Model Opacity in percent). The value "-1" toggles mode, left and multi
+// and saturation in percent), "modelop" (Model Opacity in percent), "zoomout"
+// (Multiview's Zoom Out in percent, 100-1000). The value "-1" toggles mode, left and multi
 // and steps a and b to the next view. "name" alone returns the setting.
 ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 {
@@ -10738,17 +11203,17 @@ ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 	}
 	int* field = strcmp(name, "mode") == 0 ? &gMode : strcmp(name, "left") == 0 ? &gPanelLeft :
 		strcmp(name, "multi") == 0 ? &gMulti : strcmp(name, "a") == 0 ? &gMultiA : strcmp(name, "b") == 0 ? &gMultiB :
-		strcmp(name, "auto3d") == 0 ? &gAuto3D : strcmp(name, "autopersp") == 0 ? &gAutoPersp : strcmp(name, "back") == 0 ? &gBackGrey : strcmp(name, "gamma") == 0 ? &gGamma : strcmp(name, "sat") == 0 ? &gSat : strcmp(name, "modelop") == 0 ? &gModelOpacity : nullptr;
+		strcmp(name, "auto3d") == 0 ? &gAuto3D : strcmp(name, "autopersp") == 0 ? &gAutoPersp : strcmp(name, "back") == 0 ? &gBackGrey : strcmp(name, "gamma") == 0 ? &gGamma : strcmp(name, "sat") == 0 ? &gSat : strcmp(name, "modelop") == 0 ? &gModelOpacity : strcmp(name, "zoomout") == 0 ? &gCellZoomOut : nullptr;
 	float result = -1;
 	if (field) {
 		const bool view = field == &gMultiA || field == &gMultiB;
-		const bool level = field == &gBackGrey || field == &gGamma || field == &gSat || field == &gModelOpacity;
+		const bool level = field == &gBackGrey || field == &gGamma || field == &gSat || field == &gModelOpacity || field == &gCellZoomOut;
 		if (value == -1 && !level)
 			*field = view ? (*field + 1) % 6 : !*field;
 		else if (value >= 0)
 			*field = view ? value % 6 : field == &gBackGrey ? std::min(value, 255) :
 				field == &gGamma ? std::max(20, std::min(value, 300)) : field == &gSat ? std::min(value, 200) :
-				field == &gModelOpacity ? std::min(value, 100) : value != 0;
+				field == &gModelOpacity ? std::min(value, 100) : field == &gCellZoomOut ? std::max(100, std::min(value, 1000)) : value != 0;
 		if (field == &gMulti && gMulti && value != -2) {
 			// Multiview turned on with a view without an image above or below
 			// (or the same one twice): views that have one go there instead,
@@ -12195,6 +12660,39 @@ ZFUNC RSOverlayStop(char*, double, char*, int, char*, int, char**)
 // "pureref", "left", "multi", "auto3d", "adjust", or "a N" / "b N" (view N in the
 // upper / lower Multiview image). Returns 1 if it is on, else 0: each switch
 // starts as this, and ZBrush loads the plugin again for every press.
+// text "1" or "0": ZBrush's Persp wanted on or off (Auto Persp, when no Persp
+// button is found for ZScript to set). Persp is read from ZBrush's projection
+// record; if it is not as wanted, ZBrush's Persp key (P) is pressed, which
+// ZBrush handles once the script returns. Returns 1 if pressed, 0 if already
+// so, -1 if Persp cannot be read or ZBrush is not in front. Logged.
+ZFUNC RSPersp(char* text, double, char*, int, char*, int, char**)
+{
+	const bool want = text && atoi(text) != 0;
+	EnsureLock();
+	EnterCriticalSection(&gOverlayLock);
+	const double docW = gOverlay.docW, docH = gOverlay.docH;
+	LeaveCriticalSection(&gOverlayLock);
+	bool persp = false;
+	double eye = 0;
+	float result = -1;
+	if (ProjRead(docW, docH, persp, eye) && ZBrushInFront()) {
+		result = 0;
+		if (persp != want) {
+			INPUT in[2] = {};
+			in[0].type = in[1].type = INPUT_KEYBOARD;
+			in[0].ki.wVk = in[1].ki.wVk = 'P';
+			in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+			result = SendInput(2, in, sizeof(INPUT)) == 2 ? 1.0f : -1.0f;
+		}
+	}
+	if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+		fprintf(f, "%lu auto persp: no Persp button; Persp wanted %s, is %s: %s\n", GetTickCount(), want ? "on" : "off", persp ? "on" : "off",
+			result == 1 ? "pressed P" : result == 0 ? "already so" : "could not read Persp or press P");
+		fclose(f);
+	}
+	return result;
+}
+
 ZFUNC RSIsOn(char* text, double, char*, int, char*, int, char**)
 {
 	char name[16] = {0};
@@ -12214,6 +12712,7 @@ ZFUNC RSIsOn(char* text, double, char*, int, char*, int, char**)
 	else if (strcmp(name, "multi") == 0) on = gMulti != 0;
 	else if (strcmp(name, "auto3d") == 0) on = gAuto3D != 0;
 	else if (strcmp(name, "autopersp") == 0) on = gAutoPersp != 0;
+	else if (strcmp(name, "perspwanted") == 0) on = gPerspFor[gMode == 1];
 	else if (strcmp(name, "adjust") == 0) on = gAdjust;
 	else if (strcmp(name, "a") == 0) on = gMultiA == n;
 	else if (strcmp(name, "b") == 0) on = gMultiB == n;

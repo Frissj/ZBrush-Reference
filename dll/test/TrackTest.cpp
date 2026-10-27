@@ -432,6 +432,32 @@ static bool RotationTests()
 	RotFollow();
 	const bool turnSeen = Turning();
 	const size_t turnLeft = gRotCands.size();
+	// The camera's axes through the turn: the three moving copies', not the
+	// six still holding the rotation from before it; and after the release,
+	// when all nine hold the new one, the same.
+	auto axes = [](double d[3][3]) {
+		gTesting = false;
+		const bool ok = CameraAxes(d);
+		gTesting = true;
+		return ok;
+	};
+	double before[3][3] = {}, during[3][3] = {}, after[3][3] = {};
+	const bool duringOk = axes(during);
+	for (int k = 3; k < 9; ++k)
+		memcpy(mats[k], turned, sizeof(turned));
+	RotFollow();
+	const bool afterOk = axes(after);
+	for (int k = 0; k < 9; ++k)
+		memcpy(mats[k], right, sizeof(right));
+	RotFollow();
+	const bool beforeOk = axes(before);
+	double off = 0, turnSize = 0;
+	for (int r = 0; r < 3; ++r)
+		for (int c = 0; c < 3; ++c) {
+			off = std::max(off, fabs(during[r][c] - after[r][c]));
+			turnSize = std::max(turnSize, fabs(before[r][c] - after[r][c]));
+		}
+	const bool axesOk = duringOk && afterOk && beforeOk && off < 1e-6 && turnSize > 0.1;
 
 	gRotCands.clear();
 	gRotLocked = false;
@@ -444,7 +470,8 @@ static bool RotationTests()
 	printf("  Alt pan, one copy flickers to Front    turning %d then %d, %zu copies kept: %s\n", panFlicker, panAfter, panLeft,
 		panOk ? "pass" : "FAIL");
 	printf("  turn drag, three copies move           turning %d, %zu copies kept: %s\n", turnSeen, turnLeft, turnOk ? "pass" : "FAIL");
-	return panOk && turnOk;
+	printf("  camera axes through the turn           %.4f off the turned rotation: %s\n", off, axesOk ? "pass" : "FAIL");
+	return panOk && turnOk && axesOk;
 }
 
 static int Run(int argc, char** argv)

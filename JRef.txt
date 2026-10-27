@@ -23,9 +23,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 215"]
+[VarDef, zrsBuild, "build 231"]
 [VarDef, zrsDll, "JRef_Data\JRef64.dll"]
-[VarDef, zrsDllBuild, 215]
+[VarDef, zrsDllBuild, 231]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -62,6 +62,7 @@
 [VarDef, zrsKy, 0]
 [VarDef, zrsKz, 0]
 [VarDef, zrsKsx, 0]
+[VarDef, zrsPersp, ""]
 [VarDef, zrsKsy, 0]
 [VarDef, zrsKsz, 0]
 [VarDef, zrsKrx, 0]
@@ -611,14 +612,33 @@
 	[If, zrsTick < 256, [FileExecute, zrsDll, "RSDisplay", [StrMerge, "back ", zrsTick]]]
 	[FileExecute, zrsDll, "RSDisplay", "mode 1"]
 ]
-// Auto Persp on: ZBrush's Persp on in PureRef Mode, off in Classic (where the
-// image lies on one plane and perspective draws the model off it). Only when
-// the mode or the overlay changes, so Persp set by hand in between stays.
+// Auto Persp on: when the mode or the overlay changes, ZBrush's Persp as that
+// mode last had it (the DLL keeps it per mode, from every switch of Persp, by
+// hand or not): on in PureRef Mode and off in Classic (where the image lies on
+// one plane and perspective draws the model off it) until set otherwise. Build
+// 229 set those each time, turning Persp turned off in PureRef back on.
+// One check at a time, each failure logged. ZBrush 2023 has no Draw:Persp
+// (build 228's log); the button is looked for where ZBrush versions have
+// kept it, the one found logged.
 [RoutineDef, ZRSAutoPersp,
-	[If, [FileExecute, zrsDll, "RSIsOn", "autopersp"] && [FileExecute, zrsDll, "RSIsOn", "overlay"],
-		[If, [IExists, "Draw:Persp"],
-			[ISet, "Draw:Persp", [FileExecute, zrsDll, "RSIsOn", "pureref"]]
-			[FileExecute, zrsDll, "RSLog", [StrMerge, "auto persp: Persp set to ", [FileExecute, zrsDll, "RSIsOn", "pureref"]]]
+	[If, [FileExecute, zrsDll, "RSIsOn", "autopersp"],
+		[If, [FileExecute, zrsDll, "RSIsOn", "overlay"],
+			[VarSet, zrsTick, [FileExecute, zrsDll, "RSIsOn", "perspwanted"]]
+			[VarSet, zrsPersp, ""]
+			[If, [IExists, "Draw:Perspective"], [VarSet, zrsPersp, "Draw:Perspective"]]
+			[If, [IExists, "Transform:Persp"], [VarSet, zrsPersp, "Transform:Persp"]]
+			[If, [IExists, "Transform:Perspective"], [VarSet, zrsPersp, "Transform:Perspective"]]
+			[If, [IExists, "Draw:Persp"], [VarSet, zrsPersp, "Draw:Persp"]]
+			[If, [StrLength, zrsPersp] > 0,
+				[ISet, zrsPersp, zrsTick]
+				[FileExecute, zrsDll, "RSLog", [StrMerge, "auto persp: ", zrsPersp, " set to ", zrsTick, ", reads ", [IGet, zrsPersp]]]
+				,
+				// No button: the DLL presses ZBrush's Persp key (P) if Persp is
+				// not as wanted (it reads Persp from ZBrush's own record).
+				[FileExecute, zrsDll, "RSPersp", [StrMerge, "", zrsTick]]
+			]
+			,
+			[FileExecute, zrsDll, "RSLog", "auto persp: the overlay is off"]
 		]
 	]
 ]
@@ -668,17 +688,10 @@
 	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressPureRef] [RoutineCall, ZRSAutoPersp] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
 	, 0, 0.45
 ]
-// Each press moves the panel to the other side ("left -1" toggles it): a
-// plain button, nothing to light.
-[IButton, "ZPlugin:JRef:Swap Side",
-	"PureRef: move the panel to the other side of the canvas.",
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "left -1"] [VarSet, zrsBusy, 0]]
-	, 0, 0.5
-]
 // Auto Persp: a setting (lit while on), applied when the mode changes
 // (ZRSAutoPersp).
 [ISwitch, "ZPlugin:JRef:Auto Persp", [FileExecute, zrsDll, "RSIsOn", "autopersp"],
-	"Turn ZBrush's Persp on in PureRef Mode and off in Classic Mode, each time the mode changes. Persp set by hand stays until the next change.",
+	"Each time the mode changes, put ZBrush's Persp back as you last had it in that mode: at first on in PureRef Mode and off in Classic Mode.",
 	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "autopersp -1"] [RoutineCall, ZRSAutoPersp] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
 	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "autopersp -1"] [RoutineCall, ZRSAutoPersp] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]]
 	, 0, 0.5
@@ -686,25 +699,37 @@
 
 [IButton, "ZPlugin:JRef:Reset",
 	"Snap to the Front view lined up with its reference, and put Gamma, Saturation and every image's size, place and turn back.",
-	[VarSet, zrsTick, [FileExecute, zrsDll, "RSAdjust", "3"]]
-	[ISet, "ZPlugin:JRef:Image:Gamma", 1]
-	[ISet, "ZPlugin:JRef:Image:Saturation", 100]
-	[RoutineCall, ZRSLevels]
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
-	[If, [IGet, Transform:Edit] == 0,
-		[FileExecute, zrsDll, "RSStatus", "~JRef: put the model in Edit mode first."]
-		,
-		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
-		[VarSet, zrsKsx, zrsSx]
-		[If, [FileExecute, zrsDll, "RSViewUsed", "0"],
-			[VarSet, zrsKsx, [FileExecute, zrsDll, "RSViewGet", "0 0"]]
-			[VarSet, zrsPx, [FileExecute, zrsDll, "RSViewGet", "0 1"]]
-			[VarSet, zrsPy, [FileExecute, zrsDll, "RSViewGet", "0 2"]]
-		]
-		[If, zrsSx > 0,
-			[TransformSet, zrsPx, zrsPy, zrsPz, zrsKsx, zrsSy * zrsKsx / zrsSx, zrsSz * zrsKsx / zrsSx, 0, 0, 0]
+	// Asks first: it undoes every image's Adjust Image work.
+	[If, [MessageOKCancel, "Reset snaps to the Front view and puts Gamma, Saturation and every image's size, place and turn back. This cannot be undone.", "JRef: Reset"],
+		[VarSet, zrsTick, [FileExecute, zrsDll, "RSAdjust", "3"]]
+		[ISet, "ZPlugin:JRef:Image:Gamma", 1]
+		[ISet, "ZPlugin:JRef:Image:Saturation", 100]
+		[RoutineCall, ZRSLevels]
+		[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
+		[If, [IGet, Transform:Edit] == 0,
+			[FileExecute, zrsDll, "RSStatus", "~JRef: put the model in Edit mode first."]
+			,
+			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
+			[VarSet, zrsKsx, zrsSx]
+			[If, [FileExecute, zrsDll, "RSViewUsed", "0"],
+				[VarSet, zrsKsx, [FileExecute, zrsDll, "RSViewGet", "0 0"]]
+				[VarSet, zrsPx, [FileExecute, zrsDll, "RSViewGet", "0 1"]]
+				[VarSet, zrsPy, [FileExecute, zrsDll, "RSViewGet", "0 2"]]
+			]
+			[If, zrsSx > 0,
+				[TransformSet, zrsPx, zrsPy, zrsPz, zrsKsx, zrsSy * zrsKsx / zrsSx, zrsSz * zrsKsx / zrsSx, 0, 0, 0]
+			]
 		]
 	]
+	, 0, 0.5
+]
+
+// Each press moves the panel to the other side ("left -1" toggles it): a
+// plain button, nothing to light. Last of the row: it shows only in PureRef
+// Mode, and the buttons after it moved each time the mode changed.
+[IButton, "ZPlugin:JRef:Swap Side",
+	"PureRef: move the panel to the other side of the canvas.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "left -1"] [VarSet, zrsBusy, 0]]
 	, 0, 0.5
 ]
 
@@ -881,6 +906,13 @@
 	, 0, 1
 ]
 
+[ISlider, "ZPlugin:JRef:Multiview:Zoom Out", [FileExecute, zrsDll, "RSDisplay", "zoomout"] / 100, 0.05, 1, 10,
+	"PureRef: the reference images in the panel are shown this many times smaller than the canvas shows the model (1 is the same size, 2 half).",
+	[VarSet, zrsTick, [IGet, "ZPlugin:JRef:Multiview:Zoom Out"] * 100 + 0.5]
+	[FileExecute, zrsDll, "RSDisplay", [StrMerge, "zoomout ", zrsTick]]
+	, 0, 1
+]
+
 [ISwitch, "ZPlugin:JRef:Multiview:3D Auto Track", [FileExecute, zrsDll, "RSIsOn", "auto3d"],
 	"Multiview: lit, the other view goes to the surface you are looking at (found from the views' silhouettes) when zoomed in closer than the part's depth; off, it shows the whole part at that height.",
 	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSDisplay", "auto3d -1"] [RoutineCall, ZRSLightSwitches] [VarSet, zrsBusy, 0]],
@@ -956,6 +988,7 @@
 [IEnable, "ZPlugin:JRef:Classic Mode"]
 [IEnable, "ZPlugin:JRef:PureRef Mode"]
 [IEnable, "ZPlugin:JRef:Swap Side"]
+[IEnable, "ZPlugin:JRef:Auto Persp"]
 [IEnable, "ZPlugin:JRef:Image:Adjust Image"]
 [IEnable, "ZPlugin:JRef:Multiview:Multiview"]
 [IEnable, "ZPlugin:JRef:Multiview:3D Auto Track"]
