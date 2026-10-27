@@ -23,9 +23,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 231"]
+[VarDef, zrsBuild, "build 234"]
 [VarDef, zrsDll, "JRef_Data\JRef64.dll"]
-[VarDef, zrsDllBuild, 231]
+[VarDef, zrsDllBuild, 234]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -379,13 +379,13 @@
 // with zrsBusy set (setting a slider runs its command).
 [RoutineDef, ZRSImageSliders,
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSImage", "width"]]
-	[If, zrsTick > 0, [ISet, "ZPlugin:JRef:Image:Width", zrsTick]]
+	[If, zrsTick > 0, [ISet, "ZPlugin:JRef:Image:Placement:Width", zrsTick]]
 	[VarSet, zrsTick, [FileExecute, zrsDll, "RSImage", "height"]]
-	[If, zrsTick > 0, [ISet, "ZPlugin:JRef:Image:Height", zrsTick]]
+	[If, zrsTick > 0, [ISet, "ZPlugin:JRef:Image:Placement:Height", zrsTick]]
 	[If, [FileExecute, zrsDll, "RSImage", "width"] > 0,
-		[ISet, "ZPlugin:JRef:Image:Turn", [FileExecute, zrsDll, "RSImage", "turn"]]
-		[ISet, "ZPlugin:JRef:Image:X", [FileExecute, zrsDll, "RSImage", "x"]]
-		[ISet, "ZPlugin:JRef:Image:Y", [FileExecute, zrsDll, "RSImage", "y"]]
+		[ISet, "ZPlugin:JRef:Image:Placement:Turn", [FileExecute, zrsDll, "RSImage", "turn"]]
+		[ISet, "ZPlugin:JRef:Image:Placement:X", [FileExecute, zrsDll, "RSImage", "x"]]
+		[ISet, "ZPlugin:JRef:Image:Placement:Y", [FileExecute, zrsDll, "RSImage", "y"]]
 	]
 ]
 
@@ -426,6 +426,19 @@
 		[IHide, "ZPlugin:JRef:Upper Image"]
 		[IHide, "ZPlugin:JRef:Lower Image"]
 	]
+	// Adjust Image works only in Classic Mode.
+	[If, zrsB,
+		[IHide, "ZPlugin:JRef:Image:Adjust Image"]
+		,
+		[IShow, "ZPlugin:JRef:Image:Adjust Image"]
+	]
+	// A view's trash can shows only while it has an image.
+	[If, [FileExecute, zrsDll, "RSViewUsed", "0"], [IShow, "ZPlugin:JRef:Views:Remove Front"], [IHide, "ZPlugin:JRef:Views:Remove Front"]]
+	[If, [FileExecute, zrsDll, "RSViewUsed", "1"], [IShow, "ZPlugin:JRef:Views:Remove Back"], [IHide, "ZPlugin:JRef:Views:Remove Back"]]
+	[If, [FileExecute, zrsDll, "RSViewUsed", "2"], [IShow, "ZPlugin:JRef:Views:Remove Right"], [IHide, "ZPlugin:JRef:Views:Remove Right"]]
+	[If, [FileExecute, zrsDll, "RSViewUsed", "3"], [IShow, "ZPlugin:JRef:Views:Remove Left"], [IHide, "ZPlugin:JRef:Views:Remove Left"]]
+	[If, [FileExecute, zrsDll, "RSViewUsed", "4"], [IShow, "ZPlugin:JRef:Views:Remove Top"], [IHide, "ZPlugin:JRef:Views:Remove Top"]]
+	[If, [FileExecute, zrsDll, "RSViewUsed", "5"], [IShow, "ZPlugin:JRef:Views:Remove Bottom"], [IHide, "ZPlugin:JRef:Views:Remove Bottom"]]
 ]
 
 // Lights (orange) every switch that is on in the DLL and darkens the rest.
@@ -742,6 +755,7 @@
 	[VarSet, zrsView, 0]
 	[VarSet, zrsMsg2, "Front"]
 	[RoutineCall, ZRSViewLoad]
+	[RoutineCall, ZRSShowHide]
 	, 0, 0.8
 ]
 
@@ -750,6 +764,7 @@
 	[VarSet, zrsView, 0]
 	[VarSet, zrsMsg2, "Front"]
 	[RoutineCall, ZRSViewRemove]
+	[RoutineCall, ZRSShowHide]
 	, 0, 0.2, , "JRef_Data\trash.psd"
 ]
 
@@ -758,6 +773,7 @@
 	[VarSet, zrsView, 1]
 	[VarSet, zrsMsg2, "Back"]
 	[RoutineCall, ZRSViewLoad]
+	[RoutineCall, ZRSShowHide]
 	, 0, 0.8
 ]
 
@@ -766,6 +782,7 @@
 	[VarSet, zrsView, 1]
 	[VarSet, zrsMsg2, "Back"]
 	[RoutineCall, ZRSViewRemove]
+	[RoutineCall, ZRSShowHide]
 	, 0, 0.2, , "JRef_Data\trash.psd"
 ]
 
@@ -774,6 +791,7 @@
 	[VarSet, zrsView, 2]
 	[VarSet, zrsMsg2, "Right"]
 	[RoutineCall, ZRSViewLoad]
+	[RoutineCall, ZRSShowHide]
 	, 0, 0.8
 ]
 
@@ -782,6 +800,7 @@
 	[VarSet, zrsView, 2]
 	[VarSet, zrsMsg2, "Right"]
 	[RoutineCall, ZRSViewRemove]
+	[RoutineCall, ZRSShowHide]
 	, 0, 0.2, , "JRef_Data\trash.psd"
 ]
 
@@ -790,6 +809,7 @@
 	[VarSet, zrsView, 3]
 	[VarSet, zrsMsg2, "Left"]
 	[RoutineCall, ZRSViewLoad]
+	[RoutineCall, ZRSShowHide]
 	, 0, 0.8
 ]
 
@@ -798,6 +818,7 @@
 	[VarSet, zrsView, 3]
 	[VarSet, zrsMsg2, "Left"]
 	[RoutineCall, ZRSViewRemove]
+	[RoutineCall, ZRSShowHide]
 	, 0, 0.2, , "JRef_Data\trash.psd"
 ]
 
@@ -806,6 +827,7 @@
 	[VarSet, zrsView, 4]
 	[VarSet, zrsMsg2, "Top"]
 	[RoutineCall, ZRSViewLoad]
+	[RoutineCall, ZRSShowHide]
 	, 0, 0.8
 ]
 
@@ -814,6 +836,7 @@
 	[VarSet, zrsView, 4]
 	[VarSet, zrsMsg2, "Top"]
 	[RoutineCall, ZRSViewRemove]
+	[RoutineCall, ZRSShowHide]
 	, 0, 0.2, , "JRef_Data\trash.psd"
 ]
 
@@ -822,6 +845,7 @@
 	[VarSet, zrsView, 5]
 	[VarSet, zrsMsg2, "Bottom"]
 	[RoutineCall, ZRSViewLoad]
+	[RoutineCall, ZRSShowHide]
 	, 0, 0.8
 ]
 
@@ -830,6 +854,7 @@
 	[VarSet, zrsView, 5]
 	[VarSet, zrsMsg2, "Bottom"]
 	[RoutineCall, ZRSViewRemove]
+	[RoutineCall, ZRSShowHide]
 	, 0, 0.2, , "JRef_Data\trash.psd"
 ]
 
@@ -844,36 +869,6 @@
 [IButton, "ZPlugin:JRef:Image:Adjust Image",
 	"Move, scale and turn the image with the handles at its centre. Ctrl+Z undoes. Esc or a click off the image when done.",
 	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressAdjust] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
-	, 0, 1
-]
-
-[ISlider, "ZPlugin:JRef:Image:Width", [FileExecute, zrsDll, "RSImage", "width"], 0.001, 1, 1000,
-	"The showing image's width, in percent of the image fitted to the document. Click and type a value.",
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSImage", [StrMerge, "width ", [IGet, "ZPlugin:JRef:Image:Width"]]] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
-	, 0, 0.5
-]
-
-[ISlider, "ZPlugin:JRef:Image:Height", [FileExecute, zrsDll, "RSImage", "height"], 0.001, 1, 1000,
-	"The showing image's height, in percent of the image fitted to the document. Click and type a value.",
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSImage", [StrMerge, "height ", [IGet, "ZPlugin:JRef:Image:Height"]]] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
-	, 0, 0.5
-]
-
-[ISlider, "ZPlugin:JRef:Image:X", [FileExecute, zrsDll, "RSImage", "x"], 0.01, -2000, 2000,
-	"The showing image's centre, across: document pixels right of where it is fitted. Click and type a value.",
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSImage", [StrMerge, "x ", [IGet, "ZPlugin:JRef:Image:X"]]] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
-	, 0, 0.5
-]
-
-[ISlider, "ZPlugin:JRef:Image:Y", [FileExecute, zrsDll, "RSImage", "y"], 0.01, -2000, 2000,
-	"The showing image's centre, down: document pixels below where it is fitted. Click and type a value.",
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSImage", [StrMerge, "y ", [IGet, "ZPlugin:JRef:Image:Y"]]] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
-	, 0, 0.5
-]
-
-[ISlider, "ZPlugin:JRef:Image:Turn", [FileExecute, zrsDll, "RSImage", "turn"], 0.001, -180, 180,
-	"The showing image's turn about its centre, in degrees clockwise. Click and type a value.",
-	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSImage", [StrMerge, "turn ", [IGet, "ZPlugin:JRef:Image:Turn"]]] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
 	, 0, 1
 ]
 
@@ -895,6 +890,40 @@
 	, 0, 1
 ]
 
+// The showing image's size, place and turn, in their own sub-palette of
+// Image (build 233).
+[ISubPalette, "ZPlugin:JRef:Image:Placement", 1]
+
+[ISlider, "ZPlugin:JRef:Image:Placement:Height", [FileExecute, zrsDll, "RSImage", "height"], 0.001, 1, 1000,
+	"The showing image's height, in percent of the image fitted to the document. Click and type a value.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSImage", [StrMerge, "height ", [IGet, "ZPlugin:JRef:Image:Placement:Height"]]] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
+	, 0, 0.5
+]
+
+[ISlider, "ZPlugin:JRef:Image:Placement:Width", [FileExecute, zrsDll, "RSImage", "width"], 0.001, 1, 1000,
+	"The showing image's width, in percent of the image fitted to the document. Click and type a value.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSImage", [StrMerge, "width ", [IGet, "ZPlugin:JRef:Image:Placement:Width"]]] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
+	, 0, 0.5
+]
+
+[ISlider, "ZPlugin:JRef:Image:Placement:X", [FileExecute, zrsDll, "RSImage", "x"], 0.01, -2000, 2000,
+	"The showing image's centre, across: document pixels right of where it is fitted. Click and type a value.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSImage", [StrMerge, "x ", [IGet, "ZPlugin:JRef:Image:Placement:X"]]] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
+	, 0, 0.5
+]
+
+[ISlider, "ZPlugin:JRef:Image:Placement:Y", [FileExecute, zrsDll, "RSImage", "y"], 0.01, -2000, 2000,
+	"The showing image's centre, down: document pixels below where it is fitted. Click and type a value.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSImage", [StrMerge, "y ", [IGet, "ZPlugin:JRef:Image:Placement:Y"]]] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
+	, 0, 0.5
+]
+
+[ISlider, "ZPlugin:JRef:Image:Placement:Turn", [FileExecute, zrsDll, "RSImage", "turn"], 0.001, -180, 180,
+	"The showing image's turn about its centre, in degrees clockwise. Click and type a value.",
+	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [FileExecute, zrsDll, "RSImage", [StrMerge, "turn ", [IGet, "ZPlugin:JRef:Image:Placement:Turn"]]] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
+	, 0, 1
+]
+
 // Multiview (PureRef): two views in the panel, one above the other, chosen
 // in Upper Image and Lower Image (the lit one is showing).
 [ISubPalette, "ZPlugin:JRef:Multiview", 1]
@@ -906,9 +935,9 @@
 	, 0, 1
 ]
 
-[ISlider, "ZPlugin:JRef:Multiview:Zoom Out", [FileExecute, zrsDll, "RSDisplay", "zoomout"] / 100, 0.05, 1, 10,
+[ISlider, "ZPlugin:JRef:Multiview:Zoom Out Scale PureRef", [FileExecute, zrsDll, "RSDisplay", "zoomout"] / 100, 0.05, 1, 10,
 	"PureRef: the reference images in the panel are shown this many times smaller than the canvas shows the model (1 is the same size, 2 half).",
-	[VarSet, zrsTick, [IGet, "ZPlugin:JRef:Multiview:Zoom Out"] * 100 + 0.5]
+	[VarSet, zrsTick, [IGet, "ZPlugin:JRef:Multiview:Zoom Out Scale PureRef"] * 100 + 0.5]
 	[FileExecute, zrsDll, "RSDisplay", [StrMerge, "zoomout ", zrsTick]]
 	, 0, 1
 ]

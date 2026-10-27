@@ -261,7 +261,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 231;
+static const int kDllBuild = 234;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -1551,8 +1551,8 @@ static void DrawGizmo(const OverlayState& st, int w, int h, std::vector<DrawOp>&
 // shows gBackGrey.
 static int gMode = 0, gPanelLeft = 0, gMulti = 0, gMultiA = 0, gMultiB = 3, gBackGrey = 48;
 // 3D Auto Track: Multiview goes to the surface being looked at (SurfaceDepth),
-// not only the band; off unless switched on.
-static int gAuto3D = 0;
+// not only the band; on unless switched off (build 233).
+static int gAuto3D = 1;
 // Auto Persp: the script turns ZBrush's Persp on with PureRef Mode and off
 // with Classic when this is on (only then: Persp set by hand stays).
 static int gAutoPersp = 0;
@@ -2702,6 +2702,9 @@ static bool OnMenu(int x, int y)
 // flyout and cursor checks, the changes against the copy, the boxes.
 static double gMenuMs[3] = {0};
 
+static bool MenuOverEmptyCanvas(const OverlayState& st, const unsigned char* key, int w, int h, int vx0, int vy0, int vx1, int vy1,
+	std::vector<unsigned char>& cand);
+
 static void UpdateMenus(const OverlayState& st, int w, int h)
 {
 	LARGE_INTEGER partStart, partFreq;
@@ -2875,6 +2878,97 @@ static void UpdateMenus(const OverlayState& st, int w, int h)
 		}
 		gCalPending = false;
 		return;
+	}
+	// A menu open when PureRef Mode comes on (pressed in the ZPlugin menu) is
+	// already in the copy: it never changes, so it never became a menu, and
+	// the panel drew over it (build 233: the start menu was not found at
+	// Overlay, 0 pixels). It is found from what the screen shows: not the
+	// background, yet no model in ZBrush's canvas depth, in blocks it fills
+	// (a menu's backdrop is solid; the model's antialiased outline is a thin
+	// ring). Taken as the start menu, it goes as that does.
+	{
+		static int seenMode = -1;
+		static bool want = false;
+		if (gMode == 1 && seenMode != 1)
+			want = true;
+		seenMode = gMode;
+		const unsigned char* key = gKeyShare.size() == all ? gKeyShare.data() : nullptr;
+		if (want && !gMenuSettling && gMode == 1) {
+			want = false;
+			int found = 0;
+			std::vector<unsigned char> cand;
+			if (!gMenuBakedCount && key && MenuOverEmptyCanvas(st, key, w, h, vx0, vy0, vx1, vy1, cand)) {
+				const int bs = 16, bw = (w + bs - 1) / bs, bh = (h + bs - 1) / bs;
+				std::vector<int> blocks(static_cast<size_t>(bw) * bh, 0);
+				for (int y = vy0; y < vy1; ++y)
+					for (int x = vx0; x < vx1; ++x)
+						blocks[static_cast<size_t>(y / bs) * bw + x / bs] += cand[static_cast<size_t>(y) * w + x];
+				// The largest connected area of blocks at least half filled.
+				std::vector<int> label(blocks.size(), 0);
+				int best = 0, bestSize = 0, next = 0;
+				for (size_t s = 0; s < blocks.size(); ++s) {
+					if (blocks[s] < bs * bs / 2 || label[s])
+						continue;
+					++next;
+					int size = 0;
+					std::vector<size_t> stack = {s};
+					label[s] = next;
+					while (!stack.empty()) {
+						const size_t b = stack.back();
+						stack.pop_back();
+						++size;
+						const int bx = static_cast<int>(b % bw), by = static_cast<int>(b / bw);
+						for (int dy = -1; dy <= 1; ++dy)
+							for (int dx = -1; dx <= 1; ++dx) {
+								const int nx = bx + dx, ny = by + dy;
+								if (nx < 0 || ny < 0 || nx >= bw || ny >= bh)
+									continue;
+								const size_t nb = static_cast<size_t>(ny) * bw + nx;
+								if (!label[nb] && blocks[nb] >= bs * bs / 2) {
+									label[nb] = next;
+									stack.push_back(nb);
+								}
+							}
+					}
+					if (size > bestSize) {
+						bestSize = size;
+						best = next;
+					}
+				}
+				// Its box, a block wider each way for the edges the blocks miss.
+				long bx0 = w, by0 = h, bx1 = -1, by1 = -1;
+				for (size_t s = 0; best && s < blocks.size(); ++s)
+					if (label[s] == best) {
+						const long bx = static_cast<long>(s % bw) * bs, by = static_cast<long>(s / bw) * bs;
+						bx0 = std::min(bx0, bx - bs);
+						by0 = std::min(by0, by - bs);
+						bx1 = std::max(bx1, bx + 2 * bs);
+						by1 = std::max(by1, by + 2 * bs);
+					}
+				bx0 = std::max<long>(bx0, vx0);
+				by0 = std::max<long>(by0, vy0);
+				bx1 = std::min<long>(bx1, vx1);
+				by1 = std::min<long>(by1, vy1);
+				if (best && bestSize >= 6 && static_cast<double>(bx1 - bx0) * (by1 - by0) <= 0.4 * (vx1 - vx0) * (vy1 - vy0)) {
+					gMenuBaked.assign(all, 0);
+					gMenuBakedPixels.clear();
+					for (long y = by0; y < by1; ++y)
+						for (long x = bx0; x < bx1; ++x) {
+							const size_t i = static_cast<size_t>(y) * w + x;
+							if (!cand[i])
+								continue;
+							gMenuBaked[i] = 1;
+							gMenuBakedPixels.push_back({i, cap[i] & 0xFFFFFFu});
+							++found;
+						}
+					gMenuBakedCount = found;
+					gMenuBox = {bx0, by0, bx1, by1};
+					gMenuBoxes.push_back(gMenuBox);
+					gMenuOpen = true;
+				}
+			}
+			log(cand.empty() ? "open when PureRef came on not looked for (no canvas depth)" : "open when PureRef came on", found);
+		}
 	}
 	CURSORINFO ci = {sizeof(ci)};
 	GetCursorInfo(&ci);
@@ -7033,10 +7127,10 @@ static void LoadDisplay()
 		return;
 	gDisplayLoaded = true;
 	if (FILE* f = _wfopen(DisplayPath().c_str(), L"rb")) {
-		int v[16] = {0, 0, 0, 0, 3, 48, 0, 3, 4, 1, 0, 100, 100, 75, 0, 200};
+		int v[16] = {0, 0, 0, 0, 3, 48, 0, 3, 4, 1, 1, 100, 100, 75, 0, 200};
 		const int n = fscanf(f, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9],
 			&v[10], &v[11], &v[12], &v[13], &v[14], &v[15]);
-		gAuto3D = n >= 11 && v[10] != 0;
+		gAuto3D = n < 11 || v[10] != 0;
 		gAutoPersp = n >= 15 && v[14] != 0;  // build 207
 		gCellZoomOut = n >= 16 ? std::max(100, std::min(v[15], 1000)) : 200;  // build 222
 		// Gamma, Saturation and Model Opacity (build 142; older files keep the defaults).
@@ -7488,6 +7582,29 @@ static bool DepthAtDoc(double x, double y, double& v)
 // fails, and the caller keeps the last reading. kp: overlay pixels per
 // document pixel.
 static uintptr_t ImagePixels(uintptr_t image, int dw, int dh);
+
+// UpdateMenus: 1 where the screen shows neither the background (key) nor
+// the model (ZBrush's canvas depth) inside the viewport, outside the view
+// gizmo's corner: ZBrush's interface drawn over the canvas. False without a
+// canvas depth (cand left empty).
+static bool MenuOverEmptyCanvas(const OverlayState& st, const unsigned char* key, int w, int h, int vx0, int vy0, int vx1, int vy1,
+	std::vector<unsigned char>& cand)
+{
+	cand.clear();
+	if (!gDepth.ok || st.pixelsPerDoc <= 0)
+		return false;
+	cand.assign(static_cast<size_t>(w) * h, 0);
+	const int gizmoX = vx1 - static_cast<int>(std::min(vx1 - vx0, vy1 - vy0) * 0.3), gizmoY = vy0 + (vx1 - gizmoX);
+	DepthRows depth;
+	for (int y = vy0; y < vy1; ++y)
+		for (int x = vx0; x < vx1; ++x) {
+			const size_t i = static_cast<size_t>(y) * w + x;
+			if ((x >= gizmoX && y < gizmoY) || key[i] >= 240)
+				continue;
+			cand[i] = depth.At(x / st.pixelsPerDoc, y / st.pixelsPerDoc) == 0;
+		}
+	return true;
+}
 
 static bool CanvasDepthIn(double x, double y, double reach, double kp, double& z, double& width, int& samples)
 {
@@ -9162,6 +9279,9 @@ struct RotCand {
 	// else bit 0 transposed, bits 1-3 and 4-6 the signs of the diagonal
 	// matrices on its left and right.
 	int rel;
+	// Changed in a drag taken for a pan or zoom: judged once the drag is over
+	// (RotCodes).
+	bool panStep = false;
 };
 static std::vector<RotCand> gRotCands;
 static int gRotNarrowings = 0;
@@ -9946,9 +10066,44 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 	// is one that changes in a pan or a zoom, which never turn the camera
 	// (build 205: one copy of nine read Front for a frame of an Alt pan in
 	// Right; the view counted as turning for the rest of the drag, and the
-	// pan went into the image's offset, leaving it behind).
-	const bool idle = (gButtonsDown == 0 && !gGesture.active && GetTickCount() - gLastButtonAt > 2000) ||
-		(gGesture.active && (gGesture.mode == kDragMove || gGesture.mode == kDragScale));
+	// pan went into the image's offset, leaving it behind). A copy that
+	// changes in a pan or zoom is not counted then, and is only dropped once
+	// the drag is over if no other copy has come to the same rotation: the
+	// one copy ZBrush updates during a turn was dropped when Alt went down
+	// mid-turn (build 231), and in a drag taken for an Alt pan that ZBrush
+	// turned (build 233, just after PureRef Mode was pressed in the ZPlugin
+	// menu); from then on the cells turned only on release, snapping.
+	const bool idle = gButtonsDown == 0 && !gGesture.active && GetTickCount() - gLastButtonAt > 2000;
+	const bool panning = gGesture.active && !gGesture.rotated && (gGesture.mode == kDragMove || gGesture.mode == kDragScale);
+	if (!gGesture.active && GetTickCount() - gDragEndAt > 300)
+		for (size_t ci = 0; ci < gRotCands.size(); ++ci) {
+			if (!gRotCands[ci].panStep)
+				continue;
+			gRotCands[ci].panStep = false;
+			int others = 0, agree = 0;
+			for (size_t cj = 0; cj < gRotCands.size(); ++cj) {
+				if (cj == ci || gRotCands[cj].panStep)
+					continue;
+				++others;
+				bool same = true;
+				for (int i = 0; i < 9; ++i)
+					if (fabs(gRotCands[cj].m[i] - gRotCands[ci].m[i]) > 1e-3)
+						same = false;
+				agree += same;
+			}
+			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+				fprintf(f, "%lu rotation copy %zu changed in a pan or zoom: %d of %d others agree after it, %s\n", GetTickCount(), ci, agree, others,
+					others && !agree ? "not the camera, dropped" : "kept");
+				fclose(f);
+			}
+			if (others && !agree) {
+				gRotCands.erase(gRotCands.begin() + ci);
+				--ci;
+			} else {
+				// The camera did turn: looked up again as after any turn.
+				any = true;
+			}
+		}
 	for (size_t ci = 0; ci < gRotCands.size(); ++ci) {
 		RotCand& c = gRotCands[ci];
 		double m[9];
@@ -9965,12 +10120,17 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 		}
 		if (step && idle) {
 			if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
-				fprintf(f, "%lu rotation copy %zu changed %s: not the camera, dropped (%zu left)\n", GetTickCount(), ci,
-					gGesture.active ? "in a pan or zoom" : "with the mouse buttons up", gRotCands.size() - 1);
+				fprintf(f, "%lu rotation copy %zu changed with the mouse buttons up: not the camera, dropped (%zu left)\n", GetTickCount(), ci,
+					gRotCands.size() - 1);
 				fclose(f);
 			}
 			gRotCands.erase(gRotCands.begin() + ci);
 			--ci;
+			continue;
+		}
+		if (step && panning) {
+			c.panStep = true;
+			memcpy(c.m, m, sizeof(m));
 			continue;
 		}
 		any = any || step;
