@@ -137,6 +137,7 @@ int main(int argc,char** argv) {
 						while(fgets(line,sizeof line,meta)) {
 							if(sscanf(line,"pos %lf %lf",&gOverlay.px,&gOverlay.py)==2) cameraRead=true;
 							sscanf(line,"zoom %lf",&gOverlay.ratio);
+							sscanf(line,"doc %lf %lf",&gOverlay.docW,&gOverlay.docH);
 						}
 						fclose(meta);
 					}
@@ -149,21 +150,29 @@ int main(int argc,char** argv) {
 					Check(AutoFitDepthReady(gOverlay),"actual captured camera is revalidated before fitting");
 					for(int y=0;y<dh;++y) for(int x=0;x<336;++x) gKeyShare[y*dw+x]=0;
 					gDepth.ok=false;
+					const auto cameraBefore=gOverlay;
+					const auto axesBefore=gTestCam;
 					const int result=AutoFitOnOverlay();
+					Check(gOverlay.px==cameraBefore.px && gOverlay.py==cameraBefore.py && gOverlay.ratio==cameraBefore.ratio &&
+						memcmp(&gTestCam,&axesBefore,sizeof axesBefore)==0,
+						"Auto Fit leaves camera position, zoom and orientation unchanged");
 					printf("Actual reference fit result %d, width %.3f%%, x %.3f, y %.3f, turn %.3f\n",result,
 						100*gOverlay.imgSX,gOverlay.imgX,gOverlay.imgY,gOverlay.imgRot);
 					Check(result==1,"full Auto Fit succeeds on actual cropped ZBrush depth, saved outline and Front photo");
 					Check(result==1 && gOverlay.imgSX>1.2 && gOverlay.imgSX<1.45 && gOverlay.imgY<-35 &&
 						gOverlay.imgY>-100 && gOverlay.imgRot>1 && gOverlay.imgRot<8,
 						"actual reference fit stays near the earlier manual alignment rather than the bad silhouette fit");
-					Check(result==1 && fabs(gOverlay.imgSX*100-129.4734)<.5 && fabs(gOverlay.imgX-20.87)<1 &&
-						fabs(gOverlay.imgY+67.90)<1 && fabs(gOverlay.imgRot-4.978)<.3,
-						"actual reference matches the benchmark within 0.5 percent scale, 1 pixel and 0.3 degree");
+					// X/Y sliders use anchored model coordinates. Compare their
+					// projected document pixels so this accuracy bound is the
+					// same visible displacement at every camera zoom.
+					Check(result==1 && fabs(gOverlay.imgSX*100-129.4734)<.5 && fabs(gOverlay.imgX-20.87)*gOverlay.ratio<1 &&
+						fabs(gOverlay.imgY+67.90)*gOverlay.ratio<1 && fabs(gOverlay.imgRot-4.978)<.3,
+						"actual reference matches the benchmark within 0.5 percent scale, 1 projected document pixel and 0.3 degree");
 					const auto canonical=AdjustNow();
 					gOverlay.offX=287.35; gOverlay.offY=340.80; gOverlay.fix=1.0123;
 					gOverlay.imgSX=canonical.sx/gOverlay.fix; gOverlay.imgSY=canonical.sy/gOverlay.fix;
-					gOverlay.imgX=gOverlay.ax+gOverlay.offX+(dw*.5+canonical.x-gOverlay.ax)/gOverlay.fix-dw*.5;
-					gOverlay.imgY=gOverlay.ay+gOverlay.offY+(dh*.5+canonical.y-gOverlay.ay)/gOverlay.fix-dh*.5;
+					gOverlay.imgX=gOverlay.ax+gOverlay.offX+(gOverlay.docW*.5+canonical.x-gOverlay.ax)/gOverlay.fix-gOverlay.docW*.5;
+					gOverlay.imgY=gOverlay.ay+gOverlay.offY+(gOverlay.docH*.5+canonical.y-gOverlay.ay)/gOverlay.fix-gOverlay.docH*.5;
 					const int compensated=AutoFitOnOverlay();
 					printf("Compensated reference fit result %d, width %.3f%%, x %.3f, y %.3f, turn %.3f\n",compensated,
 						100*gOverlay.imgSX,gOverlay.imgX,gOverlay.imgY,gOverlay.imgRot);

@@ -23,6 +23,7 @@ int main() {
         {1.30,2.37,158,143},{.91,-1.43,147,152},{1.08,.91,156,146},
         {.40,-2.13,92,203},{1.90,1.2,150,150},{.55,.7,195,91},
         {.43,2.6,224,79},{.78,-.48,88,206}};
+    int caseIndex=0;
     for(const auto& tc:cases) {
         auto_fit_features::Field model;
         model.w=model.h=300; model.epsilon=1; model.image.assign(300*300,210); model.mask.assign(300*300,0);
@@ -58,6 +59,15 @@ int main() {
         const bool turnOK=correctedError<angleTolerance && corrected.x==biased.x && corrected.y==biased.y && corrected.scale==biased.scale;
         printf("%s balanced turn removes deliberate angular error: %.3f deg; position and scale preserved\n",turnOK?"PASS":"FAIL",correctedError);
         failed+=!turnOK;
+        if(caseIndex++<3) {
+            auto displaced=fit;displaced.scale*=.99;displaced.x+=.4;displaced.y-=.4;displaced.angle-=1.5*3.141592653589793/180;
+            const auto precise=auto_fit_features::RefineProfiles(photo,model,displaced);
+            const double positionError=std::hypot(precise.x-tc[2],precise.y-tc[3]);
+            const double turnError=std::abs(std::remainder(precise.angle-tc[1],2*3.141592653589793))*180/3.141592653589793;
+            const bool fixed=positionError<.4 && fabs(precise.scale/tc[0]-1)<.01 && turnError<.2;
+            printf("%s local edge profiles recover a displaced fine fit: %.3f px %.3f deg\n",fixed?"PASS":"FAIL",positionError,turnError);
+            failed+=!fixed;
+        }
     }
     // Replicating samples in one region must not give that cluster more
     // influence on the angular fit. This is independent of object anatomy.

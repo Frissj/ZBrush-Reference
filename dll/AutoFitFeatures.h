@@ -206,6 +206,132 @@ inline auto_fit::Fit RefineTurn(const Field& photo,const std::vector<Sample>& sa
     auto result=initial; result.angle=sa>sb?a:b;
     return result;
 }
+template<class Objective>
+inline auto_fit::Fit MinimizeLocal(const auto_fit::Fit& initial,Objective objective,double logRadius,double xyRadius,double angleRadius) {
+    struct Vertex {std::array<double,4> p;double error;};
+    const std::array<double,4> origin={log(initial.scale),initial.x,initial.y,initial.angle};
+    auto fit=[&](const std::array<double,4>& p) {auto f=initial;f.scale=exp(p[0]);f.x=p[1];f.y=p[2];f.angle=p[3];return f;};
+    auto vertex=[&](const std::array<double,4>& p) {
+        if(fabs(p[0]-origin[0])>logRadius || fabs(p[1]-origin[1])>xyRadius || fabs(p[2]-origin[2])>xyRadius || fabs(p[3]-origin[3])>angleRadius)
+            return Vertex{p,1e6};
+        return Vertex{p,-objective(fit(p))};
+    };
+    const double delta[4]={.005,std::min(.75,xyRadius*.2),std::min(.75,xyRadius*.2),.00872664626};
+    std::array<Vertex,5> simplex;simplex[0]=vertex(origin);
+    for(int i=0;i<4;++i) {auto p=origin;p[i]+=delta[i];simplex[i+1]=vertex(p);}
+    for(int iteration=0;iteration<400;++iteration) {
+        std::sort(simplex.begin(),simplex.end(),[](const auto& a,const auto& b){return a.error<b.error;});
+        double spread=0;
+        for(int i=1;i<5;++i) for(int j=0;j<4;++j) spread=std::max(spread,fabs(simplex[i].p[j]-simplex[0].p[j])/delta[j]);
+        if(spread<.001 && simplex[4].error-simplex[0].error<1e-8) break;
+        std::array<double,4> centre={};
+        for(int i=0;i<4;++i) for(int j=0;j<4;++j) centre[j]+=simplex[i].p[j]/4;
+        auto point=[&](double factor) {auto p=centre;for(int j=0;j<4;++j) p[j]+=factor*(centre[j]-simplex[4].p[j]);return vertex(p);};
+        const auto reflected=point(1);
+        if(reflected.error<simplex[0].error) {const auto expanded=point(2);simplex[4]=expanded.error<reflected.error?expanded:reflected;}
+        else if(reflected.error<simplex[3].error) simplex[4]=reflected;
+        else {
+            const auto contracted=point(reflected.error<simplex[4].error?.5:-.5);
+            if(contracted.error<std::min(reflected.error,simplex[4].error)) simplex[4]=contracted;
+            else for(int i=1;i<5;++i) {auto p=simplex[i].p;for(int j=0;j<4;++j) p[j]=(p[j]+simplex[0].p[j])*.5;simplex[i]=vertex(p);}
+        }
+    }
+    const auto best=std::min_element(simplex.begin(),simplex.end(),[](const auto& a,const auto& b){return a.error<b.error;});
+    return fit(best->p);
+}
+struct ProfileSample { Sample centre;std::array<double,9> gx,gy;double energy=0; };
+inline std::vector<ProfileSample> Profiles(const Field& model,const std::vector<Sample>& samples,double radius) {
+    std::vector<ProfileSample> out;out.reserve(samples.size());
+    const double kernel[3]={.25,.5,.25};
+    for(const auto& p:samples) {
+        ProfileSample patch;patch.centre=p;
+        for(int y=-1;y<=1;++y) for(int x=-1;x<=1;++x) {
+            const int i=(y+1)*3+x+1;
+            patch.gx[i]=Pixel(model.dx,model.w,model.h,p.x+x*radius,p.y+y*radius);
+            patch.gy[i]=Pixel(model.dy,model.w,model.h,p.x+x*radius,p.y+y*radius);
+            patch.energy+=kernel[x+1]*kernel[y+1]*(patch.gx[i]*patch.gx[i]+patch.gy[i]*patch.gy[i]);
+        }
+        out.push_back(patch);
+    }
+    return out;
+}
+inline double ProfileScore(const Field& photo,const std::vector<ProfileSample>& samples,const auto_fit::Fit& fit,double radius,double epsilon) {
+    const double c=cos(fit.angle),s=sin(fit.angle),kernel[3]={.25,.5,.25};
+    double score=0,total=0;
+    for(const auto& p:samples) {
+        double dot=0,energy=0;
+        for(int y=-1;y<=1;++y) for(int x=-1;x<=1;++x) {
+            const int i=(y+1)*3+x+1;const double weight=kernel[x+1]*kernel[y+1];
+            const double dx=p.centre.x+x*radius-fit.x,dy=p.centre.y+y*radius-fit.y;
+            const double u=(c*dx+s*dy)/fit.scale+(photo.w-1)*.5,v=(-s*dx+c*dy)/fit.scale+(photo.h-1)*.5;
+            const double gx=Pixel(photo.dx,photo.w,photo.h,u,v),gy=Pixel(photo.dy,photo.w,photo.h,u,v);
+            dot+=weight*(p.gx[i]*(c*gx-s*gy)+p.gy[i]*(s*gx+c*gy));
+            energy+=weight*(gx*gx+gy*gy);
+        }
+        // Correlate a complete local edge profile before removing polarity.
+        // Pointwise squared gradients could match opposite sides of a crease
+        // independently, rewarding a nearby, stronger but displaced edge.
+        const double similarity=dot*dot/((p.energy+epsilon*epsilon)*(energy+photo.epsilon*photo.epsilon));
+        score+=p.centre.weight*similarity*sqrt(sqrt(energy)/fit.scale);total+=p.centre.weight;
+    }
+    return total>0?score/total:0;
+}
+inline auto_fit::Fit RefineProfiles(const Field& photo,const Field& model,const auto_fit::Fit& initial) {
+    auto samples=Samples(model,95);
+    if(samples.size()<24) return initial;
+    auto best=initial;
+    std::vector<ProfileSample> profiles;
+    double radius=0;
+    auto validated=initial;double validation=-1e30,selectedRadius=0;
+    for(int stage=0;stage<3;++stage) {
+        // Three, two, then one smoothing radii: first keep an entire crease
+        // together, then localise its edges without jumping to another line.
+        radius=(6-2*stage)/model.depthPixelStep;
+        profiles=Profiles(model,samples,radius);
+        auto objective=[&](const auto_fit::Fit& f){return ProfileScore(photo,profiles,f,radius,model.epsilon);};
+        if(stage==0) {
+            std::array<auto_fit::Fit,3> starts;
+            concurrency::parallel_for(0,3,[&](int i) {
+                auto seed=initial;seed.angle+=(i-1)*3*3.141592653589793/180;
+                starts[i]=MinimizeLocal(seed,objective,.08,8*initial.scale,5*3.141592653589793/180);
+            });
+            best=*std::max_element(starts.begin(),starts.end(),[&](const auto& a,const auto& b){return objective(a)<objective(b);});
+        } else best=MinimizeLocal(best,objective,.04,4*best.scale,1.2*3.141592653589793/180);
+        const auto evidence=Assess(photo,model,best);
+        if(evidence.reliable && evidence.validationGain>validation) {
+            validated=best;validation=evidence.validationGain;selectedRadius=radius;
+        }
+    }
+    if(selectedRadius<=0) return initial;
+    // Stop at the resolution supported by weaker features, rather than
+    // force a still finer profile onto a different nearby line.
+    best=validated;radius=selectedRadius;profiles=Profiles(model,samples,radius);
+    // Combine contrast-weighted and spatially balanced angular estimates;
+    // neither one cluster of marks nor a weak region decides the whole turn.
+    const auto balanced=BalancedSamples(samples);
+    for(size_t i=0;i<profiles.size();++i) profiles[i].centre.weight=balanced[i].weight;
+    double angle=best.angle,score=ProfileScore(photo,profiles,best,radius,model.epsilon);int peak=48;
+    for(int i=0;i<=96;++i) {
+        auto f=best;f.angle+=(i-48)*.025*3.141592653589793/180;
+        const double value=ProfileScore(photo,profiles,f,radius,model.epsilon);
+        if(value>score) {score=value;angle=f.angle;peak=i;}
+    }
+    if(peak>0 && peak<96) {
+        const double spacing=.025*3.141592653589793/180,golden=.61803398874989485;
+        double lo=angle-spacing,hi=angle+spacing;
+        auto angularScore=[&](double a){auto f=best;f.angle=a;return ProfileScore(photo,profiles,f,radius,model.epsilon);};
+        double a=hi-golden*(hi-lo),b=lo+golden*(hi-lo),sa=angularScore(a),sb=angularScore(b);
+        for(int i=0;i<20;++i) {
+            if(sa>sb) {hi=b;b=a;sb=sa;a=hi-golden*(hi-lo);sa=angularScore(a);}
+            else {lo=a;a=b;sa=sb;b=lo+golden*(hi-lo);sb=angularScore(b);}
+        }
+        best.angle=(best.angle+(sa>sb?a:b))*.5;
+    }
+    const auto before=Assess(photo,model,initial),after=Assess(photo,model,best);
+    if(!after.reliable || after.validationGain<before.validationGain-.03) return initial;
+    best.error=1-Score(photo,Samples(model),best);
+    return best;
+}
 inline Field Reduce(const Field& source) {
     Field out;
     out.w=(source.w+1)/2; out.h=(source.h+1)/2;
@@ -314,7 +440,9 @@ inline std::vector<auto_fit::Fit> PyramidSeeds(const Field& photo,const Field& m
         const auto b=bounds(samples);span=std::hypot(b[2]-b[0],b[3]-b[1]);
     }
 }
-inline auto_fit::Fit Search(const Field& photo,const Field& model,const auto_fit::Fit& initial) {
+struct RefinementTrace {auto_fit::Fit before,after;};
+inline auto_fit::Fit Search(const Field& photo,const Field& model,const auto_fit::Fit& initial,RefinementTrace* trace=nullptr) {
+    if(trace) *trace={initial,initial};
     const auto samples=Samples(model);
     auto_fit::Fit failure=initial; failure.error=1;
     if(samples.size()<60) return failure;
@@ -431,7 +559,9 @@ inline auto_fit::Fit Search(const Field& photo,const Field& model,const auto_fit
     const auto turned=RefineTurn(photo,refinementSamples,best);
     if(Score(photo,samples,turned)>=Score(photo,samples,best)-.01) best=turned;
     best.error=1-Score(photo,samples,best);
-    if(best.error>geometric.error+.03) return geometric;
-    return best;
+    if(best.error>geometric.error+.03) best=geometric;
+    const auto refined=RefineProfiles(photo,model,best);
+    if(trace) *trace={best,refined};
+    return refined;
 }
 } // namespace auto_fit_features

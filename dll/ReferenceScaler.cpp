@@ -264,7 +264,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 247;
+static const int kDllBuild = 248;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -11829,7 +11829,14 @@ static int AutoFitOnOverlay()
 		seed.angle=fit.angle;
 		seed.x=(st.px+st.ratio*st.fix*(cx-st.ax-st.offX)-featureOrigin)/docStep-.5;
 		seed.y=(st.py+st.ratio*st.fix*(cy-st.ay-st.offY)-featureOrigin)/docStep-.5;
-		const auto registered=auto_fit_features::Search(photoFeatures,modelFeatures,seed);
+		auto_fit_features::RefinementTrace refinement;
+		const auto registered=auto_fit_features::Search(photoFeatures,modelFeatures,seed,&refinement);
+		if(FILE* f=_wfopen((DataFolder()+L"nav_log.txt").c_str(),L"ab")) {
+			fprintf(f,"%lu auto fit edge-profile refinement: turn %.3f -> %.3f scale %.6f -> %.6f centre %.3f %.3f -> %.3f %.3f\n",
+				GetTickCount(),refinement.before.angle*180/kPi,refinement.after.angle*180/kPi,refinement.before.scale,refinement.after.scale,
+				refinement.before.x,refinement.before.y,refinement.after.x,refinement.after.y);
+			fclose(f);
+		}
 		const double confidence=auto_fit_features::Score(photoFeatures,auto_fit_features::Samples(modelFeatures),registered,1,false);
 		const auto evidence=auto_fit_features::Assess(photoFeatures,modelFeatures,registered);
 		featureFit=std::isfinite(registered.error) && evidence.reliable;
