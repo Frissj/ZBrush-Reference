@@ -23,9 +23,9 @@
 [IConfig, 2022]
 [IShowActions, 0]
 
-[VarDef, zrsBuild, "build 234"]
+[VarDef, zrsBuild, "build 246"]
 [VarDef, zrsDll, "JRef_Data\JRef64.dll"]
-[VarDef, zrsDllBuild, 234]
+[VarDef, zrsDllBuild, 246]
 [VarDef, zrsPx, 0]
 [VarDef, zrsPy, 0]
 [VarDef, zrsPz, 0]
@@ -337,6 +337,9 @@
 		// view: one pass instead of two (build 189). The turn also rules out
 		// rotation entries that equal the scale, once the view is turned back.
 		[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx + 15, zrsKry + 25, zrsKrz]
+		// Flush the redraw before scanning: TransformGet can already report
+		// the new values while the render camera still holds the old view.
+		[IUpdate, 2, 1]
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
 		[VarSet, zrsArgs, [StrMerge, "start ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [FileExecute, zrsDll, "RSAnchorGet", "0"]]]
 		[VarSet, zrsArgs, [StrMerge, zrsArgs, " ", zrsRx, " ", zrsRy, " ", zrsRz]]
@@ -344,14 +347,17 @@
 		[Loop, 3,
 			[VarSet, zrsTick, zrsTick + 1]
 			[TransformSet, zrsKx + 11 * zrsTick, zrsKy + 7 * zrsTick, zrsKz, zrsKsx * (1 + 0.04 * zrsTick), zrsKsy * (1 + 0.04 * zrsTick), zrsKsz * (1 + 0.04 * zrsTick), zrsKrx + 15, zrsKry + 25, zrsKrz]
+			[IUpdate, 2, 1]
 			[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
 			[VarSet, zrsArgs, [StrMerge, "next ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [FileExecute, zrsDll, "RSAnchorGet", "0"]]]
 			[FileExecute, zrsDll, "RSMemProbe", zrsArgs]
 		]
 		[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx + 40, zrsKry - 30, zrsKrz + 10]
+		[IUpdate, 2, 1]
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
 		[FileExecute, zrsDll, "RSRotProbe", [StrMerge, "next ", zrsRx, " ", zrsRy, " ", zrsRz]]
 		[TransformSet, zrsKx, zrsKy, zrsKz, zrsKsx, zrsKsy, zrsKsz, zrsKrx, zrsKry, zrsKrz]
+		[IUpdate, 2, 1]
 		[TransformGet, zrsPx, zrsPy, zrsPz, zrsSx, zrsSy, zrsSz, zrsRx, zrsRy, zrsRz]
 		[FileExecute, zrsDll, "RSRotProbe", [StrMerge, "last ", zrsRx, " ", zrsRy, " ", zrsRz]]
 		[VarSet, zrsArgs, [StrMerge, "last ", zrsSx, " ", zrsPx, " ", zrsPy, " ", [FileExecute, zrsDll, "RSAnchorGet", "0"]]]
@@ -429,8 +435,10 @@
 	// Adjust Image works only in Classic Mode.
 	[If, zrsB,
 		[IHide, "ZPlugin:JRef:Image:Adjust Image"]
+		[IHide, "ZPlugin:JRef:Image:Auto Fit to Model"]
 		,
 		[IShow, "ZPlugin:JRef:Image:Adjust Image"]
+		[IShow, "ZPlugin:JRef:Image:Auto Fit to Model"]
 	]
 	// A view's trash can shows only while it has an image.
 	[If, [FileExecute, zrsDll, "RSViewUsed", "0"], [IShow, "ZPlugin:JRef:Views:Remove Front"], [IHide, "ZPlugin:JRef:Views:Remove Front"]]
@@ -581,7 +589,11 @@
 				// stayed empty on Front with a Front image).
 				[FileExecute, zrsDll, "RSViewNow", "go"]
 				[FileExecute, zrsDll, "RSLog", [StrMerge, zrsArgs, " ", zrsMsg]]
-				[FileExecute, zrsDll, "RSStatus", "~JRef: overlay on."]
+				[If, [FileExecute, zrsDll, "RSOverlayInfo", "39"] > 0,
+					[FileExecute, zrsDll, "RSStatus", "~JRef: overlay on."]
+					,
+					[FileExecute, zrsDll, "RSStatus", "~JRef: camera rotation was not found; references cannot switch. Press Overlay to retry."]
+				]
 				// No image is shown until a view is snapped to (the DLL looks views
 				// up as the rotation changes).
 				,
@@ -869,6 +881,29 @@
 [IButton, "ZPlugin:JRef:Image:Adjust Image",
 	"Move, scale and turn the image with the handles at its centre. Ctrl+Z undoes. Esc or a click off the image when done.",
 	[If, zrsBusy == 0, [VarSet, zrsBusy, 1] [RoutineCall, ZRSPressAdjust] [RoutineCall, ZRSImageSliders] [VarSet, zrsBusy, 0]]
+	, 0, 1
+]
+
+[IButton, "ZPlugin:JRef:Image:Auto Fit to Model",
+	"Fit the current reference to model image features using all available CPU cores. Snap to the matching view. Adjust Image then Ctrl+Z undoes.",
+	[If, zrsBusy == 0,
+		[VarSet, zrsBusy, 1]
+		[FileExecute, zrsDll, "RSStatus", "Fitting reference to model..."]
+		[VarSet, zrsTick, [FileExecute, zrsDll, "RSAutoFit", ""]]
+		[If, zrsTick == 1, [FileExecute, zrsDll, "RSStatus", "~Auto Fit applied. Adjust Image then Ctrl+Z to undo."]]
+		[If, zrsTick == -1, [FileExecute, zrsDll, "RSStatus", "~Auto Fit: turn Overlay on first."]]
+		[If, zrsTick == -2, [FileExecute, zrsDll, "RSStatus", "~Auto Fit: switch to Classic Mode first."]]
+		[If, zrsTick == -3, [FileExecute, zrsDll, "RSStatus", "~Auto Fit: snap to a view with a loaded reference."]]
+		[If, zrsTick == -4, [FileExecute, zrsDll, "RSStatus", "~Auto Fit: model depth is not ready. Let the canvas settle and try again."]]
+		[If, zrsTick == -5, [FileExecute, zrsDll, "RSStatus", "~Auto Fit: the visible and saved model outlines are incomplete. Zoom out to show the whole model and try again."]]
+		[If, zrsTick == -6, [FileExecute, zrsDll, "RSStatus", "~Auto Fit: the loaded reference could not be read. Reload the image and try again."]]
+		[If, zrsTick == -7, [FileExecute, zrsDll, "RSStatus", "~Auto Fit: image features do not match reliably. Check the view or adjust the image manually."]]
+		[If, zrsTick == -8, [FileExecute, zrsDll, "RSStatus", "~Auto Fit could not finish. Your placement is unchanged."]]
+		[If, zrsTick == -9, [FileExecute, zrsDll, "RSStatus", "~Auto Fit: placement changed during fitting. Let the canvas settle and try again."]]
+		[If, zrsTick == 0, [FileExecute, zrsDll, "RSStatus", "~Auto Fit is unavailable. Reload JRef.txt from the updated plugin folder."]]
+		[RoutineCall, ZRSImageSliders]
+		[VarSet, zrsBusy, 0]
+	]
 	, 0, 1
 ]
 

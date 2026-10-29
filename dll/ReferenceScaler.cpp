@@ -36,6 +36,8 @@
 #include <dwmapi.h>
 #include <dcomp.h>
 #include <d3dcompiler.h>
+#include "AutoFit.h"
+#include "AutoFitFeatures.h"
 #pragma comment(lib, "dcomp.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #include <winrt/Windows.Foundation.h>
@@ -49,6 +51,7 @@
 #undef near
 
 #define ZFUNC extern "C" __declspec(dllexport) float
+ZFUNC RSStatus(char*, double, char*, int, char*, int, char**);
 
 static ULONG_PTR gGdiplusToken = 0;
 static Gdiplus::Bitmap* gImage = nullptr;
@@ -261,7 +264,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 234;
+static const int kDllBuild = 246;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -509,6 +512,8 @@ static HWND gOverlayWnd = nullptr;
 static DWORD gOverlayThreadId = 0;
 static const UINT WM_RS_REDRAW = WM_APP + 1;
 static const UINT WM_RS_CLOSE = WM_APP + 2;
+static const UINT WM_RS_AUTOFIT = WM_APP + 3;
+static int AutoFitOnOverlay();
 
 // Switches the calling thread to physical pixels while it lives. Under
 // Windows display scaling ZBrush's own threads see scaled coordinates, which
@@ -673,6 +678,7 @@ struct Gesture {
 	int scaleSegments = 0;
 	bool movedAfterScale = false;
 	bool rotated = false;
+	bool observedZoom = false; // live scale changed with the camera rotation steady
 	int kind = 0;
 	double scaleBasePx = 0, scaleBasePy = 0, scaleCursorX = 0, scaleCursorY = 0;  // first scale segment
 };
@@ -899,7 +905,7 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
 		if (g.active) {
 			g.active = false;
 			gDragEndAt = GetTickCount();
-			g.kind =g.mode == kDragIgnore ? kKindSculpt : g.scaleSegments > 0 ? kKindScale :
+			g.kind =g.mode == kDragIgnore ? kKindSculpt : (g.scaleSegments > 0 || g.observedZoom) ? kKindScale :
 				(g.moveX != 0 || g.moveY != 0) ? kKindMove : g.rotated ? kKindRotate : kKindNone;
 			gLastKind = g.kind;
 			g.done = g.kind == kKindMove || g.kind == kKindScale || g.kind == kKindRotate;
@@ -5384,7 +5390,10 @@ static bool Turning();
 // logged. mode: the drag's DragMode, or -1 when the mouse is not dragging.
 static bool TripletValues(double& sx, double& px, double& py, int mode)
 {
-	const bool dragging = mode == kDragMove || mode == kDragScale;
+	// Modifier events may be missed. With a steady validated rotation, live
+	// scale changes are zoom evidence even when the hook called it a turn.
+	const bool observedNavigation = gGesture.active && !Turning() && mode == kDragNone;
+	const bool dragging = mode == kDragMove || mode == kDragScale || observedNavigation;
 	const DWORD now = GetTickCount();
 	int best = -1;
 	for (size_t i = 0; i < gTriplets.size(); ++i) {
@@ -5408,7 +5417,7 @@ static bool TripletValues(double& sx, double& px, double& py, int mode)
 				++t.dragFrames;
 				if (b != t.x.last || c != t.y.last)
 					++t.posFrames;
-				if (mode == kDragScale && a != t.s.last)
+				if ((mode == kDragScale || observedNavigation) && a != t.s.last)
 					++t.scaleFrames;
 			}
 			t.s.last = a;
@@ -5554,6 +5563,7 @@ struct ScaleHold {
 	bool on = false;
 	double r0 = 0, fix0 = 1;
 };
+static ScaleHold gImageScaleHold;
 
 static void HoldScale(ScaleHold& h, bool hold, double rOld, double r, double& fix)
 {
@@ -5599,7 +5609,6 @@ static void MemFollow()
 			BuildTriplets();
 	}
 	const bool rotating = Turning();
-	const bool panning = gGesture.active && gGesture.mode == kDragMove;
 	OverlayState& st = gOverlay;
 	double sx = st.ratio * gAnchorScale, px = st.px, py = st.py;
 	const bool read = !gTriplets.empty() ? TripletValues(sx, px, py, gGesture.active ? gGesture.mode : -1) :
@@ -5610,15 +5619,26 @@ static void MemFollow()
 	// old scale (the cells went to the forehead mid-zoom, build 193).
 	static bool zooming = false;
 	static double zoomScale = 0;
-	const bool zoomNow = gGesture.active && gGesture.mode == kDragScale;
-	if (zoomNow && !zooming)
+	static bool zoomScaleMoved = false;
+	if (gGesture.active && gGesture.mode == kDragNone && !rotating && read && st.ratio > 0 &&
+		fabs(sx / (st.ratio * gAnchorScale) - 1) > 1e-4)
+		gGesture.observedZoom = true;
+	const bool zoomNow = gGesture.active && (gGesture.mode == kDragScale ||
+		(gGesture.mode == kDragNone && gGesture.observedZoom && !rotating));
+	const bool panning = gGesture.active && gGesture.mode == kDragMove && !zoomNow;
+	if (zoomNow && !zooming) {
 		zoomScale = st.ratio * gAnchorScale;
+		zoomScaleMoved = false;
+	}
 	zooming = zoomNow;
-	const bool stale = zooming && read && sx == zoomScale && (px != st.px || py != st.py);
+	if (zooming && read && sx != zoomScale)
+		zoomScaleMoved = true;
+	// Once the scale has followed this zoom it is live. Returning exactly to
+	// the starting scale is not a stale read (zoom in, then back out).
+	const bool stale = zooming && !zoomScaleMoved && read && sx == zoomScale && (px != st.px || py != st.py);
 	if (read && !stale && sx > 0 && sx < 1e7 && fabs(px) < 1e6 && fabs(py) < 1e6) {
 		const double r = sx / gAnchorScale;
-		static ScaleHold hold;
-		HoldScale(hold, rotating || panning, st.ratio, r, st.fix);
+		HoldScale(gImageScaleHold, rotating || panning, st.ratio, r, st.fix);
 		if (rotating) {
 			st.offX += (px - st.px) / (r * st.fix);
 			st.offY += (py - st.py) / (r * st.fix);
@@ -5893,16 +5913,43 @@ static void ActivateView(int slot)
 	gOverlay.imgRot = v.imgRot;
 	gOverlay.offX = gOverlay.offY = 0;
 	gOverlay.fix = 1;
+	gImageScaleHold = {};
 	QueueViewJob(v.mask.empty() ? 1 : 2, slot);
 	ViewLog(v.mask.empty() ? "activate (record)" : "activate (match)", slot);
 }
 
 // Adjust Image finished a drag: the showing view keeps the image's new size
 // and place. Caller holds the lock.
+static AdjustState CanonicalAdjustment(const OverlayState& frame, const AdjustState& a)
+{
+	return {a.sx*frame.fix, a.sy*frame.fix,
+		frame.ax+frame.fix*(frame.docW*.5+a.x-frame.ax-frame.offX)-frame.docW*.5,
+		frame.ay+frame.fix*(frame.docH*.5+a.y-frame.ay-frame.offY)-frame.docH*.5, a.rot};
+}
+
 static void SaveAdjustToView()
 {
 	if (gActiveView < 0 || gActiveView >= kViewSlots)
 		return;
+	// The displayed adjustment can include a temporary turn/pan frame.
+	// Store it in the snapped view's frame, which ActivateView restores.
+	// Rebase the live image and its undo history together: this preserves
+	// every displayed pixel now and when the same view is snapped to later.
+	if (!gViewAway && gOverlay.fix>0 && (gOverlay.offX!=0 || gOverlay.offY!=0 || gOverlay.fix!=1)) {
+		const auto frame=gOverlay;
+		AdjustApply(CanonicalAdjustment(frame,AdjustNow()));
+		if (gAdjustUndoView==gActiveView) {
+			for(auto& a:gAdjustUndo) a=CanonicalAdjustment(frame,a);
+			for(auto& a:gAdjustRedo) a=CanonicalAdjustment(frame,a);
+		}
+		gOverlay.offX=gOverlay.offY=0; gOverlay.fix=1;
+		gImageScaleHold={}; gRedrawPending=true;
+		if(FILE* f=_wfopen((DataFolder()+L"nav_log.txt").c_str(),L"ab")) {
+			fprintf(f,"%lu image placement rebased to view %d: temporary offset %.3f %.3f scale %.6f; saved width %.6f height %.6f x %.3f y %.3f turn %.3f\n",
+				GetTickCount(),gActiveView,frame.offX,frame.offY,frame.fix,gOverlay.imgSX,gOverlay.imgSY,gOverlay.imgX,gOverlay.imgY,gOverlay.imgRot);
+			fclose(f);
+		}
+	}
 	View& v = gViews[gActiveView];
 	v.imgSX = gOverlay.imgSX;
 	v.imgSY = gOverlay.imgSY;
@@ -5925,6 +5972,7 @@ static void BlankView()
 	gOverlay.imgX = gOverlay.imgY = gOverlay.imgRot = 0;
 	gOverlay.offX = gOverlay.offY = 0;
 	gOverlay.fix = 1;
+	gImageScaleHold = {};
 	gRedrawPending = true;
 	ViewLog("snapped to a view without an image: cleared", -2);
 }
@@ -7167,7 +7215,7 @@ struct DepthRows {
 };
 static bool DepthFound(double& empty);
 
-static void SampleSilhouette(const OverlayState& st, double offX, double offY, View& g, std::vector<unsigned char>& out)
+static void SampleSilhouette(const OverlayState& st, double offX, double offY, View& g, std::vector<unsigned char>& out, bool depthOnly = false)
 {
 	if (g.gw == 0) {
 		g.cell = st.docW / 640.0;
@@ -7203,9 +7251,37 @@ static void SampleSilhouette(const OverlayState& st, double offX, double offY, V
 				continue;
 			const unsigned char seen = gKeyShare[static_cast<size_t>(yp) * gKeyW + xp] < 128 ? 2 : 1;
 			const int d = k > 0 ? depth.At((xp + 0.5) / k, (yp + 0.5) / k) : -1;
-			out[static_cast<size_t>(j) * g.gw + i] = d < 0 || d == (seen == 2) ? seen : 0;
+			out[static_cast<size_t>(j) * g.gw + i] = depthOnly ? (d < 0 ? 0 : d ? 2 : 1) :
+				d < 0 || d == (seen == 2) ? seen : 0;
 		}
 	}
+}
+
+// Complete off-screen cells from the same view's saved outline, after its
+// visible part agrees with fresh depth. Do not replace current visible data
+// or borrow an unrelated/stale outline merely to pass the coverage check.
+static size_t CompleteFitSilhouette(const View& grid, const View& saved, std::vector<unsigned char>& current)
+{
+	if (saved.cell<=0 || saved.gw<=0 || saved.gh<=0 || saved.mask.size()!=size_t(saved.gw)*saved.gh ||
+		current.size()!=size_t(grid.gw)*grid.gh) return 0;
+	auto at = [&](int x,int y) -> unsigned char {
+		const double u=grid.u0+(x+0.5)*grid.cell, v=grid.v0+(y+0.5)*grid.cell;
+		const int i=int(floor((u-saved.u0)/saved.cell)),j=int(floor((v-saved.v0)/saved.cell));
+		return i>=0 && j>=0 && i<saved.gw && j<saved.gh ? saved.mask[size_t(j)*saved.gw+i] : 0;
+	};
+	int both=0,either=0;
+	for(int y=0;y<grid.gh;++y) for(int x=0;x<grid.gw;++x) {
+		const auto a=current[size_t(y)*grid.gw+x],b=at(x,y);
+		if(!a || !b) continue;
+		both+=a==2 && b==2; either+=a==2 || b==2;
+	}
+	if(either<40 || both<either*0.8) return 0;
+	size_t filled=0;
+	for(int y=0;y<grid.gh;++y) for(int x=0;x<grid.gw;++x) {
+		auto& value=current[size_t(y)*grid.gw+x];
+		if(!value) { value=at(x,y); filled+=value!=0; }
+	}
+	return filled;
 }
 
 // How well cur, shifted by (ox, oy) cells, matches saved: model cells in
@@ -7749,6 +7825,14 @@ static std::vector<DepthSample> DepthSamples(const OverlayState& st, int want)
 		for (int x = vx0 + step / 2; x < vx1; x += step) {
 			if (x >= gizmoX && y < gGizmoBottom)
 				continue;
+			// UI is not model evidence. In particular the JRef palette covers
+			// the canvas while Auto Fit is pressed, and its dark pixels used to
+			// invalidate a good depth plane every time the button was used.
+			const size_t at = static_cast<size_t>(y)*gKeyW+x;
+			if (OnMenu(x,y) || (x >= gFlyout.left && x < gFlyout.right && y >= gFlyout.top && y < gFlyout.bottom) ||
+				(gMenuMaskCount && at < gMenuMask.size() && gMenuMask[at]) ||
+				(gMenuBakedCount && at < gMenuBaked.size() && gMenuBaked[at]))
+				continue;
 			// Sure: the pixel and its neighbours two away all alike.
 			bool sure = true;
 			const int k0 = gKeyShare[static_cast<size_t>(y) * gKeyW + x];
@@ -7766,6 +7850,44 @@ static std::vector<DepthSample> DepthSamples(const OverlayState& st, int want)
 				out.push_back({static_cast<int>(x / st.pixelsPerDoc), static_cast<int>(y / st.pixelsPerDoc), k0 <= 15});
 		}
 	return out;
+}
+
+// Keep geometric evidence from a validated canvas. The menu detector may
+// temporarily learn an open palette as canvas, so button-time colour cannot
+// always be trusted, even after excluding recognised menu pixels.
+struct AutoFitDepthEvidence {
+	OverlayState camera;
+	int view = -1;
+	std::wstring project;
+	std::vector<DepthSample> samples;
+};
+static AutoFitDepthEvidence gAutoFitDepthEvidence;
+
+static void RememberAutoFitDepth(const OverlayState& st, const std::vector<DepthSample>& samples)
+{
+	if (!gDepth.ok || gActiveView<0 || gActiveView>=kDefaultView || gViewAway) return;
+	std::vector<DepthSample> reliable;
+	int model=0,background=0;
+	for (const auto& p : samples) {
+		double value;
+		if (!DepthAtDoc(p.x,p.y,value) || !std::isfinite(value) || fabs(value)>=1e6 ||
+			(!DepthSame(value,gDepth.bg)) != p.model) continue;
+		reliable.push_back(p);
+		(p.model ? model : background)++;
+	}
+	if (model<10 || background<10) return;
+	gAutoFitDepthEvidence={st,gActiveView,ProjectFolder(),std::move(reliable)};
+}
+
+static bool AutoFitDepthEvidenceMatches(const OverlayState& st)
+{
+	const auto& e=gAutoFitDepthEvidence;
+	const auto& c=e.camera;
+	return !e.samples.empty() && !gViewAway && e.view==gActiveView && e.project==ProjectFolder() &&
+		fabs(st.docW-c.docW)<1e-6 && fabs(st.docH-c.docH)<1e-6 &&
+		fabs(st.ratio-c.ratio)<1e-6 && fabs(st.px-c.px)<1e-3 && fabs(st.py-c.py)<1e-3 &&
+		fabs(st.screenX-c.screenX)<1e-3 && fabs(st.screenY-c.screenY)<1e-3 &&
+		fabs(st.pixelsPerDoc-c.pixelsPerDoc)<1e-6;
 }
 
 // How well a layout fits the samples: the share whose class (the empty
@@ -9183,6 +9305,8 @@ static void DepthStep(const OverlayState& st)
 		}
 		gDepth = best;
 		gDepth.ok = bestScore >= 0.85;
+		if (gDepth.ok)
+			RememberAutoFitDepth(st,s);
 		if (gDepth.ok != was.ok || gDepth.image != was.image) {
 			char line[200];
 			snprintf(line, sizeof line, "%s image %p: the model at %d of the mask's %d model pixels", gDepth.ok ? "using" : "no plane fits, best",
@@ -9282,12 +9406,18 @@ struct RotCand {
 	// Changed in a drag taken for a pan or zoom: judged once the drag is over
 	// (RotCodes).
 	bool panStep = false;
+	// Remembers a departure even if the camera returns exactly to settled
+	// before the next lookup (a quick turn followed by a same-view snap).
+	bool changedSinceSettled = false;
 };
 static std::vector<RotCand> gRotCands;
 static int gRotNarrowings = 0;
 static bool gRotLocked = false;
 static DWORD gRotChangedAt = 0;
 static bool gRotSettled = true;
+// Scripted test views and their final redraw can update camera copies with
+// no mouse button held. They must not be classified as idle brush matrices.
+static DWORD gRotWatchUntil = 0;
 
 static bool IsRotation(const double* m)
 {
@@ -9395,6 +9525,17 @@ static std::vector<double> EulerTraces(const double* deg)
 	return traces;
 }
 
+static bool RotMatchesTraces(const double* m, const std::vector<double>& traces)
+{
+	for (int flips = 0; flips < 8; ++flips) {
+		const double tr = (flips & 1 ? -m[0] : m[0]) + (flips & 2 ? -m[4] : m[4]) + (flips & 4 ? -m[8] : m[8]);
+		for (double t : traces)
+			if (fabs(tr - t) < 3e-3)
+				return true;
+	}
+	return false;
+}
+
 // The rotation's search in parts, like MemScanJob.
 struct RotScanJob {
 	static const size_t kMax = 200000;
@@ -9471,14 +9612,7 @@ void RotScanJob::Piece(int w, uintptr_t at, const unsigned char* buf, size_t sta
 						continue;
 					// With any axis flipped (a copy may be in screen
 					// coordinates), its diagonal entries change sign.
-					bool angle = false;
-					for (int flips = 0; flips < 8 && !angle; ++flips) {
-						const double tr = (flips & 1 ? -m[0] : m[0]) + (flips & 2 ? -m[4] : m[4]) + (flips & 4 ? -m[8] : m[8]);
-						for (double t : traces)
-							if (fabs(tr - t) < 3e-3)
-								angle = true;
-					}
-					if (!angle)
+					if (!RotMatchesTraces(m, traces))
 						continue;
 					double raw[9];
 					RotFromBytes(&buf[i], isDouble != 0, stride, raw);
@@ -9541,6 +9675,10 @@ static void RotNarrow()
 	std::vector<RotCand> keep;
 	for (const RotCand& c : gRotCands) {
 		double m[9];
+		// TransformGet's Euler values are used to seed the initial scan.
+		// Subsequent drawing matrices may include the tool's existing frame;
+		// requiring their trace to match those Euler values discarded every
+		// live candidate in build 236. Validate the observed change instead.
 		if (!RotRead(c, m))
 			continue;
 		double change = 0;
@@ -10060,6 +10198,9 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 {
 	std::vector<int> codes, counts;
 	bool any = false;
+	struct Observed { std::array<double,9> matrix; bool moved, step; };
+	std::vector<Observed> observed;
+	std::vector<uintptr_t> resumed;
 	// The camera turns only while a mouse button is held or in the snap
 	// animation just after: a copy that changes with the buttons up and idle
 	// follows something else (the brush under the cursor) and is dropped. So
@@ -10073,7 +10214,9 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 	// mid-turn (build 231), and in a drag taken for an Alt pan that ZBrush
 	// turned (build 233, just after PureRef Mode was pressed in the ZPlugin
 	// menu); from then on the cells turned only on release, snapping.
-	const bool idle = gButtonsDown == 0 && !gGesture.active && GetTickCount() - gLastButtonAt > 2000;
+	const DWORD now = GetTickCount();
+	const bool idle = gButtonsDown == 0 && !gGesture.active && now - gLastButtonAt > 2000 &&
+		static_cast<int>(gRotWatchUntil - now) <= 0;
 	const bool panning = gGesture.active && !gGesture.rotated && (gGesture.mode == kDragMove || gGesture.mode == kDragScale);
 	if (!gGesture.active && GetTickCount() - gDragEndAt > 300)
 		for (size_t ci = 0; ci < gRotCands.size(); ++ci) {
@@ -10101,14 +10244,17 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 				--ci;
 			} else {
 				// The camera did turn: looked up again as after any turn.
-				any = true;
+				resumed.push_back(gRotCands[ci].addr);
 			}
 		}
 	for (size_t ci = 0; ci < gRotCands.size(); ++ci) {
 		RotCand& c = gRotCands[ci];
 		double m[9];
-		if (!RotRead(c, m))
+		if (!RotRead(c, m)) {
+			gRotCands.erase(gRotCands.begin() + ci);
+			--ci;
 			continue;
+		}
 		bool moved = false, step = false;
 		for (int i = 0; i < 9; ++i) {
 			// Changes this small are ZBrush easing the end of a snap: the
@@ -10133,28 +10279,62 @@ static std::vector<int> RotCodes(bool* changed = nullptr, bool sinceSettled = fa
 			memcpy(c.m, m, sizeof(m));
 			continue;
 		}
-		any = any || step;
-		if (step)
+		if (step) {
 			c.changedAt = GetTickCount();
+			c.changedSinceSettled = true;
+		}
 		memcpy(c.m, m, sizeof(m));
-		if (sinceSettled && !moved)
-			continue;
 		if (c.rel < 0)
 			continue;
-		double canon[9];
-		RotApply(c.rel, m, canon);
+		Observed o = {{}, moved || c.changedSinceSettled, step || std::find(resumed.begin(),resumed.end(),c.addr) != resumed.end()};
+		RotApply(c.rel, m, o.matrix.data());
+		observed.push_back(o);
+	}
+	// A changed singleton among several validated copies can be the navigation
+	// head, not the camera (build 237: one reported Front during a Right zoom).
+	// Compare full canonical matrices, not just their snapped-view codes:
+	// three live copies turning together must beat six stale ones at a snap.
+	for (const Observed& o : observed) {
+		int agree = 0;
+		for (const Observed& other : observed) {
+			bool same = true;
+			for (int i=0;i<9;++i) same = same && fabs(o.matrix[i]-other.matrix[i]) < 1e-3;
+			agree += same;
+		}
+		if ((observed.size() > 1 && agree < 2) || (sinceSettled && !o.moved))
+			continue;
+		any = any || o.step;
 		// A copy turned to no view counts too, as -1: build 230 left them
 		// out, and a stray copy that moved onto Front while the eight that
 		// follow the camera turned away from it was the only one counted, so the
 		// view never counted as left, nor snapping back to it as a snap (the
 		// turns' pans stayed in Classic's offset, the image off the model).
-		const int code = std::max(-1, RotCode(canon));
+		const int code = std::max(-1, RotCode(o.matrix.data()));
 		const size_t at = std::find(codes.begin(), codes.end(), code) - codes.begin();
 		if (at == codes.size()) {
 			codes.push_back(code);
 			counts.push_back(0);
 		}
 		++counts[at];
+	}
+	// A lock with no readable, related copies is not a lock. In particular,
+	// the last idle/pan rejection used to leave gRotLocked true forever.
+	const bool usable = std::any_of(gRotCands.begin(), gRotCands.end(), [](const RotCand& c) { return c.rel >= 0; });
+	if (gRotLocked && !usable) {
+		gRotLocked = false;
+		gRotSettled = true;
+		gTurnKnown = gTurning = false;
+		gAxesHeldSet = false;
+		gViewAway = true;
+		if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
+			fprintf(f, "%lu rotation tracking lost: no usable copies; lock cleared, Overlay will rescan\n", now);
+			fclose(f);
+		}
+		if (gOverlayWnd && !gTesting) {
+			char notice[] = "~JRef: camera rotation tracking was lost. Press Overlay to find the camera again.";
+			RSStatus(notice, 0, nullptr, 0, nullptr, 0, nullptr);
+		}
+		codes.clear(); counts.clear();
 	}
 	if (changed)
 		*changed = any;
@@ -10191,6 +10371,10 @@ static void RotFollow()
 	EnterCriticalSection(&gOverlayLock);
 	bool changed = false;
 	const std::vector<int> codes = RotCodes(&changed, true);
+	if (!gRotLocked) {
+		LeaveCriticalSection(&gOverlayLock);
+		return;
+	}
 	const DWORD now = GetTickCount();
 	static DWORD loggedAt = 0;
 	if (changed && now - loggedAt >= 250) {
@@ -10214,12 +10398,18 @@ static void RotFollow()
 	if (changed) {
 		gRotChangedAt = now;
 		gRotSettled = false;
-	} else if (landed || (!gRotSettled && !gGesture.active && now - gRotChangedAt >= 200)) {
+		// Remember departure immediately. A turn and snap can both finish
+		// inside the 200 ms settling window; waiting until then lost the
+		// departure and left its translation/scale compensation on the view.
+		gViewAway = true;
+	} else if (landed || (!gRotSettled && now - gRotChangedAt >= 200)) {
 		gRotSettled = true;
 		lastCodes = codes;
 		const int result = ViewTickCodes(codes);
-		for (RotCand& c : gRotCands)
+		for (RotCand& c : gRotCands) {
 			memcpy(c.settled, c.m, sizeof(c.m));
+			c.changedSinceSettled = false;
+		}
 		if (FILE* f = _wfopen((DataFolder() + L"nav_log.txt").c_str(), L"ab")) {
 			fprintf(f, "%lu rotation settled, %zu snapped copies, result %d:", now, codes.size(), result);
 			for (const RotCand& c : gRotCands) {
@@ -10424,6 +10614,10 @@ static bool OverlayStep(HWND wnd)
 static LRESULT CALLBACK OverlayProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 {
 	switch (msg) {
+	case WM_RS_AUTOFIT:
+		// Capture buffers belong to this thread. Never sample them from the
+		// ZScript/UI thread while Capture or DepthMapStep is updating them.
+		try { return AutoFitOnOverlay(); } catch (...) { return -8; }
 	case WM_RS_REDRAW:
 		EnterCriticalSection(&gOverlayLock);
 		gRedrawPending = true;
@@ -11231,11 +11425,14 @@ ZFUNC RSRotProbe(char* text, double, char*, int, char*, int, char**)
 	if (strcmp(mode, "last") == 0) {
 		gRotLocked = !gRotCands.empty() && gRotNarrowings >= 2;
 		RotRelate();
+		gRotWatchUntil = GetTickCount() + 1500;
 		// The Overlay press looks the current view up itself once its
 		// popups are closed (they would get into the outline match).
 		RotCodes();
-		for (RotCand& c : gRotCands)
+		for (RotCand& c : gRotCands) {
 			memcpy(c.settled, c.m, sizeof(c.m));
+			c.changedSinceSettled = false;
+		}
 		gRotSettled = true;
 	}
 	const size_t n = gRotCands.size();
@@ -11321,6 +11518,7 @@ ZFUNC RSOverlayResetOffset(char*, double, char*, int, char*, int, char**)
 	const bool had = gOverlay.offX != 0 || gOverlay.offY != 0;
 	gOverlay.offX = gOverlay.offY = 0;
 	gOverlay.fix = 1;
+	gImageScaleHold = {};
 	LeaveCriticalSection(&gOverlayLock);
 	return had ? 1 : 0;
 }
@@ -11414,6 +11612,264 @@ ZFUNC RSDisplay(char* text, double, char*, int, char*, int, char**)
 	if (gOverlayWnd)
 		PostMessageW(gOverlayWnd, WM_RS_REDRAW, 0, 0);
 	return result;
+}
+
+// Fit the current photo to the visible model silhouette, on the overlay
+// thread. Heavy candidate scoring reads immutable snapshots and uses PPL's
+// worker pool across available logical processors; no Python installation.
+// Revalidate known depth immediately against unobscured canvas samples.
+// gDepth.ok may have been cleared by the old palette-contaminated test; a
+// button press must not depend on the periodic check running with menus shut.
+static bool AutoFitDepthReady(const OverlayState& st)
+{
+	const DepthBuffer was = gDepth;
+	if (!was.base || was.w <= 0 || was.h <= 0 || was.type < 0 || was.type > 3 ||
+		was.scale <= 0 || !was.pitch || !was.stride)
+		return false;
+	const bool cached = AutoFitDepthEvidenceMatches(st);
+	const auto samples = cached ? gAutoFitDepthEvidence.samples : DepthSamples(st,600);
+	std::vector<DepthBuffer> candidates{was};
+	for (const auto& im : gDepthImages) {
+		if (im.first == was.image) continue;
+		DepthBuffer candidate = was;
+		candidate.image = im.first; candidate.bg = im.second;
+		candidates.push_back(candidate);
+	}
+	DepthBuffer best = was;
+	double bestScore = -1;
+	for (DepthBuffer candidate : candidates) {
+		if (candidate.image) candidate.base = ImagePixels(candidate.image,candidate.w,candidate.h);
+		if (!candidate.base) continue;
+		candidate.ok = true; gDepth = candidate;
+		int on=0,off=0,onTotal=0,offTotal=0;
+		for (const auto& p : samples) {
+			double value;
+			if (!DepthAtDoc(p.x,p.y,value) || !std::isfinite(value) || fabs(value)>=1e6) continue;
+			const bool model = !DepthSame(value,candidate.bg);
+			(p.model ? onTotal : offTotal)++;
+			(p.model ? on : off) += model == p.model;
+		}
+		if (onTotal<10 || offTotal<10) continue;
+		const double score = std::min(double(on)/onTotal,double(off)/offTotal);
+		if (score>bestScore) { bestScore=score; best=candidate; }
+	}
+	if (FILE* f=_wfopen((DataFolder()+L"nav_log.txt").c_str(),L"ab")) {
+		fprintf(f,"%lu auto fit depth: %s evidence, %zu samples, best score %.4f, view %d, camera %.6f %.3f %.3f, buffer %dx%d\n",
+			GetTickCount(),cached?"validated camera":"current capture",samples.size(),bestScore,gActiveView,
+			st.ratio,st.px,st.py,was.w,was.h);
+		fclose(f);
+	}
+	if (bestScore<0.85) { gDepth=was; return false; }
+	gDepth=best;
+	if (!cached) RememberAutoFitDepth(st,samples);
+	return true;
+}
+
+static bool AutoFitFeatureModel(const OverlayState& st, auto_fit_features::Field& out, double& docStep)
+{
+    if(!gDepth.ok) return false;
+    docStep=std::max(1.0,ceil(std::max(st.docW,st.docH)/640.0));
+    const double worldStep=docStep/st.ratio;
+    out.depthPixelStep=worldStep; out.epsilon=worldStep/2; out.erosion=int(ceil(20/worldStep));
+    out.w=int(ceil(st.docW/docStep)); out.h=int(ceil(st.docH/docStep));
+    if(out.w<16 || out.h<16) return false;
+    out.image.assign(size_t(out.w)*out.h,0); out.mask.assign(out.image.size(),0);
+    const size_t bytes=size_t(gDepth.w-1)*gDepth.stride+kDepthTypeSize[gDepth.type];
+    std::vector<unsigned char> row(bytes);
+    int points=0;
+    for(int y=0;y<out.h;++y) {
+        const int by=int((y+.5)*docStep*gDepth.scale);
+        if(by<0 || by>=gDepth.h || !ReadOwn(gDepth.base+by*gDepth.pitch,row.data(),bytes)) continue;
+        for(int x=0;x<out.w;++x) {
+            const int bx=int((x+.5)*docStep*gDepth.scale);
+            if(bx<0 || bx>=gDepth.w) continue;
+            const double value=DepthValue(row.data()+bx*gDepth.stride,gDepth.type);
+            if(!std::isfinite(value) || fabs(value)>=1e6 || DepthSame(value,gDepth.bg)) continue;
+            const size_t i=size_t(y)*out.w+x;
+            out.image[i]=value/st.ratio; out.mask[i]=1; ++points;
+        }
+    }
+    if(points<100) return false;
+    auto_fit_features::ShadeDepth(out);
+    auto_fit_features::Gradients(out,2/worldStep);
+    return true;
+}
+
+static bool AutoFitFeaturePhoto(Gdiplus::Bitmap& source,auto_fit_features::Field& out,double& q)
+{
+	q=std::min(1.0,768.0/std::max(source.GetWidth(),source.GetHeight()));
+	out.w=int(ceil(source.GetWidth()*q)); out.h=int(ceil(source.GetHeight()*q));
+	Gdiplus::Bitmap thumbnail(out.w,out.h,PixelFormat24bppRGB);
+	{
+		Gdiplus::Graphics draw(&thumbnail); draw.Clear(Gdiplus::Color(255,255,255));
+		draw.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+		if(draw.DrawImage(&source,Gdiplus::RectF(0,0,Gdiplus::REAL(source.GetWidth()*q),Gdiplus::REAL(source.GetHeight()*q)))!=Gdiplus::Ok) return false;
+	}
+	Gdiplus::BitmapData bits;
+	Gdiplus::Rect rect(0,0,out.w,out.h);
+	if(thumbnail.LockBits(&rect,Gdiplus::ImageLockModeRead,PixelFormat24bppRGB,&bits)!=Gdiplus::Ok) return false;
+	out.image.resize(size_t(out.w)*out.h); out.epsilon=2/q;
+	for(int y=0;y<out.h;++y) {
+		const auto row=static_cast<const unsigned char*>(bits.Scan0)+y*bits.Stride;
+		for(int x=0;x<out.w;++x) out.image[size_t(y)*out.w+x]=.114*row[3*x]+.587*row[3*x+1]+.299*row[3*x+2];
+	}
+	thumbnail.UnlockBits(&bits);
+	auto_fit_features::Gradients(out,2*q);
+	return true;
+}
+
+static int AutoFitOnOverlay()
+{
+	OverlayState st;
+	AdjustState before;
+	std::string path;
+	int slot, iw, ih;
+	{
+		EnterCriticalSection(&gOverlayLock);
+		st = gOverlay; before = AdjustNow(); slot = gActiveView;
+		iw = gImgW; ih = gImgH; path = gOverlayPath;
+		const int error = !st.visible ? -1 : gMode == 1 ? -2 :
+			(slot < 0 || slot >= kDefaultView || gViewAway || iw < 1 || ih < 1) ? -3 : 0;
+		LeaveCriticalSection(&gOverlayLock);
+		if (error) return error;
+	}
+	if (gKeyShare.empty() || st.ratio <= 0 || st.fix <= 0 || !AutoFitDepthReady(st)) return -4;
+	// Sample a fresh model, independent of the reference's old placement.
+	View grid;
+	grid.cell = st.docW / 200.0;
+	if (grid.cell <= 0 || st.docH <= 0 || st.docH / grid.cell > 2000) return -4;
+	grid.gw = 400; grid.gh = static_cast<int>(ceil(st.docH * 2 / grid.cell));
+	grid.u0 = -st.docW * 0.5; grid.v0 = -st.docH * 0.5;
+	std::vector<unsigned char> sampled;
+	// Validated depth retains the model beneath a palette; captured colour
+	// there is the palette itself and cannot supply the fitting silhouette.
+	SampleSilhouette(st, st.offX, st.offY, grid, sampled, true);
+	const size_t completed=CompleteFitSilhouette(grid,gViews[slot],sampled);
+	auto_fit::Shape model;
+	model.w = grid.gw; model.h = grid.gh; model.mask.resize(sampled.size());
+	int boundary = 0, unseen = 0;
+	for (int y = 1; y < grid.gh-1; ++y) for (int x = 1; x < grid.gw-1; ++x) {
+		const int i = y*grid.gw+x;
+		model.mask[i] = sampled[i] == 2;
+		if (sampled[i] != 2) continue;
+		const int n[] = {i-1,i+1,i-grid.gw,i+grid.gw};
+		bool edge = false, unknown = false;
+		for (int j : n) { edge = edge || sampled[j] != 2; unknown = unknown || !sampled[j]; }
+		boundary += edge; unseen += edge && unknown;
+	}
+	if (FILE* f=_wfopen((DataFolder()+L"nav_log.txt").c_str(),L"ab")) {
+		fprintf(f,"%lu auto fit silhouette: %d boundary cells, %d unknown, %zu completed from saved view %d\n",
+			GetTickCount(),boundary,unseen,completed,slot);
+		fclose(f);
+	}
+	if (boundary < 30) return -5;
+	auto_fit::Clean(model.mask,model.w,model.h);
+	if (!auto_fit::Prepare(model)) return -5;
+	// Downsample before reading pixels, so very large photos don't allocate
+	// a second full-resolution bitmap. q maps original photo pixels to these.
+	StartGdiplus();
+	Gdiplus::Bitmap source(ResolveImage(path).c_str());
+	if (source.GetLastStatus() != Gdiplus::Ok || source.GetWidth() != UINT(iw) || source.GetHeight() != UINT(ih)) return -6;
+	const double q = std::min(1.0,320.0/std::max(iw,ih));
+	const int pw = std::max(8,int(ceil(iw*q))), ph = std::max(8,int(ceil(ih*q)));
+	Gdiplus::Bitmap thumbnail(pw,ph,PixelFormat24bppRGB);
+	{
+		Gdiplus::Graphics graphics(&thumbnail);
+		graphics.Clear(Gdiplus::Color(255,255,255));
+		graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+		if (graphics.DrawImage(&source,Gdiplus::RectF(0,0,Gdiplus::REAL(iw*q),Gdiplus::REAL(ih*q))) != Gdiplus::Ok) return -6;
+	}
+	Gdiplus::BitmapData bits;
+	Gdiplus::Rect rect(0,0,pw,ph);
+	if (thumbnail.LockBits(&rect,Gdiplus::ImageLockModeRead,PixelFormat24bppRGB,&bits) != Gdiplus::Ok) return -6;
+	std::vector<unsigned char> pixels(size_t(pw)*ph*3);
+	for (int y=0;y<ph;++y) memcpy(pixels.data()+size_t(y)*pw*3,static_cast<BYTE*>(bits.Scan0)+y*bits.Stride,pw*3);
+	thumbnail.UnlockBits(&bits);
+	auto_fit::Shape photo;
+	const bool photoShape=auto_fit::Photo(pixels,pw,ph,photo);
+	if(!photoShape) { photo.cx=(pw-1)*.5; photo.cy=(ph-1)*.5; }
+	const double base = std::min(st.docW/iw,st.docH/ih);
+	const double angle = st.imgRot*kPi/180, c = cos(angle), s = sin(angle);
+	const double fx = ((photo.cx+0.5)/q-iw*0.5)*base*st.imgSX;
+	const double fy = ((photo.cy+0.5)/q-ih*0.5)*base*st.imgSY;
+	auto_fit::Fit initial;
+	initial.scale = base*sqrt(st.imgSX*st.imgSY)*st.fix/q/grid.cell;
+	initial.angle = angle;
+	initial.x = (st.ax+st.offX+st.fix*(st.docW*0.5+st.imgX+c*fx-s*fy-st.ax-st.offX)-grid.u0)/grid.cell-0.5;
+	initial.y = (st.ay+st.offY+st.fix*(st.docH*0.5+st.imgY+s*fx+c*fy-st.ay-st.offY)-grid.v0)/grid.cell-0.5;
+	const DWORD started = GetTickCount();
+	const auto_fit::Fit fit = photoShape ? auto_fit::Search(photo,model,&initial) : initial;
+	if (FILE* f=_wfopen((DataFolder()+L"nav_log.txt").c_str(),L"ab")) {
+		fprintf(f,"%lu auto fit registration: error %.6f, scale %.6f, angle %.3f, centre %.3f %.3f\n",
+			GetTickCount(),fit.error,fit.scale,fit.angle*180/kPi,fit.x,fit.y);
+		fclose(f);
+	}
+	const double scale = fit.scale*grid.cell*q/st.fix/base;
+	if (!std::isfinite(scale) || scale < 0.001 || scale > 10) return -7;
+	const double dx = ((photo.cx+0.5)/q-iw*0.5)*base*scale;
+	const double dy = ((photo.cy+0.5)/q-ih*0.5)*base*scale;
+	const double co=cos(fit.angle), si=sin(fit.angle);
+	const double ux=grid.u0+(fit.x+0.5)*grid.cell, uy=grid.v0+(fit.y+0.5)*grid.cell;
+	const double cx=st.ax+st.offX+(ux-st.ax-st.offX)/st.fix-co*dx+si*dy;
+	const double cy=st.ay+st.offY+(uy-st.ay-st.offY)/st.fix-si*dx-co*dy;
+	double finalScale=scale,finalX=cx-st.docW*.5,finalY=cy-st.docH*.5,finalAngle=fit.angle;
+	bool featureFit=false;
+	auto_fit_features::Field modelFeatures,photoFeatures;
+	double docStep=0,featureQ=0;
+	if(AutoFitFeatureModel(st,modelFeatures,docStep) && AutoFitFeaturePhoto(source,photoFeatures,featureQ)) {
+		// The depth reader selects a pixel by floor(). Its actual centre can
+		// differ from the requested sample point by half a depth pixel when
+		// the sampling stride is even. Carry that origin through registration.
+		const double featureOrigin=(floor(docStep*gDepth.scale*.5)+.5)/gDepth.scale-docStep*.5;
+		auto_fit::Fit seed;
+		seed.scale=base*scale*st.ratio*st.fix/(featureQ*docStep);
+		seed.angle=fit.angle;
+		seed.x=(st.px+st.ratio*st.fix*(cx-st.ax-st.offX)-featureOrigin)/docStep-.5;
+		seed.y=(st.py+st.ratio*st.fix*(cy-st.ay-st.offY)-featureOrigin)/docStep-.5;
+		const auto registered=auto_fit_features::Search(photoFeatures,modelFeatures,seed);
+		const double confidence=auto_fit_features::Score(photoFeatures,auto_fit_features::Samples(modelFeatures),registered,1,false);
+		featureFit=std::isfinite(registered.error) && confidence>.30;
+		if(FILE* f=_wfopen((DataFolder()+L"nav_log.txt").c_str(),L"ab")) {
+			fprintf(f,"%lu auto fit whole-model gradients: score %.6f confidence %.6f (seed %.6f), %s, scale %.6f angle %.3f centre %.3f %.3f\n",
+				GetTickCount(),1-registered.error,confidence,auto_fit_features::Score(photoFeatures,auto_fit_features::Samples(modelFeatures),seed),
+				featureFit?"accepted":"not enough evidence",registered.scale,registered.angle*180/kPi,registered.x,registered.y);
+			fclose(f);
+		}
+		if(featureFit) {
+			finalScale=registered.scale*featureQ*docStep/(base*st.ratio*st.fix);
+			finalAngle=registered.angle;
+			finalX=st.ax+st.offX+((registered.x+.5)*docStep+featureOrigin-st.px)/(st.ratio*st.fix)-st.docW*.5;
+			finalY=st.ay+st.offY+((registered.y+.5)*docStep+featureOrigin-st.py)/(st.ratio*st.fix)-st.docH*.5;
+		}
+	}
+	if(!featureFit && (!photoShape || unseen>boundary*.08 || !std::isfinite(fit.error) || fit.error>.035)) return -7;
+	if(!std::isfinite(finalScale) || finalScale<.001 || finalScale>10) return -7;
+	EnterCriticalSection(&gOverlayLock);
+	// Do not overwrite a newer manual placement or a changed view.
+	if (gActiveView != slot || gViewAway || !(AdjustNow() == before) || !gOverlay.visible || gMode == 1 ||
+		gOverlay.ratio != st.ratio || gOverlay.px != st.px || gOverlay.py != st.py || gOverlayPath != path) {
+		LeaveCriticalSection(&gOverlayLock); return -9;
+	}
+	AdjustRemember(before);
+	const double degrees = finalAngle*180/kPi;
+	AdjustApply({finalScale,finalScale,finalX,finalY,degrees-360*floor((degrees+180)/360)});
+	gAdjustDrag = 0;
+	SaveAdjustToView(); gRedrawPending = true;
+	const auto applied=AdjustNow();
+	LeaveCriticalSection(&gOverlayLock);
+	if (FILE* f = _wfopen((DataFolder()+L"nav_log.txt").c_str(),L"ab")) {
+		fprintf(f,"%lu auto fit view %d: error %.6f, scale %.6f, x %.3f y %.3f turn %.3f, %lu ms, %u logical processors available\n",
+			GetTickCount(),slot,fit.error,applied.sx,applied.x,applied.y,applied.rot,GetTickCount()-started,std::thread::hardware_concurrency());
+		fclose(f);
+	}
+	PostMessageW(gOverlayWnd,WM_RS_REDRAW,0,0);
+	return 1;
+}
+
+ZFUNC RSAutoFit(char*, double, char*, int, char*, int, char**)
+{
+	if (!gOverlayWnd) return -1;
+	return static_cast<float>(SendMessageW(gOverlayWnd,WM_RS_AUTOFIT,0,0));
 }
 
 // text: "1" turns Adjust Image on, "0" off (keeping the image's size and
@@ -11581,8 +12037,10 @@ ZFUNC RSViewNow(char* text, double, char*, int, char*, int, char**)
 	if (text && strcmp(text, "go") == 0) {
 		gViewAway = true;
 		result = ViewTickCodes(codes);
-		for (RotCand& c : gRotCands)
+		for (RotCand& c : gRotCands) {
 			memcpy(c.settled, c.m, sizeof(c.m));
+			c.changedSinceSettled = false;
+		}
 	} else {
 		for (int i = 0; i < kDefaultView; ++i)
 			if (gViews[i].used && AtView(codes, i))
