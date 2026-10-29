@@ -135,9 +135,34 @@ inline std::vector<Sample> BalancedSamples(const std::vector<Sample>& samples) {
 }
 struct Evidence {
     double score=0, gain=0, validationGain=0, coverage=0;
+    double outlineGain=0, outlinePeak=0, featurePeak=0;
     int supportedRegions=0;
     bool reliable=false;
 };
+inline std::vector<Sample> OutlineSamples(const Field& model) {
+    Field outline; outline.w=model.w;outline.h=model.h;
+    outline.image.resize(model.mask.size());
+    for(size_t i=0;i<model.mask.size();++i) outline.image[i]=model.mask[i]?1:0;
+    Gradients(outline,1.5);
+    std::vector<Sample> points;
+    for(int y=2;y<model.h-2;++y) for(int x=2;x<model.w-2;++x) {
+        const int i=y*model.w+x;
+        if(!model.mask[i] || (model.mask[i-1] && model.mask[i+1] && model.mask[i-model.w] && model.mask[i+model.w])) continue;
+        const double length=hypot(outline.dx[i],outline.dy[i]);
+        if(length>1e-6) points.push_back({double(x),double(y),outline.dx[i]/length,outline.dy[i]/length,1});
+    }
+    for(auto& p:points) p.weight=1.0/points.size();
+    return points;
+}
+inline double PeakSeparation(const Field& photo,const std::vector<Sample>& points,const auto_fit::Fit& fit,double distance) {
+    double neighbours=0;
+    for(int axis=0;axis<2;++axis) for(int sign:{-1,1}) {
+        auto shifted=fit;
+        (axis?shifted.y:shifted.x)+=sign*distance;
+        neighbours+=Score(photo,points,shifted);
+    }
+    return Score(photo,points,fit)-neighbours*.25;
+}
 inline Evidence Assess(const Field& photo,const Field& model,const auto_fit::Fit& fit) {
     Evidence out;
     if(!std::isfinite(fit.scale) || fit.scale<=0 || !std::isfinite(fit.x) || !std::isfinite(fit.y) || !std::isfinite(fit.angle)) return out;
@@ -179,6 +204,22 @@ inline Evidence Assess(const Field& photo,const Field& model,const auto_fit::Fit
     out.validationGain=checkChance>1e-9?check/checkChance:0;
     for(int i=0;i<4;++i) if(count[i]>=8 && regionChance[i]>1e-9 && regionGain[i]/regionChance[i]>.10) ++out.supportedRegions;
     out.reliable=out.coverage>.65 && out.gain>.15 && out.validationGain>.10 && out.supportedRegions>=3;
+    // Texture and lighting can invalidate weak shading without invalidating
+    // the object. In that case require a distinct peak in BOTH the interior
+    // features and the independently sampled outline. Broad directional
+    // texture can score well at many placements and must still fail.
+    if(!out.reliable && out.coverage>.65 && out.gain>.15) {
+        const auto outline=OutlineSamples(model);
+        if(outline.size()>=60) {
+            const double value=Score(photo,outline,fit);
+            const double excess=Score(photo,outline,fit,1,false,true);
+            out.outlineGain=excess/std::max(1e-9,value-excess);
+            const double distance=std::max(4.0,hypot(x1-x0,y1-y0)*.04);
+            out.outlinePeak=PeakSeparation(photo,outline,fit,distance);
+            out.featurePeak=PeakSeparation(photo,strong,fit,distance);
+            out.reliable=out.outlineGain>.20 && out.outlinePeak>.04 && out.featurePeak>.06;
+        }
+    }
     return out;
 }
 inline auto_fit::Fit RefineTurn(const Field& photo,const std::vector<Sample>& samples,const auto_fit::Fit& initial) {
@@ -441,6 +482,44 @@ inline std::vector<auto_fit::Fit> PyramidSeeds(const Field& photo,const Field& m
     }
 }
 struct RefinementTrace {auto_fit::Fit before,after;};
+inline auto_fit::Fit RecoverOutlineMatch(const Field& photo,const Field& model,const auto_fit::Fit& initial,const auto_fit::Fit& rejected) {
+    const auto samples=Samples(model),outline=OutlineSamples(model);
+    if(samples.size()<60 || outline.size()<60) return rejected;
+    double x0=model.w,y0=model.h,x1=0,y1=0;
+    for(const auto& p:samples) {x0=std::min(x0,p.x);y0=std::min(y0,p.y);x1=std::max(x1,p.x);y1=std::max(y1,p.y);}
+    const double span=hypot(x1-x0,y1-y0);
+    const double geometryScale=span/hypot(double(photo.w),double(photo.h));
+    const double angleOrigin=round(initial.angle/.523598775598)*.523598775598;
+    std::vector<auto_fit::Fit> candidates;
+    // Preserve the approximate image orientation in a search based on the
+    // observed object size. Quantised starting angles keep repeating Auto
+    // Fit independent of the previous result's precise scale and turn.
+    for(int z=-10;z<=10;++z) for(int a=-4;a<=4;++a)
+        for(int y=-8;y<=8;++y) for(int x=-8;x<=8;++x) {
+            auto f=initial;f.scale=geometryScale*exp(z*.06);f.angle=angleOrigin+a*.130899694;
+            f.x=(x0+x1)*.5+x*span*.025;f.y=(y0+y1)*.5+y*span*.025;
+            candidates.push_back(f);
+        }
+    concurrency::parallel_for(size_t(0),candidates.size(),[&](size_t i) {candidates[i].error=1-Score(photo,samples,candidates[i],4);});
+    std::stable_sort(candidates.begin(),candidates.end(),[](const auto& a,const auto& b){return a.error<b.error;});
+    std::vector<auto_fit::Fit> seeds;
+    for(const auto& f:candidates) {
+        bool distinct=true;
+        for(const auto& p:seeds) if(hypot(f.x-p.x,f.y-p.y)<span*.025 && fabs(log(f.scale/p.scale))<.10 && fabs(f.angle-p.angle)<.15) distinct=false;
+        if(distinct) seeds.push_back(f);
+        if(seeds.size()==16) break;
+    }
+    auto best=rejected;double bestScore=-1;
+    auto objective=[&](const auto_fit::Fit& f){return Score(photo,samples,f)+.5*Score(photo,outline,f);};
+    for(auto f:seeds) {
+        f=MinimizeLocal(f,objective,.12,span*.035,.13);
+        if(!Assess(photo,model,f).reliable) continue;
+        const double value=objective(f);
+        if(value>bestScore) {best=f;bestScore=value;}
+    }
+    best.error=1-Score(photo,samples,best);
+    return best;
+}
 inline auto_fit::Fit Search(const Field& photo,const Field& model,const auto_fit::Fit& initial,RefinementTrace* trace=nullptr) {
     if(trace) *trace={initial,initial};
     const auto samples=Samples(model);
@@ -560,6 +639,7 @@ inline auto_fit::Fit Search(const Field& photo,const Field& model,const auto_fit
     if(Score(photo,samples,turned)>=Score(photo,samples,best)-.01) best=turned;
     best.error=1-Score(photo,samples,best);
     if(best.error>geometric.error+.03) best=geometric;
+    if(!Assess(photo,model,best).reliable) best=RecoverOutlineMatch(photo,model,initial,best);
     const auto refined=RefineProfiles(photo,model,best);
     if(trace) *trace={best,refined};
     return refined;

@@ -264,7 +264,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 248;
+static const int kDllBuild = 249;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -11849,6 +11849,8 @@ static int AutoFitOnOverlay()
 		if(FILE* f=_wfopen((DataFolder()+L"nav_log.txt").c_str(),L"ab")) {
 			fprintf(f,"%lu auto fit independent evidence: gain %.6f validation %.6f coverage %.3f regions %d reliable %d\n",
 				GetTickCount(),evidence.gain,evidence.validationGain,evidence.coverage,evidence.supportedRegions,evidence.reliable?1:0);
+			fprintf(f,"%lu auto fit outline evidence: gain %.6f outline peak %.6f interior peak %.6f\n",
+				GetTickCount(),evidence.outlineGain,evidence.outlinePeak,evidence.featurePeak);
 			fclose(f);
 		}
 		if(featureFit) {

@@ -93,6 +93,8 @@ int main(int argc,char** argv) {
 	gDepth.base=1;
 	Check(!AutoFitDepthReady(gOverlay),"unreadable depth is rejected safely");
 	if(argc>=5 && atoi(argv[3])>0 && atoi(argv[4])>0) {
+		const bool side=argc>=8 && strcmp(argv[7],"side")==0;
+		const int replaySlot=side?2:0;
 		const int fw=atoi(argv[3]),fh=atoi(argv[4]),dw=fw*2,dh=fh*2;
 		std::vector<float> saved(size_t(fw)*fh),full(size_t(dw)*dh);
 		FILE* raw=_wfopen(Widen(argv[2]).c_str(),L"rb");
@@ -143,7 +145,8 @@ int main(int argc,char** argv) {
 					}
 					Check(cameraRead,"actual captured camera position read from its metadata");
 					gOverlay.ax=536.34082; gOverlay.ay=784.979126;
-					gViews[0]=stored; gViews[0].used=true; gViews[0].path=argv[6];
+					gActiveView=replaySlot;
+					gViews[replaySlot]=stored; gViews[replaySlot].used=true; gViews[replaySlot].path=argv[6];
 					gImgW=reference.w; gImgH=reference.h; gOverlayPath=argv[6];
 					gAutoFitDepthEvidence={};
 					for(size_t i=0;i<full.size();++i) gKeyShare[i]=full[i]==32608?255:0;
@@ -159,6 +162,11 @@ int main(int argc,char** argv) {
 					printf("Actual reference fit result %d, width %.3f%%, x %.3f, y %.3f, turn %.3f\n",result,
 						100*gOverlay.imgSX,gOverlay.imgX,gOverlay.imgY,gOverlay.imgRot);
 					Check(result==1,"full Auto Fit succeeds on actual cropped ZBrush depth, saved outline and Front photo");
+					if(side) {
+						Check(result==1 && gOverlay.imgSX>.9 && gOverlay.imgSX<1.5 && fabs(gOverlay.imgRot)<20 &&
+							gOverlay.imgX>100 && gOverlay.imgX<230 && gOverlay.imgY>-150 && gOverlay.imgY<20,
+							"side reference recovers the upright object instead of the rejected 125-degree texture match");
+					} else {
 					Check(result==1 && gOverlay.imgSX>1.2 && gOverlay.imgSX<1.45 && gOverlay.imgY<-35 &&
 						gOverlay.imgY>-100 && gOverlay.imgRot>1 && gOverlay.imgRot<8,
 						"actual reference fit stays near the earlier manual alignment rather than the bad silhouette fit");
@@ -168,6 +176,7 @@ int main(int argc,char** argv) {
 					Check(result==1 && fabs(gOverlay.imgSX*100-129.4734)<.5 && fabs(gOverlay.imgX-20.87)*gOverlay.ratio<1 &&
 						fabs(gOverlay.imgY+67.90)*gOverlay.ratio<1 && fabs(gOverlay.imgRot-4.978)<.3,
 						"actual reference matches the benchmark within 0.5 percent scale, 1 projected document pixel and 0.3 degree");
+					}
 					const auto canonical=AdjustNow();
 					gOverlay.offX=287.35; gOverlay.offY=340.80; gOverlay.fix=1.0123;
 					gOverlay.imgSX=canonical.sx/gOverlay.fix; gOverlay.imgSY=canonical.sy/gOverlay.fix;
@@ -181,7 +190,7 @@ int main(int argc,char** argv) {
 						gOverlay.offX==0 && gOverlay.offY==0 && gOverlay.fix==1,
 						"full Auto Fit with the logged large offset produces the same canonical placement");
 					const auto fitted=AdjustNow();
-					gViewAway=true; ViewTickCodes({kViewCodes[0]});
+					gViewAway=true; ViewTickCodes({kViewCodes[replaySlot]});
 					Check(AdjustNow()==fitted && gOverlay.offX==0 && gOverlay.offY==0 && gOverlay.fix==1,
 						"full fitted placement survives a same-view snap unchanged");
 					Gdiplus::Bitmap unrelated(reference.w,reference.h,PixelFormat24bppRGB);
@@ -199,7 +208,7 @@ int main(int argc,char** argv) {
 					}
 					Check(noiseOK,"unrelated reference saved only in test scratch folder");
 					if(noiseOK) {
-						gOverlayPath=Utf8(gDataFolder+L"unrelated-reference.png");gViews[0].path=gOverlayPath;
+						gOverlayPath=Utf8(gDataFolder+L"unrelated-reference.png");gViews[replaySlot].path=gOverlayPath;
 						const auto undoCount=gAdjustUndo.size();
 						const int rejected=AutoFitOnOverlay();
 						Check(rejected==-7 && AdjustNow()==fitted && gAdjustUndo.size()==undoCount,
