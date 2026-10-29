@@ -175,6 +175,27 @@ int main(int argc,char** argv) {
 					gViewAway=true; ViewTickCodes({kViewCodes[0]});
 					Check(AdjustNow()==fitted && gOverlay.offX==0 && gOverlay.offY==0 && gOverlay.fix==1,
 						"full fitted placement survives a same-view snap unchanged");
+					Gdiplus::Bitmap unrelated(reference.w,reference.h,PixelFormat24bppRGB);
+					Gdiplus::Rect badRect(0,0,reference.w,reference.h); Gdiplus::BitmapData badBits;
+					bool noiseOK=unrelated.LockBits(&badRect,Gdiplus::ImageLockModeWrite,PixelFormat24bppRGB,&badBits)==Gdiplus::Ok;
+					if(noiseOK) {
+						unsigned random=123456789;
+						for(int y=0;y<reference.h;++y) for(int x=0;x<reference.w;++x) {
+							random=random*1664525u+1013904223u;
+							auto pixel=static_cast<unsigned char*>(badBits.Scan0)+y*badBits.Stride+3*x;
+							pixel[0]=pixel[1]=pixel[2]=32+static_cast<unsigned char>((random>>24)*.75);
+						}
+						unrelated.UnlockBits(&badBits);
+						noiseOK=WritePng(gDataFolder+L"unrelated-reference.png",unrelated);
+					}
+					Check(noiseOK,"unrelated reference saved only in test scratch folder");
+					if(noiseOK) {
+						gOverlayPath=Utf8(gDataFolder+L"unrelated-reference.png");gViews[0].path=gOverlayPath;
+						const auto undoCount=gAdjustUndo.size();
+						const int rejected=AutoFitOnOverlay();
+						Check(rejected==-7 && AdjustNow()==fitted && gAdjustUndo.size()==undoCount,
+							"unrelated image is rejected without moving the reference or adding an undo step");
+					}
 				}
 			}
 		}

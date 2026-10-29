@@ -264,7 +264,7 @@ ZFUNC RSAnchorGet(char* text, double, char*, int, char*, int, char**)
 
 // The DLL's build number, so the script can tell when ZBrush still has an
 // older DLL loaded (the overlay keeps it loaded until ZBrush closes).
-static const int kDllBuild = 246;
+static const int kDllBuild = 247;
 
 ZFUNC RSVersion(char*, double, char*, int, char*, int, char**)
 {
@@ -11671,6 +11671,9 @@ static bool AutoFitFeatureModel(const OverlayState& st, auto_fit_features::Field
     docStep=std::max(1.0,ceil(std::max(st.docW,st.docH)/640.0));
     const double worldStep=docStep/st.ratio;
     out.depthPixelStep=worldStep; out.epsilon=worldStep/2; out.erosion=int(ceil(20/worldStep));
+    // Zoomed out, skipping alternate depth pixels discards features that
+    // already occupy only a few pixels. Retain them at the fine level.
+    out.sampleStride=worldStep>4?1:2;
     out.w=int(ceil(st.docW/docStep)); out.h=int(ceil(st.docH/docStep));
     if(out.w<16 || out.h<16) return false;
     out.image.assign(size_t(out.w)*out.h,0); out.mask.assign(out.image.size(),0);
@@ -11828,11 +11831,17 @@ static int AutoFitOnOverlay()
 		seed.y=(st.py+st.ratio*st.fix*(cy-st.ay-st.offY)-featureOrigin)/docStep-.5;
 		const auto registered=auto_fit_features::Search(photoFeatures,modelFeatures,seed);
 		const double confidence=auto_fit_features::Score(photoFeatures,auto_fit_features::Samples(modelFeatures),registered,1,false);
-		featureFit=std::isfinite(registered.error) && confidence>.30;
+		const auto evidence=auto_fit_features::Assess(photoFeatures,modelFeatures,registered);
+		featureFit=std::isfinite(registered.error) && evidence.reliable;
 		if(FILE* f=_wfopen((DataFolder()+L"nav_log.txt").c_str(),L"ab")) {
-			fprintf(f,"%lu auto fit whole-model gradients: score %.6f confidence %.6f (seed %.6f), %s, scale %.6f angle %.3f centre %.3f %.3f\n",
+			fprintf(f,"%lu auto fit whole-model gradients (pyramid search): score %.6f confidence %.6f (seed %.6f), %s, scale %.6f angle %.3f centre %.3f %.3f\n",
 				GetTickCount(),1-registered.error,confidence,auto_fit_features::Score(photoFeatures,auto_fit_features::Samples(modelFeatures),seed),
 				featureFit?"accepted":"not enough evidence",registered.scale,registered.angle*180/kPi,registered.x,registered.y);
+			fclose(f);
+		}
+		if(FILE* f=_wfopen((DataFolder()+L"nav_log.txt").c_str(),L"ab")) {
+			fprintf(f,"%lu auto fit independent evidence: gain %.6f validation %.6f coverage %.3f regions %d reliable %d\n",
+				GetTickCount(),evidence.gain,evidence.validationGain,evidence.coverage,evidence.supportedRegions,evidence.reliable?1:0);
 			fclose(f);
 		}
 		if(featureFit) {

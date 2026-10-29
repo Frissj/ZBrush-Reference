@@ -10,6 +10,7 @@ struct Field {
     double epsilon=1;
     double depthPixelStep=2;
     int erosion=10;
+    int sampleStride=2;
     std::vector<double> image,dx,dy;
     std::vector<unsigned char> mask;
 };
@@ -66,14 +67,14 @@ inline std::vector<Sample> Samples(const Field& f,int percentile=85) {
         interior.swap(next);
     }
     std::vector<double> magnitudes;
-    for(int y=0;y<f.h;y+=2) for(int x=0;x<f.w;x+=2)
+    for(int y=0;y<f.h;y+=f.sampleStride) for(int x=0;x<f.w;x+=f.sampleStride)
         if(interior[y*f.w+x]) magnitudes.push_back(std::hypot(f.dx[y*f.w+x],f.dy[y*f.w+x]));
     if(magnitudes.size()<80) return {};
     const size_t at=magnitudes.size()*percentile/100;
     std::nth_element(magnitudes.begin(),magnitudes.begin()+at,magnitudes.end());
     const double threshold=std::max(.15,magnitudes[at]);
     std::vector<Sample> out;
-    for(int y=0;y<f.h;y+=2) for(int x=0;x<f.w;x+=2) {
+    for(int y=0;y<f.h;y+=f.sampleStride) for(int x=0;x<f.w;x+=f.sampleStride) {
         const int i=y*f.w+x;
         const double mag=std::hypot(f.dx[i],f.dy[i]);
         if(!interior[i] || mag<=threshold) continue;
@@ -95,7 +96,7 @@ inline double Pixel(const std::vector<double>& a,int w,int h,double x,double y) 
     return (1-fy)*((1-fx)*a[iy*w+ix]+fx*a[iy*w+ix+1])+
         fy*((1-fx)*a[(iy+1)*w+ix]+fx*a[(iy+1)*w+ix+1]);
 }
-inline double Score(const Field& photo,const std::vector<Sample>& samples,const auto_fit::Fit& fit,size_t step=1,bool strength=false) {
+inline double Score(const Field& photo,const std::vector<Sample>& samples,const auto_fit::Fit& fit,size_t step=1,bool strength=false,bool chanceAdjusted=false) {
     const double c=cos(fit.angle),s=sin(fit.angle);
     double score=0,weight=0;
     for(size_t i=0;i<samples.size();i+=step) {
@@ -106,6 +107,7 @@ inline double Score(const Field& photo,const std::vector<Sample>& samples,const 
         const double gx=Pixel(photo.dx,photo.w,photo.h,x,y),gy=Pixel(photo.dy,photo.w,photo.h,x,y);
         const double dot=p.nx*(c*gx-s*gy)+p.ny*(s*gx+c*gy);
         double similarity=dot*dot/(gx*gx+gy*gy+photo.epsilon*photo.epsilon);
+        if(chanceAdjusted) similarity-=.5*(p.nx*p.nx+p.ny*p.ny)*(gx*gx+gy*gy)/(gx*gx+gy*gy+photo.epsilon*photo.epsilon);
         // As in the supplied registration script, give coherent strong
         // reference features more influence than weak texture/noise. The
         // scale factor expresses gradient strength in model coordinates.
@@ -130,6 +132,54 @@ inline std::vector<Sample> BalancedSamples(const std::vector<Sample>& samples) {
     for(auto& p:balanced) { p.weight/=std::max(.10,mass[region(p)]); total+=p.weight; }
     for(auto& p:balanced) p.weight/=total;
     return balanced;
+}
+struct Evidence {
+    double score=0, gain=0, validationGain=0, coverage=0;
+    int supportedRegions=0;
+    bool reliable=false;
+};
+inline Evidence Assess(const Field& photo,const Field& model,const auto_fit::Fit& fit) {
+    Evidence out;
+    if(!std::isfinite(fit.scale) || fit.scale<=0 || !std::isfinite(fit.x) || !std::isfinite(fit.y) || !std::isfinite(fit.angle)) return out;
+    const auto strong=Samples(model),validation=Samples(model,50);
+    if(strong.empty() || validation.empty()) return out;
+    std::vector<unsigned char> fitted(size_t(model.w)*model.h,0);
+    for(const auto& p:strong) fitted[size_t(p.y)*model.w+size_t(p.x)]=1;
+    double x0=model.w,y0=model.h,x1=0,y1=0;
+    for(const auto& p:validation) {x0=std::min(x0,p.x);y0=std::min(y0,p.y);x1=std::max(x1,p.x);y1=std::max(y1,p.y);}
+    const double c=cos(fit.angle),s=sin(fit.angle);
+    double score=0,chance=0,total=0,visible=0,check=0,checkChance=0;
+    std::array<double,4> regionGain={},regionChance={};
+    std::array<int,4> count={};
+    for(const auto& p:validation) {
+        const double dx=p.x-fit.x,dy=p.y-fit.y;
+        const double x=(c*dx+s*dy)/fit.scale+(photo.w-1)*.5;
+        const double y=(-s*dx+c*dy)/fit.scale+(photo.h-1)*.5;
+        total+=p.weight;
+        if(x<1 || y<1 || x>=photo.w-2 || y>=photo.h-2) continue;
+        visible+=p.weight;
+        const double gx=Pixel(photo.dx,photo.w,photo.h,x,y),gy=Pixel(photo.dy,photo.w,photo.h,x,y);
+        const double denominator=gx*gx+gy*gy+photo.epsilon*photo.epsilon;
+        const double dot=p.nx*(c*gx-s*gy)+p.ny*(s*gx+c*gy);
+        const double actual=p.weight*dot*dot/denominator;
+        // Unrelated gradient directions agree half the time in the squared
+        // orientation score. Subtract that chance level, including both
+        // images' gradient strength, rather than trust a raw score of 0.3.
+        const double baseline=p.weight*.5*(p.nx*p.nx+p.ny*p.ny)*(gx*gx+gy*gy)/denominator;
+        score+=actual;chance+=baseline;
+        if(!fitted[size_t(p.y)*model.w+size_t(p.x)]) {
+            check+=actual-baseline;checkChance+=baseline;
+            const int region=(p.x>(x0+x1)*.5?1:0)+(p.y>(y0+y1)*.5?2:0);
+            regionGain[region]+=actual-baseline;regionChance[region]+=baseline;++count[region];
+        }
+    }
+    out.score=total>0?score/total:0;
+    out.coverage=total>0?visible/total:0;
+    out.gain=chance>1e-9?(score-chance)/chance:0;
+    out.validationGain=checkChance>1e-9?check/checkChance:0;
+    for(int i=0;i<4;++i) if(count[i]>=8 && regionChance[i]>1e-9 && regionGain[i]/regionChance[i]>.10) ++out.supportedRegions;
+    out.reliable=out.coverage>.65 && out.gain>.15 && out.validationGain>.10 && out.supportedRegions>=3;
+    return out;
 }
 inline auto_fit::Fit RefineTurn(const Field& photo,const std::vector<Sample>& samples,const auto_fit::Fit& initial) {
     const auto balanced=BalancedSamples(samples);
@@ -156,6 +206,114 @@ inline auto_fit::Fit RefineTurn(const Field& photo,const std::vector<Sample>& sa
     auto result=initial; result.angle=sa>sb?a:b;
     return result;
 }
+inline Field Reduce(const Field& source) {
+    Field out;
+    out.w=(source.w+1)/2; out.h=(source.h+1)/2;
+    out.epsilon=source.epsilon*2; out.depthPixelStep=source.depthPixelStep*2;
+    out.erosion=(source.erosion+1)/2;
+    out.sampleStride=source.sampleStride;
+    const auto smooth=Blur(source.image,source.w,source.h,1);
+    out.image.resize(size_t(out.w)*out.h);
+    if(!source.mask.empty()) out.mask.resize(out.image.size());
+    for(int y=0;y<out.h;++y) for(int x=0;x<out.w;++x) {
+        const int x0=std::min(2*x,source.w-1),x1=std::min(x0+1,source.w-1);
+        const int y0=std::min(2*y,source.h-1),y1=std::min(y0+1,source.h-1);
+        const size_t i=size_t(y)*out.w+x;
+        out.image[i]=(smooth[y0*source.w+x0]+smooth[y0*source.w+x1]+smooth[y1*source.w+x0]+smooth[y1*source.w+x1])*.25;
+        if(!out.mask.empty()) out.mask[i]=source.mask[y0*source.w+x0] && source.mask[y0*source.w+x1] &&
+            source.mask[y1*source.w+x0] && source.mask[y1*source.w+x1];
+    }
+    Gradients(out);
+    return out;
+}
+inline auto_fit::Fit TransferFit(const auto_fit::Fit& source,const Field& fromPhoto,const Field& toPhoto,double ratio) {
+    auto out=source;
+    // Padding an odd image shifts its centre by half a pixel. The fit maps
+    // photo centres, so changing only its model x/y would introduce drift.
+    const double dx=(toPhoto.w-ratio*fromPhoto.w)*.5,dy=(toPhoto.h-ratio*fromPhoto.h)*.5;
+    const double c=cos(source.angle),s=sin(source.angle);
+    out.x=ratio*(source.x+.5)-.5+source.scale*(c*dx-s*dy);
+    out.y=ratio*(source.y+.5)-.5+source.scale*(s*dx+c*dy);
+    return out;
+}
+inline std::vector<auto_fit::Fit> PyramidSeeds(const Field& photo,const Field& model,const auto_fit::Fit& initial) {
+    std::vector<Field> photos={photo},models={model};
+    while(std::max({photos.back().w,photos.back().h,models.back().w,models.back().h})>128 &&
+        std::min({photos.back().w,photos.back().h,models.back().w,models.back().h})>=48 && photos.size()<4) {
+        photos.push_back(Reduce(photos.back())); models.push_back(Reduce(models.back()));
+    }
+    size_t level=models.size()-1;
+    auto samples=Samples(models[level],60);
+    while(level>0 && samples.size()<32) samples=Samples(models[--level],60);
+    if(samples.size()<32 || level==0) return {};
+    samples=BalancedSamples(samples);
+    auto bounds=[](const std::vector<Sample>& points) {
+        std::array<double,4> b={points[0].x,points[0].y,points[0].x,points[0].y};
+        for(const auto& p:points) { b[0]=std::min(b[0],p.x);b[1]=std::min(b[1],p.y);b[2]=std::max(b[2],p.x);b[3]=std::max(b[3],p.y); }
+        return b;
+    };
+    const auto box=bounds(samples);
+    double span=std::hypot(box[2]-box[0],box[3]-box[1]);
+    auto evaluate=[&](std::vector<auto_fit::Fit>& candidates) {
+        const size_t stride=std::max(size_t(1),samples.size()/256);
+        concurrency::parallel_for(size_t(0),candidates.size(),[&](size_t i) {
+            candidates[i].error=1-Score(photos[level],samples,candidates[i],stride,false,true);
+        });
+        std::stable_sort(candidates.begin(),candidates.end(),[](const auto& a,const auto& b) {return a.error<b.error;});
+    };
+    auto select=[&](const std::vector<auto_fit::Fit>& candidates,double distance,double angle,double scale) {
+        std::vector<auto_fit::Fit> selected;
+        for(const auto& f:candidates) {
+            bool distinct=true;
+            for(const auto& p:selected) if(std::hypot(f.x-p.x,f.y-p.y)<distance &&
+                std::abs(std::remainder(f.angle-p.angle,2*3.141592653589793))<angle && std::abs(log(f.scale/p.scale))<scale) distinct=false;
+            if(distinct) selected.push_back(f);
+            if(selected.size()==12) break;
+        }
+        return selected;
+    };
+    const double factor=double(1u<<level);
+    auto seed=TransferFit(initial,photo,photos[level],1/factor);
+    std::vector<auto_fit::Fit> candidates={seed};
+    // Search around the observed model as well as the current placement.
+    // A badly moved/sized reference must not define the only search window.
+    const double geometryScale=span/std::hypot(double(photos[level].w),double(photos[level].h));
+    for(double base:{seed.scale,geometryScale})
+        for(int z=-10;z<=10;++z) for(int a=-12;a<12;++a)
+            for(int y=-6;y<=6;++y) for(int x=-6;x<=6;++x) {
+                auto f=seed; f.scale=base*exp(z*.14);f.angle+=a*3.141592653589793/12;
+                f.x=(box[0]+box[2])*.5+x*span*.07;f.y=(box[1]+box[3])*.5+y*span*.07;
+                candidates.push_back(f);
+            }
+    evaluate(candidates);
+    auto seeds=select(candidates,span*.10,.40,.25);
+    for(;;) {
+        // Refine at each resolution before doubling coordinates. Half-pixel
+        // centres are carried exactly, including odd image dimensions.
+        for(int pass=0;pass<3;++pass) {
+            const double step=std::pow(.4,pass);
+            // Refine each basin independently. Globally taking the best
+            // neighbouring grid points would fill every slot with tiny
+            // variations of one early favourite and lose the alternatives.
+            for(auto& centre:seeds) {
+                candidates.clear();
+                for(int z=-2;z<=2;++z) for(int a=-2;a<=2;++a)
+                    for(int y=-2;y<=2;++y) for(int x=-2;x<=2;++x) {
+                        auto f=centre;f.scale*=exp(z*.04*step);f.angle+=a*.065449847*step;
+                        f.x+=x*span*.02*step;f.y+=y*span*.02*step;candidates.push_back(f);
+                    }
+                evaluate(candidates);centre=candidates.front();
+            }
+        }
+        if(level==0) return seeds;
+        --level;
+        for(auto& f:seeds) f=TransferFit(f,photos[level+1],photos[level],2);
+        samples=Samples(models[level],level?60:50);
+        if(samples.size()<32) return {};
+        samples=BalancedSamples(samples);
+        const auto b=bounds(samples);span=std::hypot(b[2]-b[0],b[3]-b[1]);
+    }
+}
 inline auto_fit::Fit Search(const Field& photo,const Field& model,const auto_fit::Fit& initial) {
     const auto samples=Samples(model);
     auto_fit::Fit failure=initial; failure.error=1;
@@ -171,6 +329,8 @@ inline auto_fit::Fit Search(const Field& photo,const Field& model,const auto_fit
     };
     std::vector<auto_fit::Fit> coarse;
     coarse.push_back(initial);
+    const auto pyramid=PyramidSeeds(photo,model,initial);
+    coarse.insert(coarse.end(),pyramid.begin(),pyramid.end());
     // Fifteen-degree coverage keeps a small, strongly rotated object in
     // the correct basin before the continuous refinement takes over.
     for(int scale=-6;scale<=6;++scale) for(int a=-12;a<12;++a)
@@ -207,6 +367,20 @@ inline auto_fit::Fit Search(const Field& photo,const Field& model,const auto_fit
             if(distinct) seeds.push_back(f);
             if(seeds.size()==12) break;
         }
+    }
+    // A covered high-contrast patch can win the strongest-edge objective
+    // while contradicting the rest of the object. Keep the pyramid's
+    // broader evidence as a second hypothesis, and switch basins only for
+    // a material improvement across those weaker, distributed features.
+    const auto broad=Samples(model,50);
+    double agreement=Score(photo,broad,best);
+    auto supported=best;
+    for(auto candidate:pyramid) {
+        const double value=Score(photo,broad,candidate);
+        if(value>agreement) { agreement=value;supported=candidate; }
+    }
+    if(agreement>Score(photo,broad,best)+.05 && Assess(photo,model,supported).validationGain>Assess(photo,model,best).validationGain+.10) {
+        best=supported;best.error=1-Score(photo,samples,best);
     }
     // Continuous final refinement: the coarse search finds the basin;
     // Nelder-Mead avoids quantising the final position, scale and turn.
