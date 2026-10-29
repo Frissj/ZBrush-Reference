@@ -163,9 +163,14 @@ int main(int argc,char** argv) {
 						100*gOverlay.imgSX,gOverlay.imgX,gOverlay.imgY,gOverlay.imgRot);
 					Check(result==1,"full Auto Fit succeeds on actual cropped ZBrush depth, saved outline and Front photo");
 					if(side) {
-						Check(result==1 && gOverlay.imgSX>.9 && gOverlay.imgSX<1.5 && fabs(gOverlay.imgRot)<20 &&
-							gOverlay.imgX>100 && gOverlay.imgX<230 && gOverlay.imgY>-150 && gOverlay.imgY<20,
-							"side reference recovers the upright object instead of the rejected 125-degree texture match");
+						const double scaleError=fabs(gOverlay.imgSX*100-122.4748);
+						const double xError=fabs(gOverlay.imgX-114.7241)*gOverlay.ratio;
+						const double yError=fabs(gOverlay.imgY+87.7699)*gOverlay.ratio;
+						const double turnError=fabs(gOverlay.imgRot+4.1757);
+						printf("Side benchmark error: scale %.4f percentage points, x %.3f document pixels, y %.3f document pixels, turn %.4f degrees\n",
+							scaleError,xError,yError,turnError);
+						Check(result==1 && scaleError<.5 && xError<1 && yError<1 && turnError<.3,
+							"side reference matches the supplied manual benchmark within 0.5 percent scale, 1 projected document pixel and 0.3 degree");
 					} else {
 					Check(result==1 && gOverlay.imgSX>1.2 && gOverlay.imgSX<1.45 && gOverlay.imgY<-35 &&
 						gOverlay.imgY>-100 && gOverlay.imgRot>1 && gOverlay.imgRot<8,
